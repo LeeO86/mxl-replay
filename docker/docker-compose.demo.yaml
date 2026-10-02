@@ -1,0 +1,32 @@
+# Demo: a registry, two test-player cameras, replay, and a WebRTC monitor
+# on the replay outputs. Images for the siblings are the published ones.
+# Point NMOS_REGISTRY_ADDRESS at a real registry in a facility.
+services:
+  replay:
+    image: ghcr.io/leeo86/mxl-replay:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    network_mode: host
+    environment:
+      REPLAY_FORMAT: "1080p50"
+      REPLAY_INPUTS: "2"
+      REPLAY_CHANNELS: "2"
+      REPLAY_STORAGE_DIR: /data/replay
+      REPLAY_BUFFER_HOURS: "0.25"
+      MXL_DOMAIN_SCAN_PATH: /Volumes/mxl
+      NMOS_REGISTRY_ADDRESS: ${NMOS_REGISTRY_ADDRESS:-127.0.0.1}
+      NMOS_DNS_SD: "false"
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    volumes:
+      - /Volumes/mxl:/Volumes/mxl
+      - replay-data:/data/replay
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: 1
+
+volumes:
+  replay-data:

@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mxl-replay
+  labels:
+    app: mxl-replay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mxl-replay
+  template:
+    metadata:
+      labels:
+        app: mxl-replay
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        mxl.replay/nvme: "true"
+      containers:
+        - name: mxl-replay
+          image: ghcr.io/leeo86/mxl-replay:latest
+          ports:
+            - name: web
+              containerPort: 8150
+            - name: nmos
+              containerPort: 3302
+          env:
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,video,utility
+            - name: REPLAY_STORAGE_DIR
+              value: /data/replay
+            - name: MXL_DOMAIN_SCAN_PATH
+              value: /Volumes/mxl
+            - name: NMOS_DNS_SD
+              value: "false"
+          volumeMounts:
+            - name: mxl
+              mountPath: /Volumes/mxl
+            - name: nvme
+              mountPath: /data/replay
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: web
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: web
+      volumes:
+        - name: mxl
+          hostPath:
+            path: /Volumes/mxl
+            type: Directory
+        - name: nvme
+          hostPath:
+            path: /data/replay
+            type: DirectoryOrCreate
