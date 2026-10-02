@@ -17,7 +17,7 @@ This program is free software under **GPL-3.0-or-later**. See `LICENSE`.
 
 ## Storage
 
-Video is JPEG 4:2:2, 8-bit, default quality 92. One hour of 1080p50 at that quality is about **70 GB per camera**:
+Video is JPEG 4:2:2, 8-bit, default quality 92, encoded with nvJPEG when a GPU is visible and with libjpeg-turbo otherwise. One hour of 1080p50 at that quality is about **70 GB per camera**:
 
 ```
 bytes/frame = width * height * (quality / 92) * 0.1875
@@ -27,7 +27,9 @@ High frame rate scales with the frame rate. Audio is float32 PCM, 48 kHz. The pr
 
 Use a dedicated NVMe, not the operating-system disk. Protected clip ranges are never overwritten. New clips warn once protected data exceeds `REPLAY_PROTECT_MAX_PCT` (default 50%) of the budget.
 
-10-bit and 12-bit JPEG are not used. libjpeg-turbo in this build cannot encode them as 4:2:2. See `IMPLEMENTATION_PLAN.md`.
+10-bit and 12-bit JPEG are not used. nvJPEG's baseline 4:2:2 encoder is 8-bit. See `IMPLEMENTATION_PLAN.md`.
+
+The container image is the GPU build. It still starts with no GPU, which is enough for clip playback (`repeat` / `blend`). Interpolation and nvJPEG run when the NVIDIA container toolkit injects a device (`docker run --gpus all` or the Kubernetes `nvidia` runtime). Set `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility` (the image already does). Do not expect a separate CPU image.
 
 ## Build
 

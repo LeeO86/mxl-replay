@@ -11,15 +11,37 @@ bool cudaFlowAvailable()
 #endif
 }
 
+char const* jpegRuntimeBackend()
+{
+#if defined(REPLAY_WITH_NVJPEG)
+    if (cudaFlowAvailable())
+    {
+        return "nvjpeg";
+    }
+#endif
+    return "libjpeg-turbo";
+}
+
 #if !defined(REPLAY_WITH_CUDA)
-bool cudaInterpolate(Yuv422 const&, Yuv422 const&, FlowField const&, FlowField const&, float, OperatingPoint const&, Yuv422&)
+int cudaFlowDeviceCount()
+{
+    return 0;
+}
+
+bool gpuRenderFromJpeg(std::uint8_t const*, std::size_t, std::uint8_t const*, std::size_t, float, bool, OperatingPoint const&, std::string const&, int, int,
+    GpuPicture&)
 {
     return false;
 }
 
-int cudaFlowDeviceCount()
+std::vector<std::uint8_t> gpuEncodeV210(std::uint8_t const*, int, int, int, int)
 {
-    return 0;
+    return {};
+}
+
+std::vector<std::uint8_t> gpuEncodeFrame10(Frame10 const&, int)
+{
+    return {};
 }
 #endif
 

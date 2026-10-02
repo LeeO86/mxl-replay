@@ -35,7 +35,7 @@ web/              Vue 3 shotbox, LSM, library, playlists, cameras, NMOS, setting
 
 ## Deviations
 
-1. **JPEG is 8-bit 4:2:2.** libjpeg-turbo here has no usable 10-bit or 12-bit 4:2:2 encoder. `jpegSupports10Bit()` and `jpegSupports12Bit()` return false and the status JSON reports `jpeg_bit_depth: 8`. The nvJPEG GPU encode path is not linked in this tree; encode and decode stay on libjpeg-turbo. A CUDA build still packs v210 and runs the blend kernel on the device.
+1. **JPEG storage is 8-bit 4:2:2.** nvJPEG encodes and decodes that on the device when a GPU is visible. libjpeg-turbo is the fallback used for clip playback with no device, and for unit tests. nvJPEG's baseline encoder does not offer 10-bit or 12-bit 4:2:2, so `jpegSupports10Bit()` and `jpegSupports12Bit()` stay false. Status reports `"jpeg":"nvjpeg"` or `"libjpeg-turbo"`.
 2. **Reverse playback is implemented** from −100% to 0%. The scheduler already takes a signed speed, so leaving it out would have been the larger change. The UI speed fader is 0–200% as specified; the API accepts a negative speed.
 3. **`interpolate` on a CPU-only process falls back to `blend`.** The spec limits the CPU fallback to repeat and blend. Set `REPLAY_ALLOW_CPU_INTERP=true` to run the same DIS port on the CPU (tests and the harness). A visible CUDA device selects the GPU blend path.
 4. **OFA is probed, not wired as a second GPU context.** `ofaProbe()` dlopens `libvulkan.so.1` and looks for `VK_NV_optical_flow`. There is no CUDA–Vulkan external-memory interop in this cut, so a machine that has the extension still uses `dis-cuda` for pixels. `NVIDIA_DRIVER_CAPABILITIES` should add `graphics` before that interop is turned on. This was not verified on an A4000 or L4.
@@ -47,7 +47,7 @@ web/              Vue 3 shotbox, LSM, library, playlists, cameras, NMOS, setting
 10. **Segments are one MXLR file per 10 s**, not one file per JPEG. The write is sequential. `REPLAY_ODIRECT=true` asks for `O_DIRECT` and falls back to buffered IO when the filesystem refuses it (tmpfs does).
 11. **Export is a JPEG sequence plus WAV**, not ProRes 422 HQ. Upload conversion does use FFmpeg and stores the result as the same JPEG + PCM clips the buffer uses.
 12. **Phase order is receiver order.** Phase k is the k-th video receiver of the camera. A custom permutation list is not a separate key.
-13. **Variational refinement runs in the CPU port** (`src/flow/dis.cpp`), which is the reference the tests execute. `src/flow/dis_cuda.cu` implements pyramid downsampling, the occlusion-aware blend, and v210 pack on the device. The fast operating point does not use variational refinement (that matches Futatabi operating point 1).
+13. **One image, GPU when the toolkit injects a device.** `docker/Dockerfile` builds on `nvidia/cuda:12.8.2-devel` and the runtime stage carries `libcudart` and `libnvjpeg` only. `libcuda` comes from the NVIDIA container toolkit (`--gpus all`, or `runtimeClassName: nvidia`). Without a device the same binary records and plays with libjpeg, repeat, and blend. CI compiles that same CUDA binary (`ldd` must show `libnvjpeg`); it does not publish a second CPU image. On the device path the host sees the JPEG bitstream and the finished v210 grain. Search, refinement, blend, and packing stay in device memory, and the flow pair is cached there.
 
 ## Operating points
 

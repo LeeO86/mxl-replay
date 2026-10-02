@@ -28,6 +28,16 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Install CUDA toolkit
+        run: |
+          curl -fsSL -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 cuda-cudart-dev-12-8 libnvjpeg-dev-12-8
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+          echo "CUDACXX=/usr/local/cuda-12.8/bin/nvcc" >> "$GITHUB_ENV"
+
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -81,10 +91,12 @@ jobs:
       - name: Configure and build
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
             -DREPLAY_WITH_NMOS=ON \
             -DNMOS_CPP_DIR=/tmp/nmos-cpp/Development \
-            -DCMAKE_PREFIX_PATH="/opt/mxl;/tmp/mxl/build/vcpkg_installed/x64-linux"
+            -DCMAKE_PREFIX_PATH="/opt/mxl;/tmp/mxl/build/vcpkg_installed/x64-linux;/usr/local/cuda-12.8"
           cmake --build build -j"$(nproc)"
+          ldd build/mxl-replay | grep libnvjpeg
 
       - name: Unit tests
         run: ./build/unit-tests

@@ -66,6 +66,8 @@ public:
     [[nodiscard]] NmosIds const& ids() const { return ids_; }
 
     void ingestVideo(int camera, int phase, std::uint64_t taiNs, Frame10 frame);
+    // Packed v210 from an MXL grain. One device upload when nvJPEG is active.
+    void ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t const* packed, std::size_t bytes);
     void ingestAudio(int camera, std::uint64_t taiNs, std::vector<float> audio, int channels);
 
     [[nodiscard]] RenderedFrame render(int channel, std::uint64_t outputTaiNs);
@@ -153,6 +155,7 @@ private:
         int playlistIndex = -1;
         int fadeFramesLeft = 0;
         Frame10 last;
+        std::vector<std::uint8_t> lastV210;
         std::vector<std::uint8_t> preview;
         std::uint64_t late = 0;
         std::uint64_t ancSequence = 0;

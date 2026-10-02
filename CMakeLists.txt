@@ -50,14 +50,17 @@ target_include_directories(replay-core PUBLIC src third_party)
 target_link_libraries(replay-core PUBLIC Threads::Threads PkgConfig::JPEG PkgConfig::SQLITE PkgConfig::AV ${CMAKE_DL_LIBS})
 target_compile_options(replay-core PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 
-include(CheckLanguage)
-check_language(CUDA)
-if(CMAKE_CUDA_COMPILER)
+# One binary: nvcc + nvJPEG when the toolkit is installed, CPU fallback when it is not.
+# sm_75 (Turing), sm_86 (A4000), sm_89 (L4). The runtime image does not ship a
+# driver; the NVIDIA container toolkit injects libcuda at start.
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
     set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
     enable_language(CUDA)
     target_sources(replay-core PRIVATE src/flow/dis_cuda.cu)
-    set_target_properties(replay-core PROPERTIES CUDA_RUNTIME_LIBRARY Static CUDA_ARCHITECTURES "75;86;89")
-    target_compile_definitions(replay-core PUBLIC REPLAY_WITH_CUDA=1)
+    set_target_properties(replay-core PROPERTIES CUDA_ARCHITECTURES "75;86;89" CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(replay-core PUBLIC CUDA::cudart CUDA::nvjpeg)
+    target_compile_definitions(replay-core PUBLIC REPLAY_WITH_CUDA=1 REPLAY_WITH_NVJPEG=1)
 endif()
 
 if(REPLAY_BUILD_TESTS)

@@ -250,10 +250,7 @@ void MxlBridge::readLoop()
                 if (mxlFlowReaderGetGrainNonBlocking(reader, index > 2 ? index - 2 : index, &info, &payload) == MXL_STATUS_OK && payload != nullptr &&
                     (info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
                 {
-                    Frame10 frame;
-                    frame.allocate(cfg.format.width, cfg.format.height);
-                    unpackV210(payload, static_cast<int>(v210RowBytes(cfg.format.width)), frame);
-                    engine_.ingestVideo(camera.index, phase, mxlIndexToTimestamp(&rate, index), std::move(frame));
+                    engine_.ingestV210(camera.index, phase, mxlIndexToTimestamp(&rate, index), payload, info.grainSize);
                     engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});
                 }
                 mxlReleaseFlowReader(readerInstance, reader);

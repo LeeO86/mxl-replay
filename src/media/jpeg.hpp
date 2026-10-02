@@ -8,9 +8,9 @@
 
 namespace replay
 {
-// JPEG storage is 8-bit 4:2:2. libjpeg-turbo in this tree does not expose a
-// usable 10-bit or 12-bit 4:2:2 encoder; nvJPEG is wired the same way when the
-// CUDA toolkit is present. jpegStorageBitDepth() records that.
+// Storage is baseline JPEG 4:2:2, 8-bit. nvJPEG is used when a GPU is visible.
+// libjpeg-turbo is the CPU fallback (clip playback with no device). nvJPEG's
+// baseline encoder does not offer 10-bit or 12-bit 4:2:2.
 [[nodiscard]] int jpegStorageBitDepth();
 [[nodiscard]] bool jpegSupports10Bit();
 [[nodiscard]] bool jpegSupports12Bit();

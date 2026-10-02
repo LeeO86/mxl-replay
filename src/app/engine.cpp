@@ -204,7 +204,11 @@ void Engine::storeFrame(CameraRuntime& camera, std::uint64_t taiNs, Frame10 cons
 {
     StoredFrame stored;
     stored.taiNs = taiNs;
-    stored.jpeg = encodeJpeg422(frame, config_.jpegQuality);
+    stored.jpeg = gpuEncodeFrame10(frame, config_.jpegQuality);
+    if (stored.jpeg.empty())
+    {
+        stored.jpeg = encodeJpeg422(frame, config_.jpegQuality);
+    }
     stored.audio = audio;
     if (!camera.ring.push(stored))
     {
@@ -264,6 +268,48 @@ void Engine::flushHouse(CameraRuntime& camera, CameraConfig const& cfg)
     }
     camera.audio.clear();
     camera.houseOpen = false;
+}
+
+void Engine::ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t const* packed, std::size_t bytes)
+{
+    if (packed == nullptr || bytes < v210Size(config_.format.width, config_.format.height))
+    {
+        return;
+    }
+    auto jpeg = gpuEncodeV210(packed, config_.format.width, config_.format.height, static_cast<int>(v210RowBytes(config_.format.width)), config_.jpegQuality);
+    if (jpeg.empty())
+    {
+        Frame10 frame;
+        frame.allocate(config_.format.width, config_.format.height);
+        unpackV210(packed, static_cast<int>(v210RowBytes(config_.format.width)), frame);
+        ingestVideo(camera, phase, taiNs, std::move(frame));
+        return;
+    }
+    std::lock_guard lock{mutex_};
+    if (camera < 1 || camera > static_cast<int>(cameras_.size()) || !config_.cameras[static_cast<std::size_t>(camera - 1)].record)
+    {
+        return;
+    }
+    auto& runtime = cameras_[static_cast<std::size_t>(camera - 1)];
+    StoredFrame stored;
+    stored.taiNs = taiNs;
+    stored.jpeg = std::move(jpeg);
+    stored.audio = runtime.audio;
+    runtime.audio.clear();
+    if (!runtime.ring.push(std::move(stored)))
+    {
+        ++runtime.dropped;
+        return;
+    }
+    if (runtime.writer)
+    {
+        auto const& kept = runtime.ring.findNearest(taiNs);
+        if (kept)
+        {
+            runtime.writer->write(taiNs, kept->jpeg.data(), kept->jpeg.size(), kept->audio.data(), kept->audio.size());
+        }
+    }
+    ++runtime.recorded;
 }
 
 void Engine::ingestVideo(int camera, int phase, std::uint64_t taiNs, Frame10 frame)
@@ -397,12 +443,44 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     auto const periodSrc = sourcePeriod(camera);
     std::uint64_t const taiA = static_cast<std::uint64_t>(pick.frameA) * periodSrc;
     std::uint64_t const taiB = static_cast<std::uint64_t>(pick.frameB) * periodSrc;
+    bool exact = pick.kind == SourcePick::Kind::Exact;
+    bool renderedOnGpu = false;
+    if (!runtime.black && cudaFlowAvailable() && camera >= 1 && camera <= static_cast<int>(cameras_.size()))
+    {
+        auto const storedA = cameras_[static_cast<std::size_t>(camera - 1)].ring.findNearest(taiA);
+        auto const storedB = cameras_[static_cast<std::size_t>(camera - 1)].ring.findNearest(taiB);
+        bool const second = storedB && storedA && storedB->taiNs != storedA->taiNs && pick.kind != SourcePick::Kind::Exact && pick.kind != SourcePick::Kind::Repeat;
+        GpuPicture gpuPicture;
+        auto const key = std::to_string(camera) + ":" + std::to_string(taiA) + ":" + std::to_string(taiB);
+        if (storedA && !storedA->jpeg.empty() &&
+            gpuRenderFromJpeg(storedA->jpeg.data(), storedA->jpeg.size(), second ? storedB->jpeg.data() : nullptr, second ? storedB->jpeg.size() : 0,
+                static_cast<float>(pick.phase), motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate, operatingPoint(config_.preset), key,
+                config_.format.width, config_.format.height, gpuPicture))
+        {
+            rendered.v210 = std::move(gpuPicture.v210);
+            runtime.preview = std::move(gpuPicture.preview);
+            runtime.lastV210 = rendered.v210;
+            renderedOnGpu = true;
+            if (motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate)
+            {
+                metrics_.inc("flow_cache_hits_total", {{"channel", std::to_string(channel)}});
+            }
+        }
+    }
     bool foundA = false;
     bool foundB = false;
-    Frame10 frameA = frameAt(camera, taiA, &foundA);
-    Frame10 frameB = frameAt(camera, taiB, &foundB);
+    Frame10 frameA;
+    Frame10 frameB;
     Frame10 picture;
-    bool exact = pick.kind == SourcePick::Kind::Exact;
+    if (renderedOnGpu)
+    {
+        foundA = true;
+    }
+    else
+    {
+        frameA = frameAt(camera, taiA, &foundA);
+        frameB = frameAt(camera, taiB, &foundB);
+    }
     if (runtime.black || (!foundA && !foundB))
     {
         picture.allocate(config_.format.width, config_.format.height);
@@ -424,6 +502,16 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             picture.fill(64, 512, 512);
         }
         rendered.black = runtime.black || (!foundA && !foundB);
+        if (!runtime.black && cfg.idle == IdleSource::Last && !runtime.lastV210.empty() && !foundA)
+        {
+            rendered.v210 = runtime.lastV210;
+            renderedOnGpu = true;
+            rendered.black = false;
+        }
+    }
+    else if (renderedOnGpu)
+    {
+        exact = pick.kind == SourcePick::Kind::Exact || pick.kind == SourcePick::Kind::Repeat;
     }
     else if (!foundB || pick.kind == SourcePick::Kind::Exact || pick.kind == SourcePick::Kind::Repeat || std::fabs(pick.phase) < 1e-6)
     {
@@ -449,17 +537,16 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         }
         auto const& pair = flowCache_[key];
         auto const op = operatingPoint(config_.preset);
-        Yuv422 yuv;
-        if (!cudaInterpolate(toFloat(frameA), toFloat(frameB), pair.forward, pair.backward, static_cast<float>(pick.phase), op, yuv))
-        {
-            yuv = interpolateFrames(toFloat(frameA), toFloat(frameB), pair.forward, pair.backward, static_cast<float>(pick.phase), op);
-        }
-        picture = fromFloat(yuv);
+        picture = fromFloat(interpolateFrames(toFloat(frameA), toFloat(frameB), pair.forward, pair.backward, static_cast<float>(pick.phase), op));
     }
-    runtime.last = picture;
-    runtime.preview = tinyPreview(picture);
-    rendered.v210.resize(v210Size(picture.width, picture.height));
-    packV210(picture, rendered.v210.data(), 0);
+    if (!renderedOnGpu)
+    {
+        runtime.last = picture;
+        runtime.preview = tinyPreview(picture);
+        rendered.v210.resize(v210Size(picture.width, picture.height));
+        packV210(picture, rendered.v210.data(), 0);
+        runtime.lastV210 = rendered.v210;
+    }
     rendered.positionNs = position;
     rendered.speed = runtime.scheduler.speed;
     rendered.motion = motionName(exact && motion == MotionMode::Interpolate ? MotionMode::Repeat : motion);
@@ -1144,7 +1231,8 @@ std::string Engine::statusJson() const
     std::ostringstream out;
     out << "{\"version\":\"" << REPLAY_VERSION << "\",\"format\":" << jsonString(config_.format.token()) << ",\"gpu\":" << (gpuInterpolate() ? "true" : "false")
         << ",\"flow\":" << jsonString(flowModuleName(config_.flowModule)) << ",\"preset\":" << jsonString(presetName(config_.preset))
-        << ",\"storage_bps\":" << storageBps_ << ",\"free_bytes\":" << freeBytes() << ",\"jpeg_bit_depth\":" << jpegStorageBitDepth()
+        << ",\"storage_bps\":" << storageBps_ << ",\"free_bytes\":" << freeBytes() << ",\"jpeg\":\"" << jpegRuntimeBackend()
+        << "\",\"jpeg_bit_depth\":" << jpegStorageBitDepth()
         << ",\"cameras\":[";
     for (std::size_t i = 0; i < cameras_.size(); ++i)
     {

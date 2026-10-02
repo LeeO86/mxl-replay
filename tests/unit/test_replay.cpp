@@ -2,6 +2,7 @@
 
 #include "app/engine.hpp"
 #include "config/config.hpp"
+#include "flow/cuda_flow.hpp"
 #include "flow/dis.hpp"
 #include "library/catalog.hpp"
 #include "media/anc.hpp"
@@ -174,6 +175,10 @@ TEST_CASE("jpeg 4:2:2 round trip and v210 pack")
     CHECK(jpegStorageBitDepth() == 8);
     CHECK_FALSE(jpegSupports10Bit());
     CHECK_FALSE(jpegSupports12Bit());
+    if (!cudaFlowAvailable())
+    {
+        CHECK(std::string(jpegRuntimeBackend()) == "libjpeg-turbo");
+    }
     Frame10 frame;
     frame.allocate(32, 16);
     for (int y = 0; y < 16; ++y)

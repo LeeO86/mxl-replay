@@ -66,12 +66,15 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         libcpprest2.10 libboost-chrono1.83.0t64 libboost-thread1.83.0 \
         libssl3t64 libavahi-compat-libdnssd1 \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so* /usr/local/lib/
+COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libnvjpeg.so* /usr/local/lib/
 COPY --from=build /opt/mxl/lib/ /usr/local/lib/
 COPY --from=build /tmp/mxl/build/vcpkg_installed/x64-linux/lib/ /usr/local/lib/
 COPY --from=build /src/build/mxl-replay /usr/local/bin/mxl-replay
 COPY --from=build /src/build/mxl-replay-harness /usr/local/bin/mxl-replay-harness
 RUN ldconfig && useradd --uid 1000 --create-home replay
 USER 1000:1000
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 LABEL io.dmf.mxl.revision="${MXL_REF}"
 EXPOSE 8150 3302
 ENTRYPOINT ["/usr/local/bin/mxl-replay"]
