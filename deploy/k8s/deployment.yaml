@@ -19,7 +19,7 @@ spec:
         mxl.replay/nvme: "true"
       containers:
         - name: mxl-replay
-          image: ghcr.io/leeo86/mxl-replay:latest
+          image: ghcr.io/leeo86/mxl-replay:nightly-dev
           ports:
             - name: web
               containerPort: 8150
