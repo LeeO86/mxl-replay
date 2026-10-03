@@ -72,7 +72,23 @@ COPY --from=build /opt/mxl/lib/ /usr/local/lib/
 COPY --from=build /tmp/mxl/build/vcpkg_installed/x64-linux/lib/ /usr/local/lib/
 COPY --from=build /src/build/mxl-replay /usr/local/bin/mxl-replay
 COPY --from=build /src/build/mxl-replay-harness /usr/local/bin/mxl-replay-harness
-RUN ldconfig && useradd --uid 1000 --create-home replay
+# ubuntu:24.04 already owns uid/gid 1000 (user "ubuntu"), so
+# `useradd --uid 1000` exits 4. Rename that account and keep the id.
+RUN set -eu; \
+    ldconfig; \
+    if ! id replay >/dev/null 2>&1; then \
+      if id 1000 >/dev/null 2>&1; then \
+        existing="$(id -un 1000)"; \
+        usermod --login replay --home /home/replay --move-home "$existing"; \
+        if getent group "$existing" >/dev/null && ! getent group replay >/dev/null; then \
+          groupmod --new-name replay "$existing"; \
+        fi; \
+      else \
+        useradd --uid 1000 --create-home --shell /usr/sbin/nologin replay; \
+      fi; \
+    fi; \
+    test "$(id -u replay)" = 1000; \
+    test "$(id -g replay)" = 1000
 USER 1000:1000
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 LABEL io.dmf.mxl.revision="${MXL_REF}"
