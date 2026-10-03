@@ -4,9 +4,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -31,6 +34,7 @@
 #include "nmos/node_resources.h"
 #include "nmos/node_server.h"
 #include "nmos/rational.h"
+#include "nmos/query_utils.h"
 #include "nmos/resources.h"
 #include "nmos/server.h"
 #include "nmos/settings.h"
@@ -48,9 +52,14 @@ struct NmosNode::Impl
     Engine& engine;
     NmosIds ids;
     std::atomic<bool> running{false};
+    std::atomic<bool> deregistered{false};
+    std::atomic<bool> finished{false};
 #if defined(REPLAY_WITH_NMOS)
     std::thread thread;
     std::string error;
+    std::mutex startMu;
+    std::condition_variable startCv;
+    bool startDone = false;
 #endif
     Impl(Config c, Engine& e)
         : config(std::move(c))
@@ -89,7 +98,10 @@ void NmosNode::start()
         logWarn("nmos_not_linked", {{"hint", "rebuild with REPLAY_WITH_NMOS"}});
     }
 }
-void NmosNode::stop() {}
+bool NmosNode::stop()
+{
+    return true;
+}
 #else
 namespace
 {
@@ -108,6 +120,50 @@ void tagGroup(nmos::resource& resource, std::string const& group, std::string co
         resource.data[U("tags")] = web::json::value::object();
     }
     web::json::push_back(resource.data[U("tags")][U("urn:x-nmos:tag:grouphint/v1.0")], nmos::make_group_hint({us(group), us(role)}));
+}
+void addTags(nmos::resource& resource, std::map<std::string, std::vector<std::string>> const& tags)
+{
+    if (tags.empty())
+    {
+        return;
+    }
+    if (!resource.data.has_field(nmos::fields::tags))
+    {
+        resource.data[U("tags")] = web::json::value::object();
+    }
+    for (auto const& [key, values] : tags)
+    {
+        if (!resource.data[U("tags")].has_field(us(key)))
+        {
+            resource.data[U("tags")][us(key)] = web::json::value::array();
+        }
+        for (auto const& value : values)
+        {
+            web::json::push_back(resource.data[U("tags")][us(key)], web::json::value::string(us(value)));
+        }
+    }
+}
+void restoreReceiver(nmos::resource& connection, Route const& saved)
+{
+    if (saved.senderId.empty() && saved.flowId.empty() && saved.domainId.empty() && !saved.active)
+    {
+        return;
+    }
+    connection.data[U("active")][U("master_enable")] = web::json::value::boolean(saved.active);
+    connection.data[U("active")][U("sender_id")] = saved.senderId.empty() ? web::json::value::null() : web::json::value::string(us(saved.senderId));
+    if (connection.data[U("active")].has_field(U("transport_params")) && connection.data[U("active")][U("transport_params")].is_array() &&
+        connection.data[U("active")][U("transport_params")].size() > 0)
+    {
+        auto& params = connection.data[U("active")][U("transport_params")].at(0);
+        if (!saved.domainId.empty())
+        {
+            params[U("mxl_domain_id")] = web::json::value::string(us(saved.domainId));
+        }
+        if (!saved.flowId.empty())
+        {
+            params[U("mxl_flow_id")] = web::json::value::string(us(saved.flowId));
+        }
+    }
 }
 } // namespace
 
@@ -128,22 +184,27 @@ void NmosNode::start()
             nmos::node_model nodeModel;
             web::json::value settings = web::json::value::object();
             settings[U("http_port")] = impl_->config.nmosPort;
-            settings[U("label")] = web::json::value::string(us(impl_->config.hostId));
+            settings[U("label")] = web::json::value::string(us(nodeLabel(impl_->config)));
             settings[U("description")] = web::json::value::string(U("mxl-replay"));
             settings[U("seed_id")] = web::json::value::string(us(impl_->ids.node));
             settings[U("service_name_prefix")] = web::json::value::string(U("mxl-replay"));
             settings[U("logging_level")] = 20;
             settings[U("control_protocol_ws_port")] = -1;
+            settings[U("host_address")] = web::json::value::string(us(impl_->config.nmosHostAddress));
+            web::json::value addresses = web::json::value::array();
+            web::json::push_back(addresses, web::json::value::string(us(impl_->config.nmosHostAddress)));
+            settings[U("host_addresses")] = addresses;
+            settings[U("href_mode")] = 2;
             if (!impl_->config.nmosDnsSd)
             {
                 settings[U("pri")] = std::numeric_limits<int>::max();
                 settings[U("highest_pri")] = std::numeric_limits<int>::max();
+                settings[U("authorization_highest_pri")] = std::numeric_limits<int>::max();
             }
             if (!impl_->config.nmosRegistryAddress.empty())
             {
                 settings[U("registry_address")] = web::json::value::string(us(impl_->config.nmosRegistryAddress));
                 settings[U("registration_port")] = impl_->config.nmosRegistryPort;
-                settings[U("query_port")] = impl_->config.nmosRegistryPort + 1;
             }
             nodeModel.settings = settings;
             nmos::insert_node_default_settings(nodeModel.settings);
@@ -195,12 +256,12 @@ void NmosNode::start()
                             {
                                 if (id == impl_->ids.videoReceiver(camera.index, phase))
                                 {
-                                    impl_->engine.setRoute(camera.index, phase, true, Route{enable, domain, flow, sender, enable ? "running" : "waiting"});
+                                    impl_->engine.setRoute(camera.index, phase, true, Route{enable, domain, flow, sender, enable ? "running" : "waiting"}, true);
                                 }
                             }
                             if (id == impl_->ids.audioReceiver(camera.index))
                             {
-                                impl_->engine.setRoute(camera.index, 1, false, Route{enable, domain, flow, sender, enable ? "running" : "waiting"});
+                                impl_->engine.setRoute(camera.index, 1, false, Route{enable, domain, flow, sender, enable ? "running" : "waiting"}, true);
                             }
                         }
                     });
@@ -210,8 +271,9 @@ void NmosNode::start()
                 auto const clocks = web::json::value_of({nmos::make_internal_clock(nmos::clock_names::clk0)});
                 auto const interfaces = nmos::experimental::node_interfaces(nmos::get_host_interfaces(nodeModel.settings));
                 auto node = nmos::make_node(us(impl_->ids.node), clocks, nmos::make_node_interfaces(interfaces), nodeModel.settings);
-                node.data[U("label")] = web::json::value::string(us(impl_->config.hostId));
+                node.data[U("label")] = web::json::value::string(us(nodeLabel(impl_->config)));
                 node.data[U("description")] = web::json::value::string(U("MXL Replay"));
+                addTags(node, impl_->config.nmosTags);
                 nmos::insert_resource(nodeModel.node_resources, std::move(node));
                 std::vector<nmos::id> receivers;
                 std::vector<nmos::id> senders;
@@ -230,7 +292,8 @@ void NmosNode::start()
                     senders.push_back(us(impl_->ids.dataSender(channel.index)));
                 }
                 auto device = nmos::make_device(us(impl_->ids.device), us(impl_->ids.node), senders, receivers, nodeModel.settings);
-                device.data[U("label")] = web::json::value::string(U("MXL Replay"));
+                device.data[U("label")] = web::json::value::string(us(deviceLabel(impl_->config)));
+                addTags(device, impl_->config.nmosTags);
                 nmos::insert_resource(nodeModel.node_resources, std::move(device));
                 nmos::rational const rate{impl_->config.format.rateNum, impl_->config.format.rateDen};
                 for (auto const& camera : impl_->config.cameras)
@@ -246,6 +309,7 @@ void NmosNode::start()
                         nmos::insert_resource(nodeModel.node_resources, std::move(receiver));
                         auto connection = nmos::make_connection_mxl_receiver(us(id), {});
                         connection.data[U("active")][U("master_enable")] = web::json::value::boolean(false);
+                        restoreReceiver(connection, impl_->engine.route(camera.index, phase, true));
                         nmos::insert_resource(nodeModel.connection_resources, std::move(connection));
                     }
                     auto const audioId = impl_->ids.audioReceiver(camera.index);
@@ -256,6 +320,7 @@ void NmosNode::start()
                     nmos::insert_resource(nodeModel.node_resources, std::move(audio));
                     auto audioConnection = nmos::make_connection_mxl_receiver(us(audioId), {});
                     audioConnection.data[U("active")][U("master_enable")] = web::json::value::boolean(false);
+                    restoreReceiver(audioConnection, impl_->engine.route(camera.index, 1, false));
                     nmos::insert_resource(nodeModel.connection_resources, std::move(audioConnection));
                 }
                 for (auto const& channel : impl_->config.channelList)
@@ -292,6 +357,10 @@ void NmosNode::start()
                         us(impl_->ids.device), utility::string_t{}, std::vector<utility::string_t>{}, nodeModel.settings);
                     tagGroup(audioSender, channel.label, "Audio");
                     nmos::insert_resource(nodeModel.node_resources, std::move(audioSender));
+                    auto audioConnection = nmos::make_connection_mxl_sender(us(impl_->ids.audioSender(channel.index)), us(impl_->config.outputDomainId),
+                        us(impl_->ids.audioFlow(channel.index)));
+                    audioConnection.data[U("active")][U("master_enable")] = web::json::value::boolean(true);
+                    nmos::insert_resource(nodeModel.connection_resources, std::move(audioConnection));
 
                     auto dataSource = nmos::make_data_source(us(impl_->ids.dataSource(channel.index)), us(impl_->ids.device), nmos::clock_names::clk0, rate,
                         nodeModel.settings);
@@ -307,20 +376,96 @@ void NmosNode::start()
                         nmos::transports::mxl, us(impl_->ids.device), utility::string_t{}, std::vector<utility::string_t>{}, nodeModel.settings);
                     tagGroup(dataSender, channel.label, "Data");
                     nmos::insert_resource(nodeModel.node_resources, std::move(dataSender));
+                    auto dataConnection = nmos::make_connection_mxl_sender(us(impl_->ids.dataSender(channel.index)), us(impl_->config.outputDomainId),
+                        us(impl_->ids.dataFlow(channel.index, impl_->config.format.token())));
+                    dataConnection.data[U("active")][U("master_enable")] = web::json::value::boolean(true);
+                    nmos::insert_resource(nodeModel.connection_resources, std::move(dataConnection));
                 }
                 nodeModel.notify();
                 impl_->running.store(true);
-                nodeModel.wait(lock, [&] { return nodeModel.shutdown; });
+                nodeModel.wait(lock, [&] { return nodeModel.shutdown || !impl_->running.load(); });
+                if (!nodeModel.shutdown)
+                {
+                    auto rankOf = [](nmos::type const& type) {
+                        if (type == nmos::types::receiver || type == nmos::types::sender)
+                        {
+                            return 0;
+                        }
+                        if (type == nmos::types::flow)
+                        {
+                            return 1;
+                        }
+                        if (type == nmos::types::source)
+                        {
+                            return 2;
+                        }
+                        if (type == nmos::types::device)
+                        {
+                            return 3;
+                        }
+                        if (type == nmos::types::node)
+                        {
+                            return 4;
+                        }
+                        return -1;
+                    };
+                    std::vector<std::pair<int, nmos::id>> ranked;
+                    for (auto const& resource : nodeModel.node_resources)
+                    {
+                        int const rank = rankOf(resource.type);
+                        if (rank >= 0 && resource.has_data())
+                        {
+                            ranked.push_back({rank, resource.id});
+                        }
+                    }
+                    std::sort(ranked.begin(), ranked.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+                    for (auto const& item : ranked)
+                    {
+                        auto found = nodeModel.node_resources.find(item.second);
+                        if (found == nodeModel.node_resources.end() || !found->has_data())
+                        {
+                            continue;
+                        }
+                        auto const pre = found->data;
+                        auto const resourceUpdated = nmos::strictly_increasing_update(nodeModel.node_resources);
+                        nodeModel.node_resources.modify(found, [&](nmos::resource& resource) {
+                            resource.data = web::json::value::null();
+                            resource.updated = resourceUpdated;
+                        });
+                        nmos::insert_resource_events(nodeModel.node_resources, found->version, found->downgrade_version, found->type, pre, found->data);
+                    }
+                    nodeModel.notify();
+                    impl_->deregistered.store(true);
+                    nodeModel.wait(lock, [&] { return nodeModel.shutdown; });
+                }
             });
             nmos::server_guard guard(server);
             for (int i = 0; i < 200 && !impl_->running.load() && impl_->error.empty(); ++i)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
+            if (!impl_->running.load() && impl_->error.empty())
+            {
+                impl_->error = "NMOS node did not open NMOS_PORT " + std::to_string(impl_->config.nmosPort);
+            }
+            {
+                std::lock_guard startLock{impl_->startMu};
+                impl_->startDone = true;
+            }
+            impl_->startCv.notify_all();
             while (impl_->running.load())
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
+            {
+                auto lock = nodeModel.write_lock();
+                nodeModel.notify();
+            }
+            for (int i = 0; i < 100 && !impl_->deregistered.load(); ++i)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
             {
                 auto lock = nodeModel.write_lock();
                 nodeModel.shutdown = true;
@@ -331,17 +476,46 @@ void NmosNode::start()
         {
             impl_->error = ex.what();
             logError("nmos_node_failed", {{"error", ex.what()}});
+            {
+                std::lock_guard startLock{impl_->startMu};
+                impl_->startDone = true;
+            }
+            impl_->startCv.notify_all();
         }
+        impl_->finished.store(true);
     });
+    std::unique_lock startLock{impl_->startMu};
+    impl_->startCv.wait_for(startLock, std::chrono::seconds(15), [&] { return impl_->startDone; });
+    if (!impl_->error.empty())
+    {
+        throw StartupError(75, impl_->error);
+    }
+    if (!impl_->running.load())
+    {
+        throw StartupError(75, "cannot bind NMOS_PORT " + std::to_string(impl_->config.nmosPort));
+    }
 }
 
-void NmosNode::stop()
+bool NmosNode::stop()
 {
     impl_->running.store(false);
-    if (impl_->thread.joinable())
+    if (!impl_->thread.joinable())
+    {
+        return true;
+    }
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(impl_->config.shutdownTimeoutS);
+    while (!impl_->finished.load() && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (impl_->finished.load())
     {
         impl_->thread.join();
+        return true;
     }
+    impl_->thread.detach();
+    logError("nmos_shutdown_timeout", {{"seconds", std::to_string(impl_->config.shutdownTimeoutS)}});
+    return false;
 }
 #endif
 } // namespace replay

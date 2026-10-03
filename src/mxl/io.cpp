@@ -60,10 +60,12 @@ void MxlBridge::start()
     logInfo("mxl_disabled", {{"reason", "built without libmxl"}});
 #else
     auto const& cfg = engine_.config();
-    if (!ensureOutputDomain(cfg.outputDomainDir, cfg.outputDomainId, 2000000000ull))
+    auto const domain = ensureOutputDomain(cfg.outputDomainDir, cfg.outputDomainId, cfg.historyDurationNs);
+    if (domain.status != DomainStatus::Ready)
     {
-        logError("mxl_domain_rejected", {{"dir", cfg.outputDomainDir}});
-        return;
+        logError("mxl_domain_rejected", {{"dir", cfg.outputDomainDir}, {"error", domain.message}});
+        int const code = domain.status == DomainStatus::Failed ? 75 : 78;
+        throw StartupError(code, domain.message.empty() ? "output domain was rejected" : domain.message);
     }
     impl_->instance = mxlCreateInstance(cfg.outputDomainDir.c_str(), nullptr);
     if (impl_->instance == nullptr)
@@ -226,7 +228,7 @@ void MxlBridge::readLoop()
                     continue;
                 }
                 auto const domain = resolveDomain(cfg.scanPath, route.domainId);
-                if (!domain || domain->mirror)
+                if (!domain)
                 {
                     engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
                     continue;

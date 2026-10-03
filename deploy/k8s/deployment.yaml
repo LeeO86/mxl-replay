@@ -15,30 +15,70 @@ spec:
         app: mxl-replay
     spec:
       runtimeClassName: nvidia
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        supplementalGroups: [1000]
       nodeSelector:
         mxl.replay/nvme: "true"
       containers:
         - name: mxl-replay
-          image: ghcr.io/leeo86/mxl-replay:nightly-dev
+          image: ghcr.io/leeo86/mxl-replay:1.0.0
           ports:
             - name: web
               containerPort: 8150
             - name: nmos
               containerPort: 3302
+            - name: nmos-ws
+              containerPort: 3303
           env:
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: compute,video,utility
             - name: REPLAY_STORAGE_DIR
               value: /data/replay
+            - name: REPLAY_STATE_DIR
+              value: /config
             - name: MXL_DOMAIN_SCAN_PATH
               value: /Volumes/mxl
+            - name: MXL_OUTPUT_DOMAIN_DIR
+              value: /Volumes/mxl/replay-example
+            - name: MXL_CLEANUP_ON_EXIT
+              value: "true"
+            - name: SHUTDOWN_TIMEOUT_S
+              value: "10"
+            - name: NMOS_SEED
+              value: example-replay
+            - name: NMOS_LABEL
+              value: MXL Replay
+            - name: NMOS_TAGS
+              value: '{"urn:x-srf:production":["example"],"urn:x-srf:function":["replay"]}'
+            - name: NMOS_HOST_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NMOS_REGISTRY_ADDRESS
+              value: 10.0.0.10
+            - name: NMOS_REGISTRY_PORT
+              value: "3210"
+            - name: NMOS_QUERY_ADDRESS
+              value: 10.0.0.10
+            - name: NMOS_QUERY_PORT
+              value: "3211"
             - name: NMOS_DNS_SD
               value: "false"
+            - name: NMOS_PORT
+              value: "3302"
+            - name: WEB_PORT
+              value: "8150"
           volumeMounts:
             - name: mxl
               mountPath: /Volumes/mxl
             - name: nvme
               mountPath: /data/replay
+            - name: config
+              mountPath: /config
           resources:
             limits:
               nvidia.com/gpu: "1"
@@ -59,3 +99,6 @@ spec:
           hostPath:
             path: /data/replay
             type: DirectoryOrCreate
+        # Mount a persistent volume here so the catalog and IS-05 routes survive pod recreation.
+        - name: config
+          emptyDir: {}

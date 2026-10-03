@@ -18,20 +18,6 @@
 
 namespace replay
 {
-class StartupError : public std::runtime_error
-{
-public:
-    StartupError(int code, std::string const& message)
-        : std::runtime_error(message)
-        , code_(code)
-    {
-    }
-    [[nodiscard]] int code() const { return code_; }
-
-private:
-    int code_;
-};
-
 struct RenderedFrame
 {
     std::vector<std::uint8_t> v210;
@@ -58,7 +44,7 @@ struct Route
 class Engine
 {
 public:
-    explicit Engine(Config config);
+    explicit Engine(Config config, std::map<std::string, std::string> settings = {});
     ~Engine();
 
     [[nodiscard]] Config const& config() const { return config_; }
@@ -106,8 +92,17 @@ public:
     std::string exportClip(std::string const& id, std::string& error);
     bool consolidate(std::string const& id, std::string& error);
 
-    void setRoute(int camera, int phase, bool video, Route route);
+    void setRoute(int camera, int phase, bool video, Route route, bool persist = false);
     [[nodiscard]] Route route(int camera, int phase, bool video) const;
+
+    [[nodiscard]] std::string exportConfigJson() const;
+    struct ImportResult
+    {
+        bool ok = false;
+        bool restartRequired = false;
+        std::string error;
+    };
+    ImportResult importConfigJson(std::string const& body);
 
     [[nodiscard]] std::string statusJson() const;
     [[nodiscard]] std::vector<std::uint8_t> previewJpeg(int channel) const;
@@ -167,8 +162,12 @@ private:
     void finishClip(int channel);
     [[nodiscard]] std::uint64_t sourcePeriod(int camera) const;
     [[nodiscard]] double hfrFactor(int camera) const;
+    void loadRoutes();
+    void saveRoutes() const;
+    [[nodiscard]] std::string routesPath() const;
 
     Config config_;
+    std::map<std::string, std::string> settings_;
     NmosIds ids_;
     Metrics metrics_;
     Catalog catalog_;

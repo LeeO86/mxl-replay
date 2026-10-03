@@ -15,8 +15,23 @@ struct DomainInfo
     bool mirror = false;
 };
 
+enum class DomainStatus
+{
+    Ready,
+    Mismatch,
+    Mirror,
+    Failed
+};
+
+struct DomainResult
+{
+    DomainStatus status = DomainStatus::Failed;
+    std::string message;
+};
+
 std::vector<DomainInfo> scanDomains(std::string const& root);
 std::optional<DomainInfo> resolveDomain(std::string const& root, std::string const& id);
 bool isMirrorDomain(std::string const& domainDir);
-bool ensureOutputDomain(std::string const& directory, std::string const& id, std::uint64_t historyNs);
+DomainResult ensureOutputDomain(std::string const& directory, std::string const& id, std::uint64_t historyNs);
+bool removeOwnDomain(std::string const& directory, std::string const& id, std::string& error);
 } // namespace replay

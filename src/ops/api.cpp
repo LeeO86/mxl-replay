@@ -1,6 +1,8 @@
 #include "ops/api.hpp"
 
 #include "config/config.hpp"
+#include "ops/httpserver.hpp"
+#include "util/logging.hpp"
 #include "version.hpp"
 
 #include <sstream>
@@ -112,6 +114,15 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
     }
     if (path == "/readyz")
     {
+        auto const& cfg = engine.config();
+        if (cfg.nmosEnable && !cfg.nmosRegistryAddress.empty())
+        {
+            auto const query = "/x-nmos/query/v1.3/nodes/" + engine.ids().node;
+            if (httpGetStatus(cfg.nmosQueryAddress, cfg.nmosQueryPort, query, 500) != 200)
+            {
+                return json(503, "{\"status\":\"registering\"}");
+            }
+        }
         return json(200, "{\"status\":\"ready\"}");
     }
     if (path == "/statusz" || path == "/api/v1/status")
@@ -138,17 +149,24 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
     {
         return json(200, std::string("{\"export\":") + "\"" + "see /api/v1/config/export" + "\"}");
     }
-    if (path == "/api/v1/config/export")
+    if (path == "/api/v1/config/export" && (method.empty() || method == "GET"))
     {
-        HttpResponse response;
-        response.contentType = "text/plain";
-        response.body = exportKeyValue(engine.config());
-        return response;
+        return json(200, engine.exportConfigJson());
+    }
+    if (path == "/api/v1/config/import" && method == "POST")
+    {
+        auto const imported = engine.importConfigJson(request.body);
+        if (!imported.ok)
+        {
+            return json(400, std::string("{\"error\":\"") + jsonEscape(imported.error) + "\"}");
+        }
+        return json(200, std::string("{\"ok\":true,\"restart_required\":") + (imported.restartRequired ? "true" : "false") + "}");
     }
     if (path == "/api/v1/nmos")
     {
         auto const& ids = engine.ids();
-        return json(200, std::string("{\"node_id\":\"") + ids.node + "\",\"device_id\":\"" + ids.device + "\",\"device_label\":\"MXL Replay\"}");
+        return json(200, std::string("{\"node_id\":\"") + ids.node + "\",\"device_id\":\"" + ids.device + "\",\"device_label\":\"" +
+                            jsonEscape(deviceLabel(engine.config())) + "\",\"host_address\":\"" + engine.config().nmosHostAddress + "\"}");
     }
     if (path == "/api/v1/clips" && method == "GET")
     {

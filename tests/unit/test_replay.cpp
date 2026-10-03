@@ -2,6 +2,7 @@
 
 #include "app/engine.hpp"
 #include "config/config.hpp"
+#include "domain/scan.hpp"
 #include "flow/cuda_flow.hpp"
 #include "flow/dis.hpp"
 #include "library/catalog.hpp"
@@ -336,6 +337,8 @@ TEST_CASE("engine records two angles, plays at half speed and creates a clip")
         {"REPLAY_CHANNELS", "2"},
         {"REPLAY_BUFFER_HOURS", "0.01"},
         {"REPLAY_STORAGE_DIR", dir.string()},
+        {"REPLAY_STATE_DIR", (dir / "state").string()},
+        {"NMOS_HOST_ADDRESS", "10.1.2.3"},
         {"REPLAY_ALLOW_CPU_INTERP", "true"},
         {"REPLAY_STORAGE_MIN_MBPS", "0"},
         {"REPLAY_PROTECT_MAX_PCT", "90"},
@@ -408,4 +411,131 @@ TEST_CASE("metrics render the replay prefix")
     auto const text = metrics.render();
     CHECK(text.find("mxl_replay_record_dropped_total") != std::string::npos);
     CHECK(text.find("mxl_replay_frame_gpu_seconds_bucket") != std::string::npos);
+}
+
+TEST_CASE("platform settings keep aliases and reject bad values")
+{
+    std::map<std::string, std::string> env{{"NMOS_HOST_ADDRESS", "10.8.0.4"}, {"NMOS_REGISTRY_PORT", "4000"}, {"HOST_ID", "pod"}};
+    auto const loaded = loadConfig(env, {});
+    CHECK(loaded.config.nmosQueryAddress == "");
+    CHECK(loaded.config.nmosQueryPort == 4001);
+    CHECK(loaded.config.nmosHostAddress == "10.8.0.4");
+    CHECK(loaded.config.nmosDnsSd == false);
+    CHECK(loaded.config.stateDir == "/config");
+    CHECK(loaded.config.cleanupOnExit == false);
+    CHECK(loaded.config.shutdownTimeoutS == 10);
+    CHECK(loaded.config.historyDurationNs == 2000000000ull);
+    CHECK(nodeLabel(loaded.config) == "pod");
+    CHECK(deviceLabel(loaded.config) == "MXL Replay");
+    CHECK(loaded.config.outputDomainId == makeNmosIds(loaded.config.nmosSeed).domain);
+
+    env["NMOS_LABEL"] = "Sport Replay";
+    env["NMOS_QUERY_ADDRESS"] = "10.0.0.5";
+    env["NMOS_QUERY_PORT"] = "4008";
+    env["NMOS_TAGS"] = "{\"urn:x-srf:production\":[\"sport-sa\"],\"urn:x-srf:function\":[\"replay\"]}";
+    auto const tagged = loadConfig(env, {});
+    CHECK(nodeLabel(tagged.config) == "Sport Replay");
+    CHECK(deviceLabel(tagged.config) == "Sport Replay");
+    CHECK(tagged.config.nmosQueryAddress == "10.0.0.5");
+    CHECK(tagged.config.nmosQueryPort == 4008);
+    CHECK(tagged.config.nmosTags.at("urn:x-srf:production").at(0) == "sport-sa");
+
+    std::map<std::string, std::string> alias{{"HOST_ID", "10.9.9.9"}};
+    CHECK(loadConfig(alias, {}).config.nmosHostAddress == "10.9.9.9");
+    alias["NMOS_HOST_ADDRESS"] = "10.9.9.8";
+    CHECK(loadConfig(alias, {}).config.nmosHostAddress == "10.9.9.8");
+
+    std::map<std::string, std::string> state{{"REPLAY_INPUTS", "2"}, {"NMOS_HOST_ADDRESS", "10.1.1.1"}};
+    std::map<std::string, std::string> file{{"REPLAY_INPUTS", "3"}};
+    std::map<std::string, std::string> over{{"REPLAY_INPUTS", "4"}, {"NMOS_HOST_ADDRESS", "10.1.1.1"}};
+    CHECK(loadConfig(over, file, state).config.inputs == 4);
+    CHECK(loadConfig({}, file, state).config.inputs == 3);
+
+    CHECK_THROWS_AS(loadConfig({{"NMOS_HOST_ADDRESS", "replay.local"}}, {}), ConfigError);
+    CHECK_THROWS_AS(loadConfig({{"NMOS_HOST_ADDRESS", "127.0.0.1"}}, {}), ConfigError);
+    CHECK_THROWS_AS(loadConfig({{"NMOS_TAGS", "[]"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
+    CHECK_THROWS_AS(loadConfig({{"WEB_PORT", "nope"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
+}
+
+TEST_CASE("output domain is created once and only removed when the id matches")
+{
+    auto const root = std::filesystem::temp_directory_path() / "mxl-replay-domain";
+    std::filesystem::remove_all(root);
+    auto const dir = root / "replay-a";
+    auto const created = ensureOutputDomain(dir.string(), "11111111-1111-1111-1111-111111111111", 42);
+    CHECK(created.status == DomainStatus::Ready);
+    auto const def = std::filesystem::path(dir) / "domain_def.json";
+    auto const options = std::filesystem::path(dir) / "options.json";
+    auto const beforeDef = std::filesystem::last_write_time(def);
+    auto const beforeOptions = std::filesystem::file_size(options);
+    auto const again = ensureOutputDomain(dir.string(), "11111111-1111-1111-1111-111111111111", 99);
+    CHECK(again.status == DomainStatus::Ready);
+    CHECK(std::filesystem::file_size(options) == beforeOptions);
+    CHECK(std::filesystem::last_write_time(def) == beforeDef);
+    auto const mismatch = ensureOutputDomain(dir.string(), "22222222-2222-2222-2222-222222222222", 42);
+    CHECK(mismatch.status == DomainStatus::Mismatch);
+    std::ifstream in(def);
+    std::string body;
+    std::getline(in, body);
+    CHECK(body.find("11111111-1111-1111-1111-111111111111") != std::string::npos);
+    auto const other = root / "other";
+    ensureOutputDomain(other.string(), "33333333-3333-3333-3333-333333333333", 1);
+    std::string error;
+    CHECK_FALSE(removeOwnDomain(other.string(), "11111111-1111-1111-1111-111111111111", error));
+    CHECK(std::filesystem::exists(other));
+    CHECK(removeOwnDomain(dir.string(), "11111111-1111-1111-1111-111111111111", error));
+    CHECK_FALSE(std::filesystem::exists(dir));
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("config export is json and import restores a clip")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-import";
+    std::filesystem::remove_all(dir);
+    auto const loaded = loadConfig(
+        {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+            {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+            {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    Engine engine(loaded.config, loaded.flat);
+    auto const exported = engine.exportConfigJson();
+    CHECK(exported.find("\"secrets\":false") != std::string::npos);
+    CHECK(exported.find("10.4.4.4") != std::string::npos);
+    CHECK(exported.find("password") == std::string::npos);
+    auto const imported = engine.importConfigJson(
+        "{\"settings\":{\"CH1_LABEL\":\"PVW\",\"CH1_MOTION\":\"repeat\"},\"clips\":[{\"id\":\"c9\",\"name\":\"goal\",\"camera\":1,\"in_ns\":1,\"out_ns\":2,"
+        "\"speed\":0.5,\"motion\":\"blend\",\"audio\":\"mute\",\"colour\":\"#fff\",\"tags\":\"\",\"end\":\"freeze\",\"library\":true,\"group\":\"\"}]}");
+    CHECK(imported.ok);
+    CHECK(engine.config().channelList[0].label == "PVW");
+    CHECK(engine.config().channelList[0].motion == MotionMode::Repeat);
+    CHECK(engine.clips().size() == 1);
+    CHECK(engine.clips()[0].name == "goal");
+    CHECK(std::filesystem::exists(dir / "state" / "config.json"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a busy web port exits as a bind failure")
+{
+    HttpServer first;
+    first.start(0, [](HttpRequest const&) { return HttpResponse{}; });
+    HttpServer second;
+    CHECK_THROWS_AS(second.start(first.port(), [](HttpRequest const&) { return HttpResponse{}; }), StartupError);
+    first.stop();
+}
+
+TEST_CASE("query api readiness uses the node id")
+{
+    HttpServer query;
+    std::string nodeId;
+    query.start(0, [&](HttpRequest const& request) {
+        HttpResponse response;
+        response.status = request.path.find(nodeId) != std::string::npos ? 200 : 404;
+        response.body = response.status == 200 ? "{\"id\":\"node\"}" : "{}";
+        response.contentType = "application/json";
+        return response;
+    });
+    nodeId = makeNmosIds("ready-replay").node;
+    CHECK(httpGetStatus("127.0.0.1", query.port(), "/x-nmos/query/v1.3/nodes/" + nodeId, 500) == 200);
+    CHECK(httpGetStatus("127.0.0.1", query.port(), "/x-nmos/query/v1.3/nodes/missing", 500) == 404);
+    query.stop();
 }
