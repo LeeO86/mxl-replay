@@ -1,0 +1,42 @@
+{
+  "title": "MXL Replay",
+  "uid": "mxl-replay",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Record drops",
+      "targets": [{ "expr": "sum by (camera) (rate(mxl_replay_record_dropped_total[1m]))" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Missing HFR phases",
+      "targets": [{ "expr": "sum by (camera) (rate(mxl_replay_phase_missing_total[1m]))" }]
+    },
+    {
+      "type": "stat",
+      "title": "Channel speed",
+      "targets": [{ "expr": "mxl_replay_channel_speed" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU frame time",
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(mxl_replay_frame_gpu_seconds_bucket[5m])))" }]
+    },
+    {
+      "type": "stat",
+      "title": "Free storage",
+      "targets": [{ "expr": "mxl_replay_free_bytes" }]
+    },
+    {
+      "type": "stat",
+      "title": "Protected bytes",
+      "targets": [{ "expr": "mxl_replay_protected_bytes" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Write throughput",
+      "targets": [{ "expr": "mxl_replay_write_bytes_per_second" }]
+    }
+  ]
+}

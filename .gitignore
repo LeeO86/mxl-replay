@@ -1,0 +1,7 @@
+build/
+web/node_modules/
+web/dist/
+.cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

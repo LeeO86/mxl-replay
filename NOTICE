@@ -1,0 +1,23 @@
+mxl-replay
+Copyright (C) 2026 the mxl-replay authors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+The optical-flow interpolation is a derivative of Futatabi, which is part of
+Nageru:
+
+  Copyright (C) 2018 Steinar H. Gunderson
+  https://nageru.sesse.net/
+
+Futatabi implements a GPU version of:
+
+  Till Kroeger, Radu Timofte, Dengxin Dai and Luc Van Gool,
+  "Fast Optical Flow using Dense Inverse Search", ECCV 2016.
+
+The occlusion-aware blend follows the temporal-interpolation method Futatabi
+uses, which is based on occlusion reasoning for frame interpolation with
+optical flow. Ported sources under src/flow keep that attribution in their
+headers.
