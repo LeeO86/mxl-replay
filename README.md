@@ -83,7 +83,26 @@ Prefix `mxl_replay_`. Cameras report record rate, drops, missing phases, and buf
 
 ## Deploy
 
-`docker/Dockerfile` builds the image `ghcr.io/leeo86/mxl-replay` and labels it `io.dmf.mxl.revision`. The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. Set `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`. Add `graphics` only if the OFA Vulkan path is enabled later.
+`docker/Dockerfile` builds `ghcr.io/leeo86/mxl-replay` and labels it `io.dmf.mxl.revision`. The Container workflow publishes the same way as the sibling media functions:
+
+| Tag | When |
+| --- | --- |
+| `nightly-dev` | every push to `main`, the nightly rebuild, and a manual run |
+| `git-<sha>` | every published build |
+| `X.Y.Z`, `X.Y`, `X`, `latest` | a `vX.Y.Z` release tag |
+
+`nightly-dev` is the rolling development image. Pull requests build the image and do not push it.
+
+```bash
+docker run --gpus all --network host \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
+  -e MXL_DOMAIN_SCAN_PATH=/Volumes/mxl \
+  -v /Volumes/mxl:/Volumes/mxl \
+  -v /data/replay:/data/replay \
+  ghcr.io/leeo86/mxl-replay:nightly-dev
+```
+
+The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.
 
 `docker/docker-compose.demo.yaml` is the compose demo: registry, two test-player outputs as cameras, this replay, and the WebRTC monitor on the channel outputs.
 
