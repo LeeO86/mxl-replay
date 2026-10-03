@@ -14,8 +14,11 @@
 #if defined(REPLAY_WITH_NMOS)
 #include <limits>
 #include "cpprest/host_utils.h"
+#include "nmos/channels.h"
 #include "nmos/clock_name.h"
+#include "nmos/colorspace.h"
 #include "nmos/connection_api.h"
+#include "nmos/connection_resources.h"
 #include "nmos/format.h"
 #include "nmos/group_hint.h"
 #include "nmos/interlace_mode.h"
@@ -25,10 +28,15 @@
 #include "nmos/mxl.h"
 #include "nmos/node_interfaces.h"
 #include "nmos/node_resource.h"
+#include "nmos/node_resources.h"
 #include "nmos/node_server.h"
+#include "nmos/rational.h"
+#include "nmos/resources.h"
 #include "nmos/server.h"
 #include "nmos/settings.h"
 #include "nmos/slog.h"
+#include "nmos/transfer_characteristic.h"
+#include "nmos/transport.h"
 #include "sdp/json.h"
 #endif
 
