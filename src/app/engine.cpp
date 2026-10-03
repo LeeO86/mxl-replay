@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -110,11 +111,17 @@ Engine::CameraRuntime::CameraRuntime(std::size_t capacity)
 {
 }
 
-Engine::Engine(Config config)
+Engine::Engine(Config config, std::map<std::string, std::string> settings)
     : config_(std::move(config))
+    , settings_(std::move(settings))
     , ids_(makeNmosIds(config_.nmosSeed))
 {
     std::error_code ec;
+    std::filesystem::create_directories(config_.stateDir, ec);
+    if (ec)
+    {
+        throw StartupError(75, "cannot create state directory " + config_.stateDir + ": " + ec.message());
+    }
     std::filesystem::create_directories(config_.storageDir, ec);
     if (ec)
     {
@@ -147,7 +154,18 @@ Engine::Engine(Config config)
     }
     libraryDir_ = config_.storageDir + "/library";
     std::filesystem::create_directories(libraryDir_, ec);
-    catalog_.open(config_.storageDir + "/index.sqlite");
+    auto const catalogPath = config_.stateDir + "/index.sqlite";
+    auto const legacyCatalog = config_.storageDir + "/index.sqlite";
+    if (!std::filesystem::exists(catalogPath, ec) && std::filesystem::exists(legacyCatalog, ec))
+    {
+        std::filesystem::copy_file(legacyCatalog, catalogPath, ec);
+        if (!ec)
+        {
+            logInfo("catalog_migrated", {{"from", legacyCatalog}, {"to", catalogPath}});
+        }
+    }
+    catalog_.open(catalogPath);
+    loadRoutes();
     gpu_ = cudaFlowAvailable();
     auto const period = framePeriodNs(config_.format.rateNum, config_.format.rateDen);
     for (auto const& camera : config_.cameras)
@@ -174,7 +192,21 @@ Engine::Engine(Config config)
         (void)channel;
         channels_.push_back(std::move(runtime));
     }
-    logInfo("replay_ready", {{"storage", config_.storageDir}, {"inputs", std::to_string(config_.inputs)}, {"channels", std::to_string(config_.channels)}});
+    if (settings_.empty())
+    {
+        std::istringstream lines(exportKeyValue(config_));
+        std::string line;
+        while (std::getline(lines, line))
+        {
+            auto const eq = line.find('=');
+            if (eq != std::string::npos)
+            {
+                settings_[line.substr(0, eq)] = line.substr(eq + 1);
+            }
+        }
+    }
+    logInfo("replay_ready", {{"storage", config_.storageDir}, {"state", config_.stateDir}, {"inputs", std::to_string(config_.inputs)},
+        {"channels", std::to_string(config_.channels)}});
 }
 
 Engine::~Engine() = default;
@@ -1178,10 +1210,570 @@ bool Engine::consolidate(std::string const& id, std::string& error)
     return true;
 }
 
-void Engine::setRoute(int camera, int phase, bool video, Route route)
+std::string Engine::routesPath() const
+{
+    return config_.stateDir + "/routes.json";
+}
+
+void Engine::loadRoutes()
+{
+    std::ifstream in(routesPath());
+    if (!in)
+    {
+        return;
+    }
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    auto const body = buffer.str();
+    std::size_t cursor = 0;
+    while (true)
+    {
+        auto const start = body.find('{', cursor);
+        if (start == std::string::npos)
+        {
+            break;
+        }
+        auto const end = body.find('}', start);
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        auto const item = body.substr(start, end - start + 1);
+        cursor = end + 1;
+        auto field = [&](char const* key) {
+            auto const needle = std::string("\"") + key + "\"";
+            auto const pos = item.find(needle);
+            if (pos == std::string::npos)
+            {
+                return std::string{};
+            }
+            auto const colon = item.find(':', pos + needle.size());
+            if (colon == std::string::npos)
+            {
+                return std::string{};
+            }
+            auto i = colon + 1;
+            while (i < item.size() && item[i] == ' ')
+            {
+                ++i;
+            }
+            if (i < item.size() && item[i] == '"')
+            {
+                auto const stop = item.find('"', i + 1);
+                return stop == std::string::npos ? std::string{} : item.substr(i + 1, stop - i - 1);
+            }
+            auto stop = i;
+            while (stop < item.size() && item[stop] != ',' && item[stop] != '}')
+            {
+                ++stop;
+            }
+            return item.substr(i, stop - i);
+        };
+        int const camera = std::atoi(field("camera").c_str());
+        int const phase = std::atoi(field("phase").c_str());
+        bool const video = field("video") != "false";
+        Route route;
+        route.active = field("active") == "true";
+        route.domainId = field("domain_id");
+        route.flowId = field("flow_id");
+        route.senderId = field("sender_id");
+        route.state = field("state").empty() ? (route.active ? "running" : "waiting") : field("state");
+        if (camera > 0 && phase > 0)
+        {
+            routes_[std::to_string(camera) + (video ? "v" : "a") + std::to_string(phase)] = route;
+        }
+    }
+}
+
+void Engine::saveRoutes() const
+{
+    std::ofstream out(routesPath());
+    if (!out)
+    {
+        return;
+    }
+    out << '[';
+    bool first = true;
+    for (auto const& [key, route] : routes_)
+    {
+        if (key.size() < 3)
+        {
+            continue;
+        }
+        bool const video = key.find('v') != std::string::npos;
+        auto const mark = key.find(video ? 'v' : 'a');
+        int const camera = std::atoi(key.substr(0, mark).c_str());
+        int const phase = std::atoi(key.substr(mark + 1).c_str());
+        if (!first)
+        {
+            out << ',';
+        }
+        first = false;
+        out << "{\"camera\":" << camera << ",\"phase\":" << phase << ",\"video\":" << (video ? "true" : "false") << ",\"active\":"
+            << (route.active ? "true" : "false") << ",\"domain_id\":\"" << jsonEscape(route.domainId) << "\",\"flow_id\":\"" << jsonEscape(route.flowId)
+            << "\",\"sender_id\":\"" << jsonEscape(route.senderId) << "\",\"state\":\"" << jsonEscape(route.state) << "\"}";
+    }
+    out << "]\n";
+}
+
+void Engine::setRoute(int camera, int phase, bool video, Route route, bool persist)
 {
     std::lock_guard lock{mutex_};
     routes_[std::to_string(camera) + (video ? "v" : "a") + std::to_string(phase)] = std::move(route);
+    if (persist)
+    {
+        saveRoutes();
+    }
+}
+
+namespace
+{
+std::string jsonObject(std::string const& body, std::string const& key)
+{
+    auto const needle = "\"" + key + "\"";
+    auto const pos = body.find(needle);
+    if (pos == std::string::npos)
+    {
+        return {};
+    }
+    auto const brace = body.find('{', pos + needle.size());
+    if (brace == std::string::npos || brace > pos + needle.size() + 8)
+    {
+        return {};
+    }
+    int depth = 0;
+    bool inString = false;
+    for (std::size_t i = brace; i < body.size(); ++i)
+    {
+        char const c = body[i];
+        if (inString)
+        {
+            if (c == '\\' && i + 1 < body.size())
+            {
+                ++i;
+                continue;
+            }
+            if (c == '"')
+            {
+                inString = false;
+            }
+            continue;
+        }
+        if (c == '"')
+        {
+            inString = true;
+        }
+        else if (c == '{')
+        {
+            ++depth;
+        }
+        else if (c == '}')
+        {
+            --depth;
+            if (depth == 0)
+            {
+                return body.substr(brace, i - brace + 1);
+            }
+        }
+    }
+    return {};
+}
+
+std::string jsonArray(std::string const& body, std::string const& key)
+{
+    auto const needle = "\"" + key + "\"";
+    auto const pos = body.find(needle);
+    if (pos == std::string::npos)
+    {
+        return {};
+    }
+    auto const brace = body.find('[', pos + needle.size());
+    if (brace == std::string::npos || brace > pos + needle.size() + 8)
+    {
+        return {};
+    }
+    int depth = 0;
+    bool inString = false;
+    for (std::size_t i = brace; i < body.size(); ++i)
+    {
+        char const c = body[i];
+        if (inString)
+        {
+            if (c == '\\' && i + 1 < body.size())
+            {
+                ++i;
+                continue;
+            }
+            if (c == '"')
+            {
+                inString = false;
+            }
+            continue;
+        }
+        if (c == '"')
+        {
+            inString = true;
+        }
+        else if (c == '[')
+        {
+            ++depth;
+        }
+        else if (c == ']')
+        {
+            --depth;
+            if (depth == 0)
+            {
+                return body.substr(brace, i - brace + 1);
+            }
+        }
+    }
+    return {};
+}
+
+std::map<std::string, std::string> parseStringObject(std::string const& object)
+{
+    std::map<std::string, std::string> values;
+    std::size_t i = 0;
+    while (i < object.size())
+    {
+        auto const keyStart = object.find('"', i);
+        if (keyStart == std::string::npos)
+        {
+            break;
+        }
+        auto const keyEnd = object.find('"', keyStart + 1);
+        if (keyEnd == std::string::npos)
+        {
+            break;
+        }
+        auto const key = object.substr(keyStart + 1, keyEnd - keyStart - 1);
+        auto const colon = object.find(':', keyEnd);
+        if (colon == std::string::npos)
+        {
+            break;
+        }
+        auto const valueStart = object.find('"', colon + 1);
+        if (valueStart == std::string::npos)
+        {
+            throw ConfigError("imported settings must be strings");
+        }
+        std::string value;
+        for (std::size_t j = valueStart + 1; j < object.size(); ++j)
+        {
+            if (object[j] == '\\' && j + 1 < object.size())
+            {
+                char const next = object[j + 1];
+                if (next == 'n')
+                {
+                    value.push_back('\n');
+                }
+                else if (next == 'r')
+                {
+                    value.push_back('\r');
+                }
+                else if (next == 't')
+                {
+                    value.push_back('\t');
+                }
+                else
+                {
+                    value.push_back(next);
+                }
+                ++j;
+                continue;
+            }
+            if (object[j] == '"')
+            {
+                i = j + 1;
+                break;
+            }
+            value.push_back(object[j]);
+        }
+        values[key] = value;
+    }
+    return values;
+}
+
+std::string fieldOf(std::string const& item, char const* key)
+{
+    auto const needle = std::string("\"") + key + "\"";
+    auto const pos = item.find(needle);
+    if (pos == std::string::npos)
+    {
+        return {};
+    }
+    auto const colon = item.find(':', pos + needle.size());
+    if (colon == std::string::npos)
+    {
+        return {};
+    }
+    auto i = colon + 1;
+    while (i < item.size() && item[i] == ' ')
+    {
+        ++i;
+    }
+    if (i < item.size() && item[i] == '"')
+    {
+        auto const stop = item.find('"', i + 1);
+        return stop == std::string::npos ? std::string{} : item.substr(i + 1, stop - i - 1);
+    }
+    auto stop = i;
+    while (stop < item.size() && item[stop] != ',' && item[stop] != '}' && item[stop] != ']')
+    {
+        ++stop;
+    }
+    return item.substr(i, stop - i);
+}
+
+std::vector<std::string> objectsIn(std::string const& array)
+{
+    std::vector<std::string> objects;
+    int depth = 0;
+    bool inString = false;
+    std::size_t start = std::string::npos;
+    for (std::size_t i = 0; i < array.size(); ++i)
+    {
+        char const c = array[i];
+        if (inString)
+        {
+            if (c == '\\' && i + 1 < array.size())
+            {
+                ++i;
+                continue;
+            }
+            if (c == '"')
+            {
+                inString = false;
+            }
+            continue;
+        }
+        if (c == '"')
+        {
+            inString = true;
+        }
+        else if (c == '{')
+        {
+            if (depth == 0)
+            {
+                start = i;
+            }
+            ++depth;
+        }
+        else if (c == '}')
+        {
+            --depth;
+            if (depth == 0 && start != std::string::npos)
+            {
+                objects.push_back(array.substr(start, i - start + 1));
+                start = std::string::npos;
+            }
+        }
+    }
+    return objects;
+}
+} // namespace
+
+std::string Engine::exportConfigJson() const
+{
+    std::lock_guard lock{mutex_};
+    std::ostringstream out;
+    out << "{\"version\":1,\"secrets\":false,\"settings\":{";
+    bool first = true;
+    for (auto const& [key, value] : settings_)
+    {
+        if (!first)
+        {
+            out << ',';
+        }
+        first = false;
+        out << '"' << jsonEscape(key) << "\":\"" << jsonEscape(value) << '"';
+    }
+    out << "},\"clips\":[";
+    first = true;
+    for (auto const& clip : catalog_.clips())
+    {
+        if (!first)
+        {
+            out << ',';
+        }
+        first = false;
+        out << "{\"id\":\"" << jsonEscape(clip.id) << "\",\"name\":\"" << jsonEscape(clip.name) << "\",\"camera\":" << clip.camera << ",\"in_ns\":" << clip.inNs
+            << ",\"out_ns\":" << clip.outNs << ",\"speed\":" << clip.speed << ",\"motion\":\"" << jsonEscape(clip.motion) << "\",\"audio\":\""
+            << jsonEscape(clip.audio) << "\",\"colour\":\"" << jsonEscape(clip.colour) << "\",\"tags\":\"" << jsonEscape(clip.tags) << "\",\"end\":\""
+            << endActionName(clip.end) << "\",\"library\":" << (clip.library ? "true" : "false") << ",\"group\":\"" << jsonEscape(clip.groupId) << "\"}";
+    }
+    out << "],\"playlists\":[";
+    first = true;
+    for (auto const& playlist : catalog_.playlists())
+    {
+        if (!first)
+        {
+            out << ',';
+        }
+        first = false;
+        out << "{\"id\":\"" << jsonEscape(playlist.id) << "\",\"name\":\"" << jsonEscape(playlist.name) << "\",\"entries\":[";
+        bool entryFirst = true;
+        for (auto const& entry : playlist.entries)
+        {
+            if (!entryFirst)
+            {
+                out << ',';
+            }
+            entryFirst = false;
+            out << "{\"clip_id\":\"" << jsonEscape(entry.clipId) << "\",\"speed\":" << entry.speed << ",\"end\":\"" << endActionName(entry.end)
+                << "\",\"auto_advance\":" << (entry.autoAdvance ? "true" : "false") << '}';
+        }
+        out << "]}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+Engine::ImportResult Engine::importConfigJson(std::string const& body)
+{
+    ImportResult result;
+    try
+    {
+        auto const settingsObject = jsonObject(body, "settings");
+        if (settingsObject.empty() && body.find("\"settings\"") != std::string::npos)
+        {
+            result.error = "settings must be an object of strings";
+            return result;
+        }
+        auto merged = settings_;
+        if (!settingsObject.empty())
+        {
+            auto const imported = parseStringObject(settingsObject);
+            for (auto const& [key, value] : imported)
+            {
+                merged[key] = value;
+            }
+        }
+        else if (!body.empty() && body.find('{') != std::string::npos && body.find("\"clips\"") == std::string::npos)
+        {
+            auto const imported = parseStringObject(body);
+            for (auto const& [key, value] : imported)
+            {
+                merged[key] = value;
+            }
+        }
+        auto const loaded = loadConfig({}, {}, merged);
+        static char const* restartKeys[] = {"REPLAY_FORMAT", "REPLAY_INPUTS", "REPLAY_CHANNELS", "REPLAY_STORAGE_DIR", "REPLAY_STATE_DIR", "WEB_PORT",
+            "NMOS_PORT", "NMOS_SEED", "NMOS_LABEL", "NMOS_HOST_ADDRESS", "MXL_OUTPUT_DOMAIN_DIR", "MXL_OUTPUT_DOMAIN_ID", "NMOS_REGISTRY_ADDRESS",
+            "NMOS_REGISTRY_PORT", "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT"};
+        for (auto const* key : restartKeys)
+        {
+            auto const before = settings_.count(key) ? settings_.at(key) : std::string{};
+            auto const after = merged.count(key) ? merged.at(key) : std::string{};
+            if (before != after)
+            {
+                result.restartRequired = true;
+            }
+        }
+        std::lock_guard lock{mutex_};
+        settings_ = merged;
+        if (loaded.config.inputs == config_.inputs)
+        {
+            for (std::size_t i = 0; i < config_.cameras.size(); ++i)
+            {
+                config_.cameras[i].label = loaded.config.cameras[i].label;
+                config_.cameras[i].colour = loaded.config.cameras[i].colour;
+            }
+        }
+        if (loaded.config.channels == config_.channels)
+        {
+            for (std::size_t i = 0; i < config_.channelList.size(); ++i)
+            {
+                config_.channelList[i].label = loaded.config.channelList[i].label;
+                config_.channelList[i].motion = loaded.config.channelList[i].motion;
+                config_.channelList[i].audio = loaded.config.channelList[i].audio;
+                config_.channelList[i].idle = loaded.config.channelList[i].idle;
+                config_.channelList[i].timecode = loaded.config.channelList[i].timecode;
+            }
+        }
+        std::ofstream out(config_.stateDir + "/config.json");
+        if (!out)
+        {
+            result.error = "cannot write " + config_.stateDir + "/config.json";
+            return result;
+        }
+        out << "{\n";
+        bool first = true;
+        for (auto const& [key, value] : settings_)
+        {
+            if (!first)
+            {
+                out << ",\n";
+            }
+            first = false;
+            out << "  \"" << jsonEscape(key) << "\": \"" << jsonEscape(value) << '"';
+        }
+        out << "\n}\n";
+        for (auto const& item : objectsIn(jsonArray(body, "clips")))
+        {
+            ClipRef clip;
+            clip.id = fieldOf(item, "id");
+            clip.name = fieldOf(item, "name");
+            if (clip.id.empty())
+            {
+                continue;
+            }
+            clip.camera = std::atoi(fieldOf(item, "camera").c_str());
+            clip.inNs = static_cast<std::uint64_t>(std::strtoull(fieldOf(item, "in_ns").c_str(), nullptr, 10));
+            clip.outNs = static_cast<std::uint64_t>(std::strtoull(fieldOf(item, "out_ns").c_str(), nullptr, 10));
+            clip.speed = std::strtod(fieldOf(item, "speed").c_str(), nullptr);
+            clip.motion = fieldOf(item, "motion");
+            clip.audio = fieldOf(item, "audio");
+            clip.colour = fieldOf(item, "colour");
+            clip.tags = fieldOf(item, "tags");
+            bool endOk = false;
+            clip.end = parseEndAction(fieldOf(item, "end"), &endOk);
+            if (!endOk)
+            {
+                clip.end = EndAction::Freeze;
+            }
+            clip.library = fieldOf(item, "library") == "true";
+            clip.groupId = fieldOf(item, "group");
+            catalog_.upsertClip(clip);
+        }
+        for (auto const& item : objectsIn(jsonArray(body, "playlists")))
+        {
+            Catalog::Playlist playlist;
+            playlist.id = fieldOf(item, "id");
+            playlist.name = fieldOf(item, "name");
+            if (playlist.id.empty())
+            {
+                continue;
+            }
+            for (auto const& entryText : objectsIn(jsonArray(item, "entries")))
+            {
+                PlaylistEntry entry;
+                entry.clipId = fieldOf(entryText, "clip_id");
+                entry.speed = std::strtod(fieldOf(entryText, "speed").c_str(), nullptr);
+                bool endOk = false;
+                entry.end = parseEndAction(fieldOf(entryText, "end"), &endOk);
+                if (!endOk)
+                {
+                    entry.end = EndAction::Next;
+                }
+                entry.autoAdvance = fieldOf(entryText, "auto_advance") != "false";
+                playlist.entries.push_back(entry);
+            }
+            catalog_.upsertPlaylist(playlist);
+        }
+        result.ok = true;
+        return result;
+    }
+    catch (ConfigError const& ex)
+    {
+        result.error = ex.what();
+        return result;
+    }
+    catch (std::exception const& ex)
+    {
+        result.error = ex.what();
+        return result;
+    }
 }
 
 Route Engine::route(int camera, int phase, bool video) const

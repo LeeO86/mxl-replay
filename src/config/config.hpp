@@ -6,6 +6,7 @@
 #include "playout/scheduler.hpp"
 #include "playout/shotbox.hpp"
 
+#include <cstdint>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,20 @@ class ConfigError : public std::runtime_error
 {
 public:
     using std::runtime_error::runtime_error;
+};
+
+class StartupError : public std::runtime_error
+{
+public:
+    StartupError(int code, std::string const& message)
+        : std::runtime_error(message)
+        , code_(code)
+    {
+    }
+    [[nodiscard]] int code() const { return code_; }
+
+private:
+    int code_;
 };
 
 enum class IdleSource
@@ -64,6 +79,7 @@ struct ChannelConfig
 struct Config
 {
     std::string hostId;
+    std::string stateDir = "/config";
     VideoFormat format;
     int inputs = 4;
     int channels = 2;
@@ -86,12 +102,21 @@ struct Config
     std::string scanPath = "/Volumes/mxl";
     std::string outputDomainDir;
     std::string outputDomainId;
+    std::uint64_t historyDurationNs = 2000000000ull;
+    bool cleanupOnExit = false;
+    int shutdownTimeoutS = 10;
     bool nmosEnable = true;
     std::string nmosRegistryAddress;
     int nmosRegistryPort = 3210;
+    std::string nmosQueryAddress;
+    int nmosQueryPort = 3211;
     bool nmosDnsSd = false;
     int nmosPort = 3302;
     std::string nmosSeed;
+    std::string nmosLabel;
+    bool nmosLabelExplicit = false;
+    std::map<std::string, std::vector<std::string>> nmosTags;
+    std::string nmosHostAddress;
     bool webEnable = true;
     int webPort = 8150;
     std::string logLevel = "info";
@@ -108,10 +133,16 @@ struct LoadedConfig
 };
 
 [[nodiscard]] std::vector<std::string> configKeys();
-[[nodiscard]] LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file);
+[[nodiscard]] LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file,
+    std::map<std::string, std::string> const& state = {});
 [[nodiscard]] std::map<std::string, std::string> readConfigFile(std::string const& path);
+[[nodiscard]] std::string stateDirectory(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file);
 [[nodiscard]] std::string exportKeyValue(Config const& config);
 [[nodiscard]] std::string hostnameString();
+[[nodiscard]] std::string firstNonLoopbackIpv4();
+[[nodiscard]] bool isIpv4Literal(std::string const& text);
+[[nodiscard]] std::string nodeLabel(Config const& config);
+[[nodiscard]] std::string deviceLabel(Config const& config);
 
 [[nodiscard]] char const* idleName(IdleSource idle);
 [[nodiscard]] char const* tcModeName(TcMode mode);

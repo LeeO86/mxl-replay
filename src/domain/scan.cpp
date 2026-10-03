@@ -115,25 +115,74 @@ bool isMirrorDomain(std::string const& domainDir)
     return jsonBool(body, "x-mxl-fabrics-agent.mirror");
 }
 
-bool ensureOutputDomain(std::string const& directory, std::string const& id, std::uint64_t historyNs)
+DomainResult ensureOutputDomain(std::string const& directory, std::string const& id, std::uint64_t historyNs)
 {
-    if (isMirrorDomain(directory))
-    {
-        return false;
-    }
+    auto const def = std::filesystem::path(directory) / "domain_def.json";
     std::error_code ec;
+    if (std::filesystem::is_regular_file(def, ec))
+    {
+        auto const body = fileText(def);
+        if (jsonBool(body, "x-mxl-fabrics-agent.mirror"))
+        {
+            return {DomainStatus::Mirror, "output domain is a fabrics mirror"};
+        }
+        auto const existing = jsonString(body, "id");
+        if (existing != id)
+        {
+            return {DomainStatus::Mismatch, "domain_def.json id " + existing + " does not match " + id};
+        }
+        return {DomainStatus::Ready, {}};
+    }
     std::filesystem::create_directories(directory, ec);
     if (ec)
     {
-        return false;
+        return {DomainStatus::Failed, "cannot create output domain: " + ec.message()};
     }
-    auto const def = std::filesystem::path(directory) / "domain_def.json";
-    if (!std::filesystem::exists(def))
     {
         std::ofstream out(def);
+        if (!out)
+        {
+            return {DomainStatus::Failed, "cannot write domain_def.json"};
+        }
         out << "{\"id\":\"" << id << "\",\"label\":\"MXL Replay\"}\n";
-        std::ofstream options(std::filesystem::path(directory) / "options.json");
+    }
+    auto const optionsPath = std::filesystem::path(directory) / "options.json";
+    if (!std::filesystem::exists(optionsPath, ec))
+    {
+        std::ofstream options(optionsPath);
+        if (!options)
+        {
+            return {DomainStatus::Failed, "cannot write options.json"};
+        }
         options << "{\"urn:x-mxl:option:history_duration/v1.0\":" << historyNs << "}\n";
+    }
+    return {DomainStatus::Ready, {}};
+}
+
+bool removeOwnDomain(std::string const& directory, std::string const& id, std::string& error)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(directory, ec))
+    {
+        return true;
+    }
+    auto const def = std::filesystem::path(directory) / "domain_def.json";
+    if (!std::filesystem::is_regular_file(def, ec))
+    {
+        error = "refusing to remove " + directory + " without domain_def.json";
+        return false;
+    }
+    auto const existing = jsonString(fileText(def), "id");
+    if (existing != id)
+    {
+        error = "refusing to remove domain " + existing;
+        return false;
+    }
+    std::filesystem::remove_all(directory, ec);
+    if (ec)
+    {
+        error = ec.message();
+        return false;
     }
     return true;
 }

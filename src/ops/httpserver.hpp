@@ -25,6 +25,8 @@ struct HttpResponse
 
 using HttpHandler = std::function<HttpResponse(HttpRequest const&)>;
 
+[[nodiscard]] int httpGetStatus(std::string const& host, int port, std::string const& path, int timeoutMs);
+
 class HttpServer
 {
 public:

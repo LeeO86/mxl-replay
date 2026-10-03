@@ -13,7 +13,8 @@ public:
     NmosNode(Config config, Engine& engine);
     ~NmosNode();
     void start();
-    void stop();
+    // false when deregistration did not finish inside SHUTDOWN_TIMEOUT_S.
+    bool stop();
     [[nodiscard]] bool running() const;
     [[nodiscard]] std::string summary() const;
 

@@ -1,5 +1,6 @@
 #include "app/engine.hpp"
 #include "config/config.hpp"
+#include "domain/scan.hpp"
 #include "media/timebase.hpp"
 #include "mxl/io.hpp"
 #include "nmos/node.hpp"
@@ -11,7 +12,9 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <thread>
@@ -76,10 +79,18 @@ int main(int argc, char** argv)
         {
             file = replay::readConfigFile(configPath);
         }
-        auto loaded = replay::loadConfig(env, file);
+        std::map<std::string, std::string> state;
+        auto const stateDir = replay::stateDirectory(env, file);
+        auto const statePath = stateDir + "/config.json";
+        if (std::filesystem::is_regular_file(statePath))
+        {
+            state = replay::readConfigFile(statePath);
+        }
+        auto loaded = replay::loadConfig(env, file, state);
         replay::setLogLevel(replay::parseLogLevel(loaded.config.logLevel));
         replay::setLogFormatJson(loaded.config.logFormat != "text");
-        replay::Engine engine(std::move(loaded.config));
+        auto const flat = loaded.flat;
+        replay::Engine engine(std::move(loaded.config), flat);
         replay::NmosNode node(engine.config(), engine);
         node.start();
         replay::MxlBridge bridge(engine);
@@ -126,10 +137,22 @@ int main(int argc, char** argv)
             std::this_thread::sleep_until(next);
         }
         bridge.stop();
-        node.stop();
+        bool const nmosStopped = node.stop();
+        if (engine.config().cleanupOnExit)
+        {
+            std::string error;
+            if (!replay::removeOwnDomain(engine.config().outputDomainDir, engine.config().outputDomainId, error))
+            {
+                replay::logError("mxl_cleanup_refused", {{"dir", engine.config().outputDomainDir}, {"error", error}});
+            }
+        }
         server.stop();
         if (gSignal.load() == SIGTERM)
         {
+            if (!nmosStopped)
+            {
+                std::_Exit(143);
+            }
             return 143;
         }
         return 0;

@@ -1,12 +1,17 @@
 #include "config/config.hpp"
 
+#include "nmos/ids.hpp"
 #include "util/uuid.hpp"
+
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <sstream>
-#include <unistd.h>
 
 namespace replay
 {
@@ -139,6 +144,132 @@ bool knownIndexed(std::string const& key)
     }
     return false;
 }
+
+std::uint64_t parseU64(std::string const& key, std::string const& text, std::uint64_t min, std::uint64_t max)
+{
+    try
+    {
+        std::size_t used = 0;
+        unsigned long long const value = std::stoull(text, &used);
+        if (used != text.size() || value < min || value > max)
+        {
+            throw ConfigError(key + " is out of range");
+        }
+        return static_cast<std::uint64_t>(value);
+    }
+    catch (ConfigError const&)
+    {
+        throw;
+    }
+    catch (...)
+    {
+        throw ConfigError(key + " is not an integer");
+    }
+}
+
+std::map<std::string, std::vector<std::string>> parseNmosTags(std::string const& text)
+{
+    std::map<std::string, std::vector<std::string>> tags;
+    if (text.empty() || text == "{}")
+    {
+        return tags;
+    }
+    std::size_t i = 0;
+    auto skip = [&] {
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t'))
+        {
+            ++i;
+        }
+    };
+    auto parseString = [&]() -> std::string {
+        skip();
+        if (i >= text.size() || text[i] != '"')
+        {
+            throw ConfigError("NMOS_TAGS values must be JSON strings");
+        }
+        ++i;
+        std::string out;
+        while (i < text.size() && text[i] != '"')
+        {
+            if (text[i] == '\\' && i + 1 < text.size())
+            {
+                ++i;
+            }
+            out.push_back(text[i]);
+            ++i;
+        }
+        if (i >= text.size() || text[i] != '"')
+        {
+            throw ConfigError("NMOS_TAGS has an unterminated string");
+        }
+        ++i;
+        return out;
+    };
+    skip();
+    if (i >= text.size() || text[i] != '{')
+    {
+        throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
+    }
+    ++i;
+    while (true)
+    {
+        skip();
+        if (i < text.size() && text[i] == '}')
+        {
+            break;
+        }
+        auto const key = parseString();
+        skip();
+        if (i >= text.size() || text[i] != ':')
+        {
+            throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
+        }
+        ++i;
+        skip();
+        if (i >= text.size() || text[i] != '[')
+        {
+            throw ConfigError("NMOS_TAGS values must be arrays of strings");
+        }
+        ++i;
+        std::vector<std::string> values;
+        while (true)
+        {
+            skip();
+            if (i < text.size() && text[i] == ']')
+            {
+                ++i;
+                break;
+            }
+            values.push_back(parseString());
+            skip();
+            if (i < text.size() && text[i] == ',')
+            {
+                ++i;
+                continue;
+            }
+            if (i < text.size() && text[i] == ']')
+            {
+                ++i;
+                break;
+            }
+            throw ConfigError("NMOS_TAGS values must be arrays of strings");
+        }
+        tags[key] = std::move(values);
+        skip();
+        if (i < text.size() && text[i] == ',')
+        {
+            ++i;
+            continue;
+        }
+        skip();
+        if (i < text.size() && text[i] == '}')
+        {
+            break;
+        }
+        throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
+    }
+    return tags;
+}
 } // namespace
 
 std::vector<std::string> configKeys()
@@ -146,9 +277,10 @@ std::vector<std::string> configKeys()
     return {"HOST_ID", "REPLAY_FORMAT", "REPLAY_INPUTS", "REPLAY_CHANNELS", "REPLAY_STORAGE_DIR", "REPLAY_BUFFER_HOURS", "REPLAY_JPEG_QUALITY",
         "REPLAY_PROTECT_MAX_PCT", "REPLAY_FLOW_MODULE", "REPLAY_INTERP_PRESET", "REPLAY_SLOWMO_AUDIO", "REPLAY_RAMP_FRAMES", "REPLAY_HFR_SNAP",
         "REPLAY_SEGMENT_SECONDS", "REPLAY_LIVE_DELAY_FRAMES", "REPLAY_PLAY_ON_FIRST_CLICK", "REPLAY_ALLOW_CPU_INTERP", "REPLAY_STORAGE_MIN_MBPS",
-        "REPLAY_ODIRECT", "REPLAY_SYNTHETIC", "MXL_DOMAIN_SCAN_PATH", "MXL_OUTPUT_DOMAIN_DIR", "MXL_OUTPUT_DOMAIN_ID", "NMOS_ENABLE",
-        "NMOS_REGISTRY_ADDRESS", "NMOS_REGISTRY_PORT", "NMOS_DNS_SD", "NMOS_PORT", "NMOS_SEED", "WEB_ENABLE", "WEB_PORT", "LOG_LEVEL", "LOG_FORMAT",
-        "REPLAY_CONFIG_FILE"};
+        "REPLAY_ODIRECT", "REPLAY_SYNTHETIC", "REPLAY_STATE_DIR", "MXL_DOMAIN_SCAN_PATH", "MXL_OUTPUT_DOMAIN_DIR", "MXL_OUTPUT_DOMAIN_ID",
+        "MXL_HISTORY_DURATION", "MXL_CLEANUP_ON_EXIT", "SHUTDOWN_TIMEOUT_S", "NMOS_ENABLE", "NMOS_REGISTRY_ADDRESS", "NMOS_REGISTRY_PORT",
+        "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "NMOS_DNS_SD", "NMOS_PORT", "NMOS_SEED", "NMOS_LABEL", "NMOS_TAGS", "NMOS_HOST_ADDRESS", "WEB_ENABLE",
+        "WEB_PORT", "LOG_LEVEL", "LOG_FORMAT", "REPLAY_CONFIG_FILE"};
 }
 
 std::string hostnameString()
@@ -159,6 +291,67 @@ std::string hostnameString()
         return "replay";
     }
     return buf;
+}
+
+bool isIpv4Literal(std::string const& text)
+{
+    in_addr addr{};
+    return inet_pton(AF_INET, text.c_str(), &addr) == 1;
+}
+
+std::string firstNonLoopbackIpv4()
+{
+    ifaddrs* list = nullptr;
+    if (getifaddrs(&list) != 0)
+    {
+        return {};
+    }
+    std::string found;
+    for (auto* cursor = list; cursor != nullptr; cursor = cursor->ifa_next)
+    {
+        if (cursor->ifa_addr == nullptr || cursor->ifa_addr->sa_family != AF_INET)
+        {
+            continue;
+        }
+        auto const& in = reinterpret_cast<sockaddr_in const*>(cursor->ifa_addr)->sin_addr;
+        char text[INET_ADDRSTRLEN] = {};
+        if (inet_ntop(AF_INET, &in, text, sizeof(text)) == nullptr)
+        {
+            continue;
+        }
+        std::string const address(text);
+        if (address == "0.0.0.0" || address.rfind("127.", 0) == 0)
+        {
+            continue;
+        }
+        found = address;
+        break;
+    }
+    freeifaddrs(list);
+    return found;
+}
+
+std::string stateDirectory(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file)
+{
+    if (env.count("REPLAY_STATE_DIR") != 0)
+    {
+        return env.at("REPLAY_STATE_DIR");
+    }
+    if (file.count("REPLAY_STATE_DIR") != 0)
+    {
+        return file.at("REPLAY_STATE_DIR");
+    }
+    return "/config";
+}
+
+std::string nodeLabel(Config const& config)
+{
+    return config.nmosLabelExplicit ? config.nmosLabel : config.hostId;
+}
+
+std::string deviceLabel(Config const& config)
+{
+    return config.nmosLabelExplicit ? config.nmosLabel : "MXL Replay";
 }
 
 char const* idleName(IdleSource idle)
@@ -273,18 +466,27 @@ std::map<std::string, std::string> readConfigFile(std::string const& path)
     return values;
 }
 
-LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file)
+LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file,
+    std::map<std::string, std::string> const& state)
 {
     auto const known = configKeys();
+    auto rejectUnknown = [&](std::map<std::string, std::string> const& source, char const* origin) {
+        for (auto const& [key, value] : source)
+        {
+            (void)value;
+            if (std::find(known.begin(), known.end(), key) == known.end() && !knownIndexed(key))
+            {
+                throw ConfigError(std::string("unknown configuration key ") + key + " in " + origin);
+            }
+        }
+    };
+    rejectUnknown(file, "the config file");
+    rejectUnknown(state, "the state file");
+    std::map<std::string, std::string> values = state;
     for (auto const& [key, value] : file)
     {
-        (void)value;
-        if (std::find(known.begin(), known.end(), key) == known.end() && !knownIndexed(key))
-        {
-            throw ConfigError("unknown configuration key " + key);
-        }
+        values[key] = value;
     }
-    std::map<std::string, std::string> values = file;
     for (auto const& [key, value] : env)
     {
         if (std::find(known.begin(), known.end(), key) != known.end() || knownIndexed(key))
@@ -305,6 +507,11 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     }
     cfg.inputs = parseInt("REPLAY_INPUTS", take(values, "REPLAY_INPUTS", "4"), 1, 12);
     cfg.channels = parseInt("REPLAY_CHANNELS", take(values, "REPLAY_CHANNELS", "2"), 1, 8);
+    cfg.stateDir = take(values, "REPLAY_STATE_DIR", "/config");
+    if (cfg.stateDir.empty())
+    {
+        throw ConfigError("REPLAY_STATE_DIR is empty");
+    }
     cfg.storageDir = take(values, "REPLAY_STORAGE_DIR", "/data/replay");
     cfg.bufferHours = parseDouble("REPLAY_BUFFER_HOURS", take(values, "REPLAY_BUFFER_HOURS", "2"), 0.01, 48);
     cfg.jpegQuality = parseInt("REPLAY_JPEG_QUALITY", take(values, "REPLAY_JPEG_QUALITY", "92"), 1, 100);
@@ -361,6 +568,13 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     }
     cfg.synthetic = flag;
     cfg.scanPath = take(values, "MXL_DOMAIN_SCAN_PATH", "/Volumes/mxl");
+    cfg.historyDurationNs = parseU64("MXL_HISTORY_DURATION", take(values, "MXL_HISTORY_DURATION", "2000000000"), 1, 86400000000000ull);
+    if (!parseBool(take(values, "MXL_CLEANUP_ON_EXIT", "false"), &flag))
+    {
+        throw ConfigError("MXL_CLEANUP_ON_EXIT must be a boolean");
+    }
+    cfg.cleanupOnExit = flag;
+    cfg.shutdownTimeoutS = parseInt("SHUTDOWN_TIMEOUT_S", take(values, "SHUTDOWN_TIMEOUT_S", "10"), 1, 600);
     if (!parseBool(take(values, "NMOS_ENABLE", "true"), &flag))
     {
         throw ConfigError("NMOS_ENABLE must be a boolean");
@@ -368,6 +582,19 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     cfg.nmosEnable = flag;
     cfg.nmosRegistryAddress = take(values, "NMOS_REGISTRY_ADDRESS", "");
     cfg.nmosRegistryPort = parseInt("NMOS_REGISTRY_PORT", take(values, "NMOS_REGISTRY_PORT", "3210"), 1, 65535);
+    cfg.nmosQueryAddress = take(values, "NMOS_QUERY_ADDRESS", cfg.nmosRegistryAddress);
+    if (values.count("NMOS_QUERY_PORT") != 0)
+    {
+        cfg.nmosQueryPort = parseInt("NMOS_QUERY_PORT", values.at("NMOS_QUERY_PORT"), 1, 65535);
+    }
+    else
+    {
+        if (cfg.nmosRegistryPort >= 65535)
+        {
+            throw ConfigError("NMOS_QUERY_PORT defaults to NMOS_REGISTRY_PORT + 1, which does not fit");
+        }
+        cfg.nmosQueryPort = cfg.nmosRegistryPort + 1;
+    }
     if (!parseBool(take(values, "NMOS_DNS_SD", "false"), &flag))
     {
         throw ConfigError("NMOS_DNS_SD must be a boolean");
@@ -375,6 +602,32 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     cfg.nmosDnsSd = flag;
     cfg.nmosPort = parseInt("NMOS_PORT", take(values, "NMOS_PORT", "3302"), 1, 65535);
     cfg.nmosSeed = take(values, "NMOS_SEED", cfg.hostId + "-replay");
+    cfg.nmosLabelExplicit = values.count("NMOS_LABEL") != 0;
+    cfg.nmosLabel = take(values, "NMOS_LABEL", "");
+    try
+    {
+        cfg.nmosTags = parseNmosTags(take(values, "NMOS_TAGS", ""));
+    }
+    catch (ConfigError const&)
+    {
+        throw;
+    }
+    if (values.count("NMOS_HOST_ADDRESS") != 0)
+    {
+        cfg.nmosHostAddress = values.at("NMOS_HOST_ADDRESS");
+    }
+    else if (values.count("HOST_ID") != 0 && isIpv4Literal(values.at("HOST_ID")))
+    {
+        cfg.nmosHostAddress = values.at("HOST_ID");
+    }
+    else
+    {
+        cfg.nmosHostAddress = firstNonLoopbackIpv4();
+    }
+    if (!isIpv4Literal(cfg.nmosHostAddress) || cfg.nmosHostAddress == "0.0.0.0" || cfg.nmosHostAddress.rfind("127.", 0) == 0)
+    {
+        throw ConfigError("NMOS_HOST_ADDRESS must be a non-loopback IPv4 address");
+    }
     if (!parseBool(take(values, "WEB_ENABLE", "true"), &flag))
     {
         throw ConfigError("WEB_ENABLE must be a boolean");
@@ -387,7 +640,7 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     cfg.outputDomainId = take(values, "MXL_OUTPUT_DOMAIN_ID", "");
     if (cfg.outputDomainId.empty())
     {
-        cfg.outputDomainId = uuidV5(kUuidNamespaceUrl, cfg.nmosSeed + "/domain");
+        cfg.outputDomainId = makeNmosIds(cfg.nmosSeed).domain;
     }
     else if (!isUuid(cfg.outputDomainId))
     {
@@ -501,11 +754,22 @@ std::string exportKeyValue(Config const& config)
     out << "MXL_DOMAIN_SCAN_PATH=" << config.scanPath << "\n";
     out << "MXL_OUTPUT_DOMAIN_DIR=" << config.outputDomainDir << "\n";
     out << "MXL_OUTPUT_DOMAIN_ID=" << config.outputDomainId << "\n";
+    out << "REPLAY_STATE_DIR=" << config.stateDir << "\n";
     out << "NMOS_REGISTRY_ADDRESS=" << config.nmosRegistryAddress << "\n";
     out << "NMOS_REGISTRY_PORT=" << config.nmosRegistryPort << "\n";
+    out << "NMOS_QUERY_ADDRESS=" << config.nmosQueryAddress << "\n";
+    out << "NMOS_QUERY_PORT=" << config.nmosQueryPort << "\n";
     out << "NMOS_DNS_SD=" << (config.nmosDnsSd ? "true" : "false") << "\n";
     out << "NMOS_PORT=" << config.nmosPort << "\n";
     out << "NMOS_SEED=" << config.nmosSeed << "\n";
+    out << "NMOS_HOST_ADDRESS=" << config.nmosHostAddress << "\n";
+    if (config.nmosLabelExplicit)
+    {
+        out << "NMOS_LABEL=" << config.nmosLabel << "\n";
+    }
+    out << "MXL_HISTORY_DURATION=" << config.historyDurationNs << "\n";
+    out << "MXL_CLEANUP_ON_EXIT=" << (config.cleanupOnExit ? "true" : "false") << "\n";
+    out << "SHUTDOWN_TIMEOUT_S=" << config.shutdownTimeoutS << "\n";
     out << "WEB_PORT=" << config.webPort << "\n";
     for (auto const& camera : config.cameras)
     {

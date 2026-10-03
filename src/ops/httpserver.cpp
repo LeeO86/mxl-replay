@@ -1,5 +1,6 @@
 #include "ops/httpserver.hpp"
 
+#include "config/config.hpp"
 #include "util/sha1.hpp"
 
 #include <arpa/inet.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <poll.h>
@@ -281,7 +283,7 @@ void HttpServer::start(int port, HttpHandler handler)
     {
         ::close(impl_->listenFd);
         impl_->listenFd = -1;
-        throw std::runtime_error("bind failed");
+        throw StartupError(75, "cannot bind WEB_PORT " + std::to_string(port));
     }
     sockaddr_in bound{};
     socklen_t len = sizeof(bound);
@@ -328,6 +330,65 @@ void HttpServer::stop()
 int HttpServer::port() const
 {
     return impl_->boundPort;
+}
+
+int httpGetStatus(std::string const& host, int port, std::string const& path, int timeoutMs)
+{
+    int const fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        return 0;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<std::uint16_t>(port));
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
+    {
+        ::close(fd);
+        return 0;
+    }
+    timeval timeout{};
+    timeout.tv_sec = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+    {
+        ::close(fd);
+        return 0;
+    }
+    auto const request = "GET " + path + " HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
+    if (!sendAll(fd, request.data(), request.size()))
+    {
+        ::close(fd);
+        return 0;
+    }
+    std::string response;
+    char buf[1024];
+    while (response.size() < 64)
+    {
+        auto const n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0)
+        {
+            break;
+        }
+        response.append(buf, buf + n);
+        if (response.find("\r\n") != std::string::npos)
+        {
+            break;
+        }
+    }
+    ::close(fd);
+    if (response.rfind("HTTP/", 0) != 0)
+    {
+        return 0;
+    }
+    auto const space = response.find(' ');
+    if (space == std::string::npos)
+    {
+        return 0;
+    }
+    return std::atoi(response.c_str() + space + 1);
 }
 
 void HttpServer::broadcast(std::string const& text)
