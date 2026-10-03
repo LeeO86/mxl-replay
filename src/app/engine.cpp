@@ -344,6 +344,15 @@ void Engine::ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t
     ++runtime.recorded;
 }
 
+void Engine::countDropped(int camera, std::uint64_t grains)
+{
+    std::lock_guard lock{mutex_};
+    if (camera >= 1 && camera <= static_cast<int>(cameras_.size()))
+    {
+        cameras_[static_cast<std::size_t>(camera - 1)].dropped += grains;
+    }
+}
+
 void Engine::ingestVideo(int camera, int phase, std::uint64_t taiNs, Frame10 frame)
 {
     std::lock_guard lock{mutex_};

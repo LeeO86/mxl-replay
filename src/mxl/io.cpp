@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -216,50 +217,104 @@ void MxlBridge::readLoop()
 #if defined(REPLAY_WITH_MXL)
     auto const& cfg = engine_.config();
     mxlRational const rate{cfg.format.rateNum, cfg.format.rateDen};
+    // One reader per camera phase, kept open while its route stays the same.
+    // Opening a reader scans every domain and maps every grain of the flow, so
+    // doing it per grain recorded about 9 of 50 grains per camera.
+    struct Input
+    {
+        std::string domainId;
+        std::string flowId;
+        mxlInstance instance = nullptr;
+        mxlFlowReader reader = nullptr;
+        std::uint64_t next = 0;
+    };
+    std::map<std::pair<int, int>, Input> inputs;
+    auto close = [](Input& input) {
+        if (input.reader != nullptr)
+        {
+            mxlReleaseFlowReader(input.instance, input.reader);
+        }
+        if (input.instance != nullptr)
+        {
+            mxlDestroyInstance(input.instance);
+        }
+        input = Input{};
+    };
     while (run_.load())
     {
+        bool read = false;
         for (auto const& camera : cfg.cameras)
         {
             for (int phase = 1; phase <= camera.phases; ++phase)
             {
+                auto& input = inputs[{camera.index, phase}];
                 auto const route = engine_.route(camera.index, phase, true);
                 if (!route.active || route.flowId.empty() || route.domainId.empty())
                 {
+                    close(input);
                     continue;
                 }
-                auto const domain = resolveDomain(cfg.scanPath, route.domainId);
-                if (!domain)
+                if (input.reader == nullptr || input.domainId != route.domainId || input.flowId != route.flowId)
                 {
-                    engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
-                    continue;
+                    close(input);
+                    auto const domain = resolveDomain(cfg.scanPath, route.domainId);
+                    if (domain)
+                    {
+                        input.instance = mxlCreateInstance(domain->path.c_str(), nullptr);
+                    }
+                    if (input.instance == nullptr || mxlCreateFlowReader(input.instance, route.flowId.c_str(), nullptr, &input.reader) != MXL_STATUS_OK)
+                    {
+                        close(input);
+                        engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
+                        continue;
+                    }
+                    input.domainId = route.domainId;
+                    input.flowId = route.flowId;
                 }
-                mxlInstance readerInstance = mxlCreateInstance(domain->path.c_str(), nullptr);
-                if (readerInstance == nullptr)
+                // Stay two grains behind the current index, as before, and read every grain since the last one.
+                auto const now = mxlTimestampToIndex(&rate, mxlGetTime());
+                auto const last = now > 2 ? now - 2 : now;
+                if (input.next == 0 || input.next > last + 1)
                 {
-                    continue;
+                    input.next = last;
                 }
-                mxlFlowReader reader = nullptr;
-                if (mxlCreateFlowReader(readerInstance, route.flowId.c_str(), nullptr, &reader) != MXL_STATUS_OK)
+                for (; input.next <= last; ++input.next)
                 {
-                    mxlDestroyInstance(readerInstance);
-                    engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
-                    continue;
+                    mxlGrainInfo info{};
+                    std::uint8_t* payload = nullptr;
+                    auto const status = mxlFlowReaderGetGrainNonBlocking(input.reader, input.next, &info, &payload);
+                    if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
+                    {
+                        engine_.countDropped(camera.index, 1);
+                        continue;
+                    }
+                    if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
+                    {
+                        break;
+                    }
+                    if (status != MXL_STATUS_OK)
+                    {
+                        close(input);
+                        engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
+                        break;
+                    }
+                    if (payload != nullptr && (info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
+                    {
+                        engine_.ingestV210(camera.index, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
+                        engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});
+                        read = true;
+                    }
                 }
-                auto const now = mxlGetTime();
-                auto const index = mxlTimestampToIndex(&rate, now);
-                mxlGrainInfo info{};
-                std::uint8_t* payload = nullptr;
-                if (mxlFlowReaderGetGrainNonBlocking(reader, index > 2 ? index - 2 : index, &info, &payload) == MXL_STATUS_OK && payload != nullptr &&
-                    (info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
-                {
-                    engine_.ingestV210(camera.index, phase, mxlIndexToTimestamp(&rate, index), payload, info.grainSize);
-                    engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});
-                }
-                mxlReleaseFlowReader(readerInstance, reader);
-                mxlDestroyInstance(readerInstance);
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (!read)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    for (auto& [key, input] : inputs)
+    {
+        close(input);
     }
 #else
     (void)engine_;

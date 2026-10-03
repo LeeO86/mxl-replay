@@ -54,6 +54,8 @@ public:
     void ingestVideo(int camera, int phase, std::uint64_t taiNs, Frame10 frame);
     // Packed v210 from an MXL grain. One device upload when nvJPEG is active.
     void ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t const* packed, std::size_t bytes);
+    // Grains the recorder could not read in time (they left the input ring).
+    void countDropped(int camera, std::uint64_t grains);
     void ingestAudio(int camera, std::uint64_t taiNs, std::vector<float> audio, int channels);
 
     [[nodiscard]] RenderedFrame render(int channel, std::uint64_t outputTaiNs);
