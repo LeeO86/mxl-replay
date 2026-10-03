@@ -91,6 +91,8 @@ RUN set -eu; \
     test "$(id -g replay)" = 1000
 USER 1000:1000
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
-LABEL io.dmf.mxl.revision="${MXL_REF}"
-EXPOSE 8150 3302
+LABEL org.opencontainers.image.source="https://github.com/LeeO86/mxl-replay" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      io.dmf.mxl.revision="${MXL_REF}"
+EXPOSE 8150 3302 3303
 ENTRYPOINT ["/usr/local/bin/mxl-replay"]

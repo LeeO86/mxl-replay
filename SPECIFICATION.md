@@ -313,7 +313,7 @@ The flow step (1–5) is a module behind one interface:
 
 Library (clips, uploads, conversion queue, export), Playlists, Cameras (inputs,
 phase groups, buffer settings, storage status), NMOS, Settings (config
-import/export, `KEY=value` export) — like the siblings.
+import/export as one JSON document) — like the siblings.
 
 ### 8.4 Controllers
 
@@ -328,19 +328,31 @@ REST under `/api/v1/…` (cameras, channels: transport/position/speed/angle, cli
 playlists, library, uploads, exports, config) and WebSocket `/api/v1/events`
 (positions, states, thumbnails at low rate, alarms) so several UIs stay in sync and
 other systems (e.g. a control surface or a vision mixer macro) can drive the replay.
-`/livez`, `/readyz`, `/statusz`, `/metrics` on `WEB_PORT`.
+`/livez`, `/readyz`, `/statusz`, `/metrics` on `WEB_PORT`. `/readyz` stays 503 until
+the node is visible on the Query API when a registry address is set.
+`GET /api/v1/config/export` and `POST /api/v1/config/import` exchange one JSON
+document. There are no secret settings.
 
 ---
 
 ## 9. NMOS
 
-- One Node, one Device ("MXL Replay"); deterministic UUIDv5 IDs.
+- One Node, one Device; deterministic UUIDv5 IDs from `NMOS_SEED`, including the
+  default output domain id. `NMOS_LABEL` sets the node label and the device label.
+  `NMOS_TAGS` is added to the node and the device. Group hints stay on the resources.
 - Inputs: per camera video + audio receivers; phase groups: N video receivers + one
   audio receiver, grouped (`<camera>:Video Phase k`).
 - Outputs: per channel video, audio and data (`video/smpte291`) senders with Sources
-  and Flows, grouped (`<channel>:Video|Audio|Data`). Flow IDs change only when the
+  and Flows, grouped (`<channel>:Video|Audio|Data`). Each sender's active connection
+  carries `mxl_domain_id` and `mxl_flow_id`. Flow IDs change only when the
   house format changes.
-- Static registry, DNS-SD off by default.
+- Receivers accept an IS-05 PATCH (`sender_id`, `master_enable`, `transport_params`,
+  `activate_immediate`). `master_enable: false` stops reading. The active connection
+  is restored from `REPLAY_STATE_DIR` after a restart.
+- Static registry. `NMOS_DNS_SD` defaults to false and then disables DNS-SD browse
+  and mDNS advertisement. Query API defaults to the registry address on
+  registration port + 1. The node href and API endpoints use `NMOS_HOST_ADDRESS`.
+- The Node API listens on `NMOS_PORT`. The events WebSocket listens on `NMOS_PORT + 1`.
 
 ---
 
@@ -357,9 +369,12 @@ other systems (e.g. a control surface or a vision mixer macro) can drive the rep
 | `REPLAY_FLOW_MODULE` | `dis-cuda` (`ofa` optional) |
 | `REPLAY_INTERP_PRESET` | `balanced` |
 | `REPLAY_SLOWMO_AUDIO` | `mute` |
-| `MXL_DOMAIN_SCAN_PATH` / `MXL_OUTPUT_DOMAIN_DIR` / `MXL_OUTPUT_DOMAIN_ID` | `/Volumes/mxl` / `/Volumes/mxl/replay-<seed-short>` / derived |
-| `NMOS_REGISTRY_ADDRESS` / `_PORT`, `NMOS_DNS_SD`, `NMOS_PORT`, `NMOS_SEED` | empty / 3210, false, 3302, `HOST_ID-replay` |
-| `WEB_PORT` | 8150 |
+| `REPLAY_STATE_DIR` | `/config` (catalog, imported settings, IS-05 routes) |
+| `MXL_DOMAIN_SCAN_PATH` / `MXL_OUTPUT_DOMAIN_DIR` / `MXL_OUTPUT_DOMAIN_ID` | `/Volumes/mxl` / `/Volumes/mxl/replay-<seed-short>` / UUIDv5 from `NMOS_SEED` |
+| `MXL_HISTORY_DURATION` / `MXL_CLEANUP_ON_EXIT` | 2000000000 ns / false |
+| `NMOS_REGISTRY_ADDRESS` / `_PORT`, `NMOS_QUERY_ADDRESS` / `_PORT` | empty / 3210, registry address / registry port + 1 |
+| `NMOS_DNS_SD`, `NMOS_PORT`, `NMOS_SEED`, `NMOS_LABEL`, `NMOS_TAGS`, `NMOS_HOST_ADDRESS` | false, 3302, `HOST_ID-replay`, unset, `{}`, first non-loopback IPv4 |
+| `WEB_PORT` / `SHUTDOWN_TIMEOUT_S` | 8150 / 10 |
 
 Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`,
 `phase_missing_total`, `buffer_seconds`, `jpeg_encode_seconds`; per channel
@@ -379,9 +394,14 @@ Deployment:
 - Compose demo: registry, two mxl-test-player outputs as "cameras" (motion and
   field-order patterns), the replay, mxl-webrtc-monitor on the channel outputs; and a
   Kubernetes Deployment that `mxl-poc-platform` can vendor.
-- CI and tags as siblings (`ghcr.io/leeo86/mxl-replay`), label `io.dmf.mxl.revision`;
-  the reference-harness image is built in CI but not published by default.
-- Exit codes 0, 75, 78, 143.
+- CI publishes `ghcr.io/leeo86/mxl-replay`: `nightly-dev` and `git-<sha7>` from `main`,
+  and `X.Y.Z` / `X.Y` / `X` from a `vX.Y.Z` tag. Labels include
+  `org.opencontainers.image.source`, `.revision`, `.licenses`, and `io.dmf.mxl.revision`.
+  The reference-harness image is built in CI but not published by default.
+- Pod network, uid 1000, no `hostIPC`. On SIGTERM: release MXL readers and writers,
+  DELETE the node from the registry, and with `MXL_CLEANUP_ON_EXIT=true` remove only
+  the function's own output domain. Exit codes 0, 75 (including a port that will not
+  bind), 78, 143.
 
 ---
 

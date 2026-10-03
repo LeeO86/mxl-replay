@@ -3,24 +3,31 @@
 # Point NMOS_REGISTRY_ADDRESS at a real registry in a facility.
 services:
   replay:
-    image: ghcr.io/leeo86/mxl-replay:nightly-dev
+    image: ghcr.io/leeo86/mxl-replay:1.0.0
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    network_mode: host
+    ports:
+      - "8150:8150"
+      - "3302:3302"
+      - "3303:3303"
     environment:
       REPLAY_FORMAT: "1080p50"
       REPLAY_INPUTS: "2"
       REPLAY_CHANNELS: "2"
       REPLAY_STORAGE_DIR: /data/replay
+      REPLAY_STATE_DIR: /config
       REPLAY_BUFFER_HOURS: "0.25"
       MXL_DOMAIN_SCAN_PATH: /Volumes/mxl
+      MXL_CLEANUP_ON_EXIT: "true"
       NMOS_REGISTRY_ADDRESS: ${NMOS_REGISTRY_ADDRESS:-127.0.0.1}
       NMOS_DNS_SD: "false"
+      NMOS_HOST_ADDRESS: ${NMOS_HOST_ADDRESS:-10.0.0.20}
       NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
     volumes:
       - /Volumes/mxl:/Volumes/mxl
       - replay-data:/data/replay
+      - replay-config:/config
     deploy:
       resources:
         reservations:
@@ -30,3 +37,4 @@ services:
 
 volumes:
   replay-data:
+  replay-config:
