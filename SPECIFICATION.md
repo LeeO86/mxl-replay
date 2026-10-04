@@ -118,6 +118,9 @@ of sequences beyond playlists, compressed outputs, HDR.
 
 - Ring buffer on a local NVMe volume (`REPLAY_STORAGE_DIR`, hostPath on the node),
   one segment file series per camera (e.g. 10 s segments) plus the SQLite index.
+  RAM holds only a frame index; frames are read back from the segments. Expired
+  segments are deleted unless a clip touches them; a restart indexes the existing
+  segments again.
 - Video stored as **JPEG 4:2:2** per frame (intra-frame, so any frame decodes
   independently), quality configurable (default 92), via nvJPEG or CPU fallback.
   Audio stored as float32 PCM per camera.

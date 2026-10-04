@@ -124,7 +124,6 @@ private:
     struct CameraRuntime
     {
         FrameRing ring;
-        std::unique_ptr<SegmentWriter> writer;
         std::vector<PhaseSlot> phases;
         std::uint64_t openHouse = 0;
         bool houseOpen = false;
@@ -135,7 +134,7 @@ private:
         std::uint64_t phaseMissing = 0;
         bool scaled = false;
         std::vector<std::uint8_t> preview;
-        explicit CameraRuntime(std::size_t capacity);
+        CameraRuntime(std::string directory, std::uint64_t retentionNs, int segmentSeconds);
     };
     struct ChannelRuntime
     {

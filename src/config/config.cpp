@@ -672,7 +672,7 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     {
         ChannelConfig channel;
         channel.index = i;
-        channel.label = take(values, "CH" + std::to_string(i) + "_LABEL", i == 1 ? "PGM" : "PVW");
+        channel.label = take(values, "CH" + std::to_string(i) + "_LABEL", i == 1 ? "PGM" : i == 2 ? "PVW" : "CH" + std::to_string(i));
         auto const idle = lower(take(values, "CH" + std::to_string(i) + "_IDLE", "last"));
         if (idle == "black")
         {
