@@ -21,6 +21,7 @@
 #include "record/ring.hpp"
 #include "util/uuid.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -115,27 +116,93 @@ TEST_CASE("phased HFR repeats a missing phase")
     CHECK(result.frames[1].timeNs <= result.frames[2].timeNs);
 }
 
-TEST_CASE("ring buffer skips protected frames")
+namespace
 {
-    FrameRing ring(4);
-    for (int i = 0; i < 4; ++i)
+constexpr std::uint64_t kSecond = 1000000000ull;
+
+std::filesystem::path freshDir(char const* name)
+{
+    auto const dir = std::filesystem::temp_directory_path() / name;
+    std::filesystem::remove_all(dir);
+    return dir;
+}
+
+StoredFrame frameAt(std::uint64_t tai, std::uint8_t value)
+{
+    StoredFrame frame;
+    frame.taiNs = tai;
+    frame.jpeg = {value, static_cast<std::uint8_t>(value + 1)};
+    frame.audio = {static_cast<float>(value), 0.5F};
+    return frame;
+}
+} // namespace
+
+TEST_CASE("disk ring reads frames back and survives a restart")
+{
+    auto const dir = freshDir("mxl-replay-ring-reopen");
     {
-        StoredFrame frame;
-        frame.taiNs = static_cast<std::uint64_t>(i);
-        frame.jpeg = {static_cast<std::uint8_t>(i)};
-        CHECK(ring.push(frame));
+        FrameRing ring(dir.string(), 3600 * kSecond, 1);
+        for (int i = 0; i < 10; ++i)
+        {
+            CHECK(ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 2, static_cast<std::uint8_t>(i))));
+        }
+        CHECK(ring.size() == 10);
+        auto const frame = ring.findNearest(3 * kSecond / 2 + 1);
+        REQUIRE(frame);
+        CHECK(frame->jpeg == std::vector<std::uint8_t>{2, 3});
+        CHECK(frame->audio == std::vector<float>{2.0F, 0.5F});
+        CHECK_FALSE(ring.push(frameAt(kSecond, 99)));
+        CHECK(ring.segmentCount() == 4);
     }
-    ring.protect(1, 2);
-    for (int i = 4; i < 8; ++i)
+    // 1.0.x files are removed; a record cut off at the end of a segment is ignored.
+    std::ofstream(dir / "cam1_seg0.bin") << "old";
+    std::vector<std::filesystem::path> segments;
+    for (auto const& item : std::filesystem::directory_iterator(dir))
     {
-        StoredFrame frame;
-        frame.taiNs = static_cast<std::uint64_t>(i);
-        frame.jpeg = {static_cast<std::uint8_t>(i)};
-        CHECK(ring.push(frame));
+        if (item.path().filename().string().rfind("seg-", 0) == 0)
+        {
+            segments.push_back(item.path());
+        }
     }
-    CHECK(ring.findNearest(1)->jpeg[0] == 1);
-    CHECK(ring.findNearest(2)->jpeg[0] == 2);
-    CHECK(ring.protectedCount() == 2);
+    std::sort(segments.begin(), segments.end());
+    REQUIRE(!segments.empty());
+    {
+        std::ofstream tail(segments.back(), std::ios::binary | std::ios::app);
+        std::string const garbage(20, '\xff');
+        tail << garbage;
+    }
+    FrameRing again(dir.string(), 3600 * kSecond, 1);
+    CHECK(again.size() == 10);
+    CHECK(again.findAtOrBefore(5 * kSecond)->jpeg[0] == 9);
+    CHECK_FALSE(std::filesystem::exists(dir / "cam1_seg0.bin"));
+    CHECK(again.push(frameAt(6 * kSecond, 20)));
+    CHECK(again.findAfter(5 * kSecond)->jpeg[0] == 20);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("disk ring deletes expired segments unless a clip protects them")
+{
+    auto const dir = freshDir("mxl-replay-ring-retention");
+    FrameRing ring(dir.string(), 3 * kSecond, 1);
+    ring.protect(kSecond, kSecond);
+    // 0.5 s steps, one segment per 1.5 s: [0.5-1.5] [2-3] [3.5-4.5] [5-6] [6.5-7.5] [8-9] [9.5-10]
+    for (int i = 0; i < 20; ++i)
+    {
+        CHECK(ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 2, static_cast<std::uint8_t>(i))));
+    }
+    ring.enforceRetention();
+    // Newest 10 s, retention 3 s: segments ending before 7 s go, except the protected first one.
+    CHECK(ring.segmentCount() == 4);
+    CHECK(ring.size() == 11);
+    CHECK(ring.protectedCount() == 1);
+    CHECK(ring.findNearest(kSecond)->jpeg[0] == 1);
+    CHECK(ring.findAtOrBefore(6 * kSecond)->taiNs == 3 * kSecond / 2);
+    ring.unprotect(kSecond, kSecond);
+    ring.enforceRetention();
+    CHECK(ring.segmentCount() == 3);
+    CHECK_FALSE(ring.findAtOrBefore(6 * kSecond));
+    CHECK(ring.protectedCount() == 0);
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("shotbox cues then plays and a playlist advances")

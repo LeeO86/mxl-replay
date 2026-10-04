@@ -113,8 +113,11 @@ std::string su(utility::string_t const& text)
 {
     return utility::conversions::to_utf8string(text);
 }
+// Labels the resource "<group> <role>" and adds the group hint. Without the label a
+// sender or receiver showed the node label, and the platform connects by label.
 void tagGroup(nmos::resource& resource, std::string const& group, std::string const& role)
 {
+    resource.data[U("label")] = web::json::value::string(us(group + " " + role));
     if (!resource.data.has_field(nmos::fields::tags))
     {
         resource.data[U("tags")] = web::json::value::object();

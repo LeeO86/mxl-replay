@@ -106,8 +106,8 @@ std::string jsonString(std::string const& text)
 }
 } // namespace
 
-Engine::CameraRuntime::CameraRuntime(std::size_t capacity)
-    : ring(capacity)
+Engine::CameraRuntime::CameraRuntime(std::string directory, std::uint64_t retentionNs, int segmentSeconds)
+    : ring(std::move(directory), retentionNs, segmentSeconds)
 {
 }
 
@@ -132,7 +132,11 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
     {
         throw StartupError(75, "cannot stat storage directory " + config_.storageDir);
     }
-    auto const freeBytes = static_cast<std::uint64_t>(st.f_bavail) * static_cast<std::uint64_t>(st.f_frsize);
+    auto freeBytes = static_cast<std::uint64_t>(st.f_bavail) * static_cast<std::uint64_t>(st.f_frsize);
+    for (auto const& camera : config_.cameras)
+    {
+        freeBytes += segmentBytes(config_.storageDir + "/cam" + std::to_string(camera.index));
+    }
     double required = 0;
     for (auto const& camera : config_.cameras)
     {
@@ -168,17 +172,28 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
     loadRoutes();
     gpu_ = cudaFlowAvailable();
     auto const period = framePeriodNs(config_.format.rateNum, config_.format.rateDen);
+    if (config_.odirect)
+    {
+        logWarn("odirect_ignored", {{"reason", "the buffer writes buffered and drops finished segments from the page cache"}});
+    }
+    cameras_.reserve(config_.cameras.size());
     for (auto const& camera : config_.cameras)
     {
-        double const hours = camera.bufferHours;
-        double const fps = camera.nativeFps > 0 ? static_cast<double>(camera.nativeFps)
-                                                 : static_cast<double>(config_.format.rateNum) / static_cast<double>(config_.format.rateDen);
-        auto const capacity = static_cast<std::size_t>(std::max(8.0, hours * 3600.0 * fps));
-        cameras_.emplace_back(capacity);
-        auto& runtime = cameras_.back();
-        runtime.phases.resize(static_cast<std::size_t>(camera.phases));
-        runtime.writer = std::make_unique<SegmentWriter>(config_.storageDir + "/cam" + std::to_string(camera.index), camera.index, config_.segmentSeconds,
-            config_.odirect);
+        auto const retention = static_cast<std::uint64_t>(camera.bufferHours * 3600.0 * 1e9);
+        cameras_.emplace_back(config_.storageDir + "/cam" + std::to_string(camera.index), retention, config_.segmentSeconds);
+        cameras_.back().phases.resize(static_cast<std::size_t>(camera.phases));
+    }
+    // Clips keep their frames: protect them again before old segments expire.
+    for (auto const& clip : catalog_.clips())
+    {
+        if (clip.camera >= 1 && clip.camera <= static_cast<int>(cameras_.size()))
+        {
+            cameras_[static_cast<std::size_t>(clip.camera - 1)].ring.protect(clip.inNs, clip.outNs);
+        }
+    }
+    for (auto& camera : cameras_)
+    {
+        camera.ring.enforceRetention();
     }
     for (auto const& channel : config_.channelList)
     {
@@ -242,14 +257,10 @@ void Engine::storeFrame(CameraRuntime& camera, std::uint64_t taiNs, Frame10 cons
         stored.jpeg = encodeJpeg422(frame, config_.jpegQuality);
     }
     stored.audio = audio;
-    if (!camera.ring.push(stored))
+    if (!camera.ring.push(std::move(stored)))
     {
         ++camera.dropped;
         return;
-    }
-    if (camera.writer)
-    {
-        camera.writer->write(taiNs, stored.jpeg.data(), stored.jpeg.size(), audio.data(), audio.size());
     }
     ++camera.recorded;
     camera.preview = tinyPreview(frame);
@@ -332,14 +343,6 @@ void Engine::ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t
     {
         ++runtime.dropped;
         return;
-    }
-    if (runtime.writer)
-    {
-        auto const& kept = runtime.ring.findNearest(taiNs);
-        if (kept)
-        {
-            runtime.writer->write(taiNs, kept->jpeg.data(), kept->jpeg.size(), kept->audio.data(), kept->audio.size());
-        }
     }
     ++runtime.recorded;
 }
@@ -1857,7 +1860,8 @@ std::string Engine::statusJson() const
         out << "{\"index\":" << cfg.index << ",\"label\":" << jsonString(cfg.label) << ",\"colour\":" << jsonString(cfg.colour)
             << ",\"record\":" << (cfg.record ? "true" : "false") << ",\"phases\":" << cfg.phases << ",\"hfr_factor\":" << hfrFactor(cfg.index)
             << ",\"frames\":" << camera.ring.size() << ",\"dropped\":" << camera.dropped << ",\"phase_missing\":" << camera.phaseMissing
-            << ",\"scaled\":" << (camera.scaled ? "true" : "false") << ",\"protected_bytes\":" << camera.ring.protectedBytes() << '}';
+            << ",\"scaled\":" << (camera.scaled ? "true" : "false") << ",\"protected_bytes\":" << camera.ring.protectedBytes()
+            << ",\"disk_bytes\":" << camera.ring.diskBytes() << ",\"segments\":" << camera.ring.segmentCount() << '}';
     }
     out << "],\"channels\":[";
     for (std::size_t i = 0; i < channels_.size(); ++i)

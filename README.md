@@ -25,9 +25,11 @@ Video is JPEG 4:2:2, 8-bit, default quality 92, encoded with nvJPEG when a GPU i
 bytes/frame = width * height * (quality / 92) * 0.1875
 ```
 
-High frame rate scales with the frame rate. Audio is float32 PCM, 48 kHz. The process refuses to start when `REPLAY_BUFFER_HOURS` does not fit on `REPLAY_STORAGE_DIR`, and it says how many bytes it needs.
+High frame rate scales with the frame rate. Audio is float32 PCM, 48 kHz. The process refuses to start when `REPLAY_BUFFER_HOURS` does not fit on `REPLAY_STORAGE_DIR`, and it says how many bytes it needs. Its own segments from an earlier run count as available.
 
-Use a dedicated NVMe, not the operating-system disk. Protected clip ranges are never overwritten. New clips warn once protected data exceeds `REPLAY_PROTECT_MAX_PCT` (default 50%) of the budget.
+The buffer lives on `REPLAY_STORAGE_DIR`: one series of segment files (`cam<N>/seg-<TAI>.bin`, `REPLAY_SEGMENT_SECONDS` each) per camera. Memory holds only an index of about 32 bytes per frame (4 cameras × 1.5 h at 50p: about 35 MB) and a few open files. Segments whose newest frame is older than the camera's buffer duration behind its newest frame are deleted, so disk use stays at the configured duration. After a restart the existing segments are indexed again: the buffer and the clips survive.
+
+Use a dedicated NVMe, not the operating-system disk. Protected clip ranges are never overwritten: a segment that a clip touches stays until the clip is deleted. New clips warn once protected data exceeds `REPLAY_PROTECT_MAX_PCT` (default 50%) of the budget.
 
 10-bit and 12-bit JPEG are not used. nvJPEG's baseline 4:2:2 encoder is 8-bit. See `IMPLEMENTATION_PLAN.md`.
 
@@ -79,7 +81,7 @@ Process state (the SQLite catalog, imported settings, and IS-05 routes) lives in
 | `REPLAY_PLAY_ON_FIRST_CLICK` | false |
 | `REPLAY_ALLOW_CPU_INTERP` | false |
 | `REPLAY_STORAGE_MIN_MBPS` | 100 |
-| `REPLAY_ODIRECT` | false |
+| `REPLAY_ODIRECT` | false (ignored since 1.1.0, see the implementation plan) |
 | `REPLAY_SYNTHETIC` | false |
 | `MXL_DOMAIN_SCAN_PATH` | `/Volumes/mxl` |
 | `MXL_OUTPUT_DOMAIN_DIR` | `<scan>/replay-<short id>` |
@@ -103,7 +105,7 @@ Process state (the SQLite catalog, imported settings, and IS-05 routes) lives in
 | `LOG_LEVEL` | `info` |
 | `LOG_FORMAT` | `json` |
 
-Per-camera keys are `CAM1_LABEL`, `CAM1_COLOUR` (alias `CAM1_COLOR`), `CAM1_RECORD`, `CAM1_AUDIO`, `CAM1_PHASES`, `CAM1_HFR_FPS`, `CAM1_BUFFER_HOURS`. Per-channel keys are `CH1_LABEL`, `CH1_IDLE` (`last`, `black`, `e2e`), `CH1_MOTION`, `CH1_AUDIO`, `CH1_TC` (`source` or `output`), `CH1_FLOW`, `CH1_ATMOS`, `CH1_LOCK`.
+Per-camera keys are `CAM1_LABEL`, `CAM1_COLOUR` (alias `CAM1_COLOR`), `CAM1_RECORD`, `CAM1_AUDIO`, `CAM1_PHASES`, `CAM1_HFR_FPS`, `CAM1_BUFFER_HOURS`. Per-channel keys are `CH1_LABEL` (default `PGM`, `PVW`, then `CH3`, `CH4` …), `CH1_IDLE` (`last`, `black`, `e2e`), `CH1_MOTION`, `CH1_AUDIO`, `CH1_TC` (`source` or `output`), `CH1_FLOW`, `CH1_ATMOS`, `CH1_LOCK`.
 
 `GET /api/v1/config/export` returns one JSON document (`version`, `settings`, `clips`, `playlists`). `POST /api/v1/config/import` accepts that document. Channel and camera labels and modes apply immediately. Ports, format, counts, the seed, and the domain are stored and take effect on the next start (`restart_required` in the response). IS-05 activations are kept in `REPLAY_STATE_DIR/routes.json` and restored after a restart.
 
@@ -126,7 +128,7 @@ HTTP on `WEB_PORT`:
 
 On SIGTERM the process stops playout, releases MXL readers and writers, removes its NMOS resources so the registry receives DELETEs, and, when `MXL_CLEANUP_ON_EXIT=true`, deletes only its own output domain. It then exits 143. Work still running after `SHUTDOWN_TIMEOUT_S` is abandoned.
 
-Playout channels are NMOS senders (video `video/v210`, audio `audio/float32`, data `video/smpte291`) in the replay's own domain. Inputs are receivers. A receiver accepts activation before the flow exists and stays `waiting` until the grain can be read. The process does not write into a mirror domain.
+Playout channels are NMOS senders (video `video/v210`, audio `audio/float32`, data `video/smpte291`) in the replay's own domain, labelled `<channel label> Video`, `Audio` and `Data`. Inputs are receivers, labelled `<camera label> Video` and `Audio` the same way. A receiver accepts activation before the flow exists and stays `waiting` until the grain can be read. The process does not write into a mirror domain.
 
 `REPLAY_SYNTHETIC=true` feeds a moving test raster into the recorder so the UI and the integration test can run without other MXL flows.
 
@@ -161,7 +163,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.0.1
+  ghcr.io/leeo86/mxl-replay:1.1.0
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+
+- The replay buffer lives on `REPLAY_STORAGE_DIR` instead of in RAM. 1.0.x kept every JPEG frame of the buffer in memory (4 cameras × 1.5 h is about 420 GB) and wrote segment files that were never read. Frames now go to the segments only; memory holds an index of about 32 bytes per frame and a few open files, and playback reads the frames back from the segments.
+- Disk use stays at the buffer duration: segments that are older than the camera's `BUFFER_HOURS` behind its newest frame are deleted, unless a clip touches them.
+- A restart keeps the buffer and the clips: the existing segments are indexed again and the clips in the catalog protect their frames again. 1.0.x renumbered its segments from 0 on every start and overwrote them; those files are removed at the first start.
+- The startup space check counts the buffer's own segments as available, so a second start with the storage kept no longer exits 78.
+- NMOS senders and receivers carry their own labels (`<channel label> Video`, `Audio`, `Data`; `<camera label> Video`, `Audio`) instead of the node label, so a controller can address them by label. Default channel labels are unique: `PGM`, `PVW`, `CH3`, `CH4` … (every channel after the first was `PVW`).
+- Camera status reports `disk_bytes` and `segments`.
+- `REPLAY_ODIRECT` is ignored with a warning.
+
 ## 1.0.1
 
 - GPU work no longer runs behind one lock. Every recorder input and every playout channel has its own thread, CUDA stream and nvJPEG state; the engine lock is released while a channel decodes, interpolates and downloads. Before, one thread encoded every camera and one loop rendered every channel in turn, both behind a single mutex. On an NVIDIA A16 (one GA107) four cameras now record at full rate while four 1080p50 channels interpolate at 0.5×; before, two channels left each camera at about 19 of 50 grains per second ([docs/benchmarks/README.md](docs/benchmarks/README.md)).
