@@ -17,7 +17,9 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <sys/resource.h>
 #include <thread>
+#include <vector>
 
 #ifdef REPLAY_HAS_UI
 #include "ops/webui_generated.hpp"
@@ -61,6 +63,15 @@ int main(int argc, char** argv)
             std::cout << "mxl-replay " << REPLAY_VERSION << "\nMXL pin " << REPLAY_MXL_REVISION << "\nUsage: mxl-replay [--config FILE]\n";
             return 0;
         }
+    }
+    // Every MXL flow keeps one descriptor per grain (50 for 1 s at 50p): four cameras
+    // and four channels (video, audio, ANC each) pass Docker's default soft limit of
+    // 1024, and further readers then fail with "Too many open files".
+    rlimit files{};
+    if (getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur < files.rlim_max)
+    {
+        files.rlim_cur = files.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &files);
     }
     auto env = environmentMap();
     for (int i = 1; i < argc; ++i)
@@ -108,6 +119,23 @@ int main(int argc, char** argv)
         std::signal(SIGTERM, onSignal);
         std::signal(SIGINT, onSignal);
         auto const period = std::chrono::nanoseconds(replay::framePeriodNs(engine.config().format.rateNum, engine.config().format.rateDen));
+        // Each channel renders and writes on its own thread. One thread rendering every
+        // channel in turn made four channels late while the GPU was far from busy.
+        std::vector<std::thread> playout;
+        for (int channel = 1; channel <= engine.config().channels; ++channel)
+        {
+            playout.emplace_back([&engine, &bridge, period, channel] {
+                auto due = std::chrono::steady_clock::now();
+                while (!gStop.load())
+                {
+                    auto const tai = replay::taiNowNs();
+                    auto rendered = engine.render(channel, tai);
+                    bridge.publish(channel, rendered, tai);
+                    due += period;
+                    std::this_thread::sleep_until(due);
+                }
+            });
+        }
         auto next = std::chrono::steady_clock::now();
         std::uint64_t synthetic = 0;
         while (!gStop.load())
@@ -124,17 +152,16 @@ int main(int argc, char** argv)
                 }
                 ++synthetic;
             }
-            for (int channel = 1; channel <= engine.config().channels; ++channel)
-            {
-                auto rendered = engine.render(channel, tai);
-                bridge.publish(channel, rendered, tai);
-            }
             if (engine.config().webEnable)
             {
                 server.broadcast(engine.statusJson());
             }
             next += period;
             std::this_thread::sleep_until(next);
+        }
+        for (auto& thread : playout)
+        {
+            thread.join();
         }
         bridge.stop();
         bool const nmosStopped = node.stop();

@@ -19,7 +19,6 @@
 #include <cmath>
 #include <cstring>
 #include <map>
-#include <mutex>
 #include <vector>
 
 namespace replay
@@ -47,6 +46,60 @@ struct DevFlow
     int height = 0;
 };
 
+// Device or page-locked host memory that is kept and only grows.
+struct Buffer
+{
+    void* ptr = nullptr;
+    std::size_t cap = 0;
+    bool host = false;
+
+    Buffer() = default;
+    Buffer(Buffer const&) = delete;
+    Buffer& operator=(Buffer const&) = delete;
+
+    ~Buffer()
+    {
+        release();
+    }
+
+    void* ensure(std::size_t bytes, bool pinnedHost)
+    {
+        if (ptr != nullptr && bytes <= cap && host == pinnedHost)
+        {
+            return ptr;
+        }
+        release();
+        if ((pinnedHost ? cudaMallocHost(&ptr, bytes) : cudaMalloc(&ptr, bytes)) != cudaSuccess)
+        {
+            ptr = nullptr;
+            return nullptr;
+        }
+        cap = bytes;
+        host = pinnedHost;
+        return ptr;
+    }
+
+    void release()
+    {
+        if (ptr != nullptr)
+        {
+            host ? cudaFreeHost(ptr) : cudaFree(ptr);
+        }
+        ptr = nullptr;
+        cap = 0;
+    }
+};
+
+void releasePlanes(DevPlanes& planes)
+{
+    cudaFree(planes.y);
+    cudaFree(planes.cb);
+    cudaFree(planes.cr);
+    planes = {};
+}
+
+// One per thread (recorder input, playout channel): its own nvJPEG states, stream and
+// buffers, so cameras and channels run in parallel instead of behind one mutex.
 struct Nv
 {
     nvjpegHandle_t handle{};
@@ -56,22 +109,142 @@ struct Nv
     cudaStream_t stream{};
     bool ready = false;
     DevPlanes slots[3];
-    std::mutex mutex;
+    // Which source frame slots[0] and slots[1] hold: consecutive output frames reuse
+    // the same pair (slow motion) or one of it, so it is not decoded again.
+    std::string slotKey[2];
+    DevPlanes preview;
+    Buffer packed;
+    Buffer pinned;
     std::map<std::string, DevFlow> flows;
+
+    Nv() = default;
+    Nv(Nv const&) = delete;
+    Nv& operator=(Nv const&) = delete;
+
+    ~Nv()
+    {
+        if (!ready)
+        {
+            return;
+        }
+        cudaStreamSynchronize(stream);
+        for (auto& entry : flows)
+        {
+            cudaFree(entry.second.u);
+            cudaFree(entry.second.v);
+        }
+        for (auto& slot : slots)
+        {
+            releasePlanes(slot);
+        }
+        releasePlanes(preview);
+        nvjpegEncoderParamsDestroy(params);
+        nvjpegEncoderStateDestroy(encoder);
+        nvjpegJpegStateDestroy(decoder);
+        nvjpegDestroy(handle);
+        cudaStreamDestroy(stream);
+    }
 };
 
 Nv& nv()
 {
-    static Nv state;
+    thread_local Nv state;
     return state;
 }
 
-void releasePlanes(DevPlanes& planes)
+// Stream-ordered allocations from the device's caching pool. cudaFree waits for the
+// whole device, so per-frame cudaMalloc/cudaFree serialised every channel and camera.
+template <typename T>
+bool devAlloc(T*& ptr, std::size_t bytes)
 {
-    cudaFree(planes.y);
-    cudaFree(planes.cb);
-    cudaFree(planes.cr);
-    planes = {};
+    void* raw = nullptr;
+    if (cudaMallocAsync(&raw, bytes, nv().stream) != cudaSuccess)
+    {
+        ptr = nullptr;
+        return false;
+    }
+    ptr = static_cast<T*>(raw);
+    return true;
+}
+
+void devFree(void* ptr)
+{
+    if (ptr != nullptr)
+    {
+        cudaFreeAsync(ptr, nv().stream);
+    }
+}
+
+// MXL grain memory this thread page-locked: the upload is then a direct DMA. Each
+// grain is its own mapping that lives as long as the reader, so it is locked once.
+struct HostMemory
+{
+    std::map<void const*, std::size_t> locked;
+    std::map<void const*, bool> other;
+
+    HostMemory() = default;
+    HostMemory(HostMemory const&) = delete;
+    HostMemory& operator=(HostMemory const&) = delete;
+
+    ~HostMemory()
+    {
+        release();
+    }
+
+    // True when `ptr` is locked (by this thread or another); false when it cannot be.
+    bool ensure(void const* ptr, std::size_t bytes)
+    {
+        auto const it = locked.find(ptr);
+        if (it != locked.end() && it->second >= bytes)
+        {
+            return true;
+        }
+        auto const seen = other.find(ptr);
+        if (seen != other.end())
+        {
+            return seen->second;
+        }
+        if (it != locked.end())
+        {
+            cudaHostUnregister(const_cast<void*>(ptr));
+            locked.erase(it);
+        }
+        static int const readOnly = [] {
+            int value = 0;
+            if (cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, 0) != cudaSuccess)
+            {
+                cudaGetLastError();
+                return 0;
+            }
+            return value;
+        }();
+        unsigned const flags = cudaHostRegisterPortable | (readOnly != 0 ? cudaHostRegisterReadOnly : 0u);
+        cudaError_t const err = cudaHostRegister(const_cast<void*>(ptr), bytes, flags);
+        if (err == cudaSuccess)
+        {
+            locked.emplace(ptr, bytes);
+            return true;
+        }
+        cudaGetLastError();
+        other.emplace(ptr, err == cudaErrorHostMemoryAlreadyRegistered);
+        return err == cudaErrorHostMemoryAlreadyRegistered;
+    }
+
+    void release()
+    {
+        for (auto const& entry : locked)
+        {
+            cudaHostUnregister(const_cast<void*>(entry.first));
+        }
+        locked.clear();
+        other.clear();
+    }
+};
+
+HostMemory& hostMemory()
+{
+    thread_local HostMemory value;
+    return value;
 }
 
 bool ensureSlot(DevPlanes& planes, int width, int height)
@@ -113,6 +286,13 @@ bool prepareNv()
     {
         return false;
     }
+    static bool const poolKept = [] {
+        // Keep freed stream-ordered memory in the pool instead of returning it each sync.
+        cudaMemPool_t pool{};
+        std::uint64_t keep = UINT64_MAX;
+        return cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep) == cudaSuccess;
+    }();
+    (void)poolKept;
     if (nvjpegCreateSimple(&state.handle) != NVJPEG_STATUS_SUCCESS)
     {
         return false;
@@ -121,7 +301,7 @@ bool prepareNv()
     {
         return false;
     }
-    if (cudaStreamCreate(&state.stream) != cudaSuccess)
+    if (cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking) != cudaSuccess)
     {
         return false;
     }
@@ -446,9 +626,8 @@ dim3 grid2(int width, int height)
 
 bool launchGray(DevPlanes const& planes, float*& gray)
 {
-    if (cudaMalloc(&gray, static_cast<std::size_t>(planes.width) * static_cast<std::size_t>(planes.height) * sizeof(float)) != cudaSuccess)
+    if (!devAlloc(gray, static_cast<std::size_t>(planes.width) * static_cast<std::size_t>(planes.height) * sizeof(float)))
     {
-        gray = nullptr;
         return false;
     }
     yToGrayKernel<<<grid2(planes.width, planes.height), block2(), 0, nv().stream>>>(planes.y, planes.pitchY, planes.width, planes.height, gray);
@@ -473,8 +652,8 @@ DevFlow computeFlowDevice(float* reference, float* search, int width, int height
         hs[static_cast<std::size_t>(level)] = std::max(1, hs[static_cast<std::size_t>(level - 1)] >> 1);
         int const dw = ws[static_cast<std::size_t>(level)];
         int const dh = hs[static_cast<std::size_t>(level)];
-        cudaMalloc(&pyrA[static_cast<std::size_t>(level)], static_cast<std::size_t>(dw * dh) * sizeof(float));
-        cudaMalloc(&pyrB[static_cast<std::size_t>(level)], static_cast<std::size_t>(dw * dh) * sizeof(float));
+        devAlloc(pyrA[static_cast<std::size_t>(level)], static_cast<std::size_t>(dw * dh) * sizeof(float));
+        devAlloc(pyrB[static_cast<std::size_t>(level)], static_cast<std::size_t>(dw * dh) * sizeof(float));
         downsampleKernel<<<grid2(dw, dh), block2(), 0, nv().stream>>>(pyrA[static_cast<std::size_t>(level - 1)], ws[static_cast<std::size_t>(level - 1)],
             hs[static_cast<std::size_t>(level - 1)], pyrA[static_cast<std::size_t>(level)], dw, dh);
         downsampleKernel<<<grid2(dw, dh), block2(), 0, nv().stream>>>(pyrB[static_cast<std::size_t>(level - 1)], ws[static_cast<std::size_t>(level - 1)],
@@ -493,9 +672,9 @@ DevFlow computeFlowDevice(float* reference, float* search, int width, int height
         float* denseU = nullptr;
         float* denseV = nullptr;
         float* weight = nullptr;
-        cudaMalloc(&denseU, static_cast<std::size_t>(lw * lh) * sizeof(float));
-        cudaMalloc(&denseV, static_cast<std::size_t>(lw * lh) * sizeof(float));
-        cudaMalloc(&weight, static_cast<std::size_t>(lw * lh) * sizeof(float));
+        devAlloc(denseU, static_cast<std::size_t>(lw * lh) * sizeof(float));
+        devAlloc(denseV, static_cast<std::size_t>(lw * lh) * sizeof(float));
+        devAlloc(weight, static_cast<std::size_t>(lw * lh) * sizeof(float));
         cudaMemsetAsync(denseU, 0, static_cast<std::size_t>(lw * lh) * sizeof(float), nv().stream);
         cudaMemsetAsync(denseV, 0, static_cast<std::size_t>(lw * lh) * sizeof(float), nv().stream);
         cudaMemsetAsync(weight, 0, static_cast<std::size_t>(lw * lh) * sizeof(float), nv().stream);
@@ -504,7 +683,7 @@ DevFlow computeFlowDevice(float* reference, float* search, int width, int height
         motionDensifyKernel<<<grid2(patchesX, patchesY), block2(), 0, nv().stream>>>(pyrA[static_cast<std::size_t>(index)], pyrB[static_cast<std::size_t>(index)], lw, lh, prevU,
             prevV, prevW, prevH, op.patchSize, op.searchIterations, patchesX, patchesY, denseU, denseV, weight);
         normalizeFlowKernel<<<(lw * lh + 255) / 256, 256, 0, nv().stream>>>(denseU, denseV, weight, lw * lh);
-        cudaFree(weight);
+        devFree(weight);
         if (op.variational)
         {
             int const sweeps = std::max(1, (level + 1) * 5);
@@ -513,8 +692,8 @@ DevFlow computeFlowDevice(float* reference, float* search, int width, int height
                 refineKernel<<<grid2(lw, lh), block2(), 0, nv().stream>>>(pyrA[static_cast<std::size_t>(index)], pyrB[static_cast<std::size_t>(index)], denseU, denseV, lw, lh, sweep);
             }
         }
-        cudaFree(prevU);
-        cudaFree(prevV);
+        devFree(prevU);
+        devFree(prevV);
         prevU = denseU;
         prevV = denseV;
         prevW = lw;
@@ -522,8 +701,8 @@ DevFlow computeFlowDevice(float* reference, float* search, int width, int height
     }
     for (int level = 1; level <= levels; ++level)
     {
-        cudaFree(pyrA[static_cast<std::size_t>(level)]);
-        cudaFree(pyrB[static_cast<std::size_t>(level)]);
+        devFree(pyrA[static_cast<std::size_t>(level)]);
+        devFree(pyrB[static_cast<std::size_t>(level)]);
     }
     flow.u = prevU;
     flow.v = prevV;
@@ -610,18 +789,26 @@ __global__ void copyPlanesKernel(std::uint8_t const* y, std::uint8_t const* cb, 
     }
 }
 
+// v210 kernels: one thread per 6-pixel group (launch with v210Grid). One thread per
+// row, as before, kept the GPU nearly idle and took milliseconds per frame.
+dim3 v210Grid(int width, int height)
+{
+    int const groups = (width + 5) / 6;
+    return dim3((groups + 127) / 128, height);
+}
+
 __global__ void packV210Kernel(std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitchY, int pitchC, int width, int height,
     std::uint8_t* dst, int rowBytes)
 {
-    int const row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= height)
+    int const group = blockIdx.x * blockDim.x + threadIdx.x;
+    int const row = blockIdx.y;
+    int const cw = width / 2;
+    int const groups = (width + 5) / 6;
+    if (row >= height || group >= groups)
     {
         return;
     }
-    int const cw = width / 2;
-    int const groups = (width + 5) / 6;
     std::uint8_t* line = dst + static_cast<std::size_t>(row) * static_cast<std::size_t>(rowBytes);
-    for (int group = 0; group < groups; ++group)
     {
         std::uint16_t yv[6] = {};
         std::uint16_t cbv[3] = {};
@@ -654,16 +841,16 @@ __global__ void packV210Kernel(std::uint8_t const* y, std::uint8_t const* cb, st
 __global__ void unpackV210Kernel(std::uint8_t const* src, int rowBytes, int width, int height, std::uint8_t* y, std::uint8_t* cb, std::uint8_t* cr, int pitchY,
     int pitchC)
 {
-    int const row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= height)
+    int const group = blockIdx.x * blockDim.x + threadIdx.x;
+    int const row = blockIdx.y;
+    int const cw = width / 2;
+    int const groups = (width + 5) / 6;
+    if (row >= height || group >= groups)
     {
         return;
     }
-    int const cw = width / 2;
-    int const groups = (width + 5) / 6;
     std::uint8_t const* line = src + static_cast<std::size_t>(row) * static_cast<std::size_t>(rowBytes);
-    int x = 0;
-    for (int group = 0; group < groups; ++group)
+    int x = group * 6;
     {
         std::uint32_t words[4];
         for (int byte = 0; byte < 16; ++byte)
@@ -784,26 +971,27 @@ std::vector<std::uint8_t> downloadV210(DevPlanes const& planes)
 {
     int const rowBytes = static_cast<int>(v210RowBytes(planes.width));
     std::size_t const bytes = static_cast<std::size_t>(rowBytes) * static_cast<std::size_t>(planes.height);
-    std::uint8_t* device = nullptr;
-    if (cudaMalloc(&device, bytes) != cudaSuccess)
+    auto& state = nv();
+    auto* device = static_cast<std::uint8_t*>(state.packed.ensure(bytes, false));
+    auto* pinned = static_cast<std::uint8_t*>(state.pinned.ensure(bytes, true));
+    if (device == nullptr || pinned == nullptr)
     {
         return {};
     }
-    packV210Kernel<<<planes.height, 1, 0, nv().stream>>>(planes.y, planes.cb, planes.cr, planes.pitchY, planes.pitchC, planes.width, planes.height, device, rowBytes);
-    std::vector<std::uint8_t> host(bytes);
-    cudaMemcpyAsync(host.data(), device, bytes, cudaMemcpyDeviceToHost, nv().stream);
-    cudaStreamSynchronize(nv().stream);
-    cudaFree(device);
-    if (cudaGetLastError() != cudaSuccess)
+    packV210Kernel<<<v210Grid(planes.width, planes.height), 128, 0, state.stream>>>(planes.y, planes.cb, planes.cr, planes.pitchY, planes.pitchC, planes.width,
+        planes.height, device, rowBytes);
+    // Page-locked target: a full-speed DMA instead of the driver's pageable staging.
+    cudaMemcpyAsync(pinned, device, bytes, cudaMemcpyDeviceToHost, state.stream);
+    if (cudaStreamSynchronize(state.stream) != cudaSuccess || cudaGetLastError() != cudaSuccess)
     {
         return {};
     }
-    return host;
+    return std::vector<std::uint8_t>(pinned, pinned + bytes);
 }
 
 std::vector<std::uint8_t> previewOf(DevPlanes const& planes)
 {
-    DevPlanes small;
+    auto& small = nv().preview;
     if (!ensureSlot(small, 32, 16))
     {
         return {};
@@ -813,7 +1001,6 @@ std::vector<std::uint8_t> previewOf(DevPlanes const& planes)
         planes.pitchC, std::min(planes.width, 32), std::min(planes.height, 16), small.y, small.cb, small.cr, small.pitchY, small.pitchC);
     std::vector<std::uint8_t> bytes;
     encodePlanes(small, 70, bytes);
-    releasePlanes(small);
     return bytes;
 }
 
@@ -828,21 +1015,21 @@ DevFlow cachedFlow(std::string const& key, DevPlanes const& a, DevPlanes const& 
     if (state.flows.size() > 8)
     {
         auto const oldest = state.flows.begin();
-        cudaFree(oldest->second.u);
-        cudaFree(oldest->second.v);
+        devFree(oldest->second.u);
+        devFree(oldest->second.v);
         state.flows.erase(oldest);
     }
     float* grayA = nullptr;
     float* grayB = nullptr;
     if (!launchGray(a, grayA) || !launchGray(b, grayB))
     {
-        cudaFree(grayA);
-        cudaFree(grayB);
+        devFree(grayA);
+        devFree(grayB);
         return {};
     }
     DevFlow flow = computeFlowDevice(grayA, grayB, a.width, a.height, op);
-    cudaFree(grayA);
-    cudaFree(grayB);
+    devFree(grayA);
+    devFree(grayB);
     if (flow.u != nullptr)
     {
         state.flows.emplace(key, flow);
@@ -861,44 +1048,74 @@ int cudaFlowDeviceCount()
     return count;
 }
 
-bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::uint8_t const* jpegB, std::size_t sizeB, float phase, bool interpolate,
-    OperatingPoint const& op, std::string const& flowKey, int width, int height, GpuPicture& out)
+bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB, std::size_t sizeB, std::string const& keyB,
+    float phase, bool interpolate, OperatingPoint const& op, std::string const& flowKey, int width, int height, GpuPicture& out)
 {
     if (jpegA == nullptr || sizeA == 0 || width < 2 || height < 1)
     {
         return false;
     }
     auto& state = nv();
-    std::lock_guard lock{state.mutex};
     if (!prepareNv())
     {
         return false;
     }
-    if (!decodeToSlot(jpegA, sizeA, state.slots[0]) || state.slots[0].width != width || state.slots[0].height != height)
-    {
-        return false;
-    }
+    auto holding = [&](std::string const& key) {
+        for (int i = 0; i < 2; ++i)
+        {
+            if (!key.empty() && state.slotKey[i] == key)
+            {
+                return i;
+            }
+        }
+        return -1;
+    };
+    // Decode into slot `index` unless it already holds `key`.
+    auto load = [&](int index, std::uint8_t const* jpeg, std::size_t size, std::string const& key) {
+        if (!key.empty() && state.slotKey[index] == key)
+        {
+            return true;
+        }
+        state.slotKey[index].clear();
+        if (!decodeToSlot(jpeg, size, state.slots[index]) || state.slots[index].width != width || state.slots[index].height != height)
+        {
+            return false;
+        }
+        state.slotKey[index] = key;
+        return true;
+    };
     bool const needB = jpegB != nullptr && sizeB > 0 && phase > 0.001f && phase < 0.999f;
-    if (needB && (!decodeToSlot(jpegB, sizeB, state.slots[1]) || state.slots[1].width != width || state.slots[1].height != height))
+    int a = holding(keyA);
+    if (a < 0)
+    {
+        a = needB && holding(keyB) == 0 ? 1 : 0;
+    }
+    if (!load(a, jpegA, sizeA, keyA))
     {
         return false;
     }
-    DevPlanes* source = &state.slots[0];
+    int const b = 1 - a;
+    if (needB && !load(b, jpegB, sizeB, keyB))
+    {
+        return false;
+    }
+    auto const& planesA = state.slots[a];
+    auto const& planesB = state.slots[b];
+    DevPlanes* source = &state.slots[a];
     if (needB)
     {
-        if (!ensureSlot(state.slots[2], state.slots[0].width, state.slots[0].height))
+        if (!ensureSlot(state.slots[2], planesA.width, planesA.height))
         {
             return false;
         }
         DevFlow flow;
         if (interpolate)
         {
-            flow = cachedFlow(flowKey, state.slots[0], state.slots[1], op);
+            flow = cachedFlow(flowKey, planesA, planesB, op);
         }
-        blendKernel<<<grid2(state.slots[0].width, state.slots[0].height), block2(), 0, nv().stream>>>(state.slots[0].y, state.slots[0].cb, state.slots[0].cr, state.slots[1].y,
-            state.slots[1].cb, state.slots[1].cr, state.slots[0].pitchY, state.slots[0].pitchC, state.slots[1].pitchY, state.slots[1].pitchC, state.slots[0].width,
-            state.slots[0].height, flow.u, flow.v, flow.width, flow.height, phase, state.slots[2].y, state.slots[2].cb, state.slots[2].cr, state.slots[2].pitchY,
-            state.slots[2].pitchC);
+        blendKernel<<<grid2(planesA.width, planesA.height), block2(), 0, nv().stream>>>(planesA.y, planesA.cb, planesA.cr, planesB.y, planesB.cb, planesB.cr,
+            planesA.pitchY, planesA.pitchC, planesB.pitchY, planesB.pitchC, planesA.width, planesA.height, flow.u, flow.v, flow.width, flow.height, phase,
+            state.slots[2].y, state.slots[2].cb, state.slots[2].cr, state.slots[2].pitchY, state.slots[2].pitchC);
         source = &state.slots[2];
     }
     if (cudaStreamSynchronize(state.stream) != cudaSuccess || cudaGetLastError() != cudaSuccess)
@@ -917,7 +1134,7 @@ std::vector<std::uint8_t> gpuEncodeV210(std::uint8_t const* packed, int width, i
         return {};
     }
     auto& state = nv();
-    std::lock_guard lock{state.mutex};
+    state.slotKey[0].clear();
     if (!prepareNv() || !ensureSlot(state.slots[0], width, height))
     {
         return {};
@@ -927,14 +1144,17 @@ std::vector<std::uint8_t> gpuEncodeV210(std::uint8_t const* packed, int width, i
         rowBytes = static_cast<int>(v210RowBytes(width));
     }
     std::size_t const bytes = static_cast<std::size_t>(rowBytes) * static_cast<std::size_t>(height);
-    std::uint8_t* device = nullptr;
-    if (cudaMalloc(&device, bytes) != cudaSuccess)
+    auto* device = static_cast<std::uint8_t*>(state.packed.ensure(bytes, false));
+    if (device == nullptr)
     {
         return {};
     }
+    // The MXL grain is page-locked on first use, so the copy is a direct DMA; when it
+    // cannot be locked the driver stages the pageable copy as before.
+    hostMemory().ensure(packed, bytes);
     cudaMemcpyAsync(device, packed, bytes, cudaMemcpyHostToDevice, state.stream);
-    unpackV210Kernel<<<height, 1, 0, nv().stream>>>(device, rowBytes, width, height, state.slots[0].y, state.slots[0].cb, state.slots[0].cr, state.slots[0].pitchY, state.slots[0].pitchC);
-    cudaFree(device);
+    unpackV210Kernel<<<v210Grid(width, height), 128, 0, state.stream>>>(device, rowBytes, width, height, state.slots[0].y, state.slots[0].cb, state.slots[0].cr,
+        state.slots[0].pitchY, state.slots[0].pitchC);
     std::vector<std::uint8_t> jpeg;
     if (!encodePlanes(state.slots[0], quality, jpeg))
     {
@@ -950,7 +1170,7 @@ std::vector<std::uint8_t> gpuEncodeFrame10(Frame10 const& frame, int quality)
         return {};
     }
     auto& state = nv();
-    std::lock_guard lock{state.mutex};
+    state.slotKey[0].clear();
     if (!prepareNv() || !ensureSlot(state.slots[0], frame.width, frame.height))
     {
         return {};
@@ -960,11 +1180,11 @@ std::vector<std::uint8_t> gpuEncodeFrame10(Frame10 const& frame, int quality)
     std::uint16_t* cr = nullptr;
     std::size_t const yBytes = frame.y.size() * sizeof(std::uint16_t);
     std::size_t const cBytes = frame.cb.size() * sizeof(std::uint16_t);
-    if (cudaMalloc(&y, yBytes) != cudaSuccess || cudaMalloc(&cb, cBytes) != cudaSuccess || cudaMalloc(&cr, cBytes) != cudaSuccess)
+    if (!devAlloc(y, yBytes) || !devAlloc(cb, cBytes) || !devAlloc(cr, cBytes))
     {
-        cudaFree(y);
-        cudaFree(cb);
-        cudaFree(cr);
+        devFree(y);
+        devFree(cb);
+        devFree(cr);
         return {};
     }
     cudaMemcpyAsync(y, frame.y.data(), yBytes, cudaMemcpyHostToDevice, state.stream);
@@ -972,14 +1192,25 @@ std::vector<std::uint8_t> gpuEncodeFrame10(Frame10 const& frame, int quality)
     cudaMemcpyAsync(cr, frame.cr.data(), cBytes, cudaMemcpyHostToDevice, state.stream);
     planes10Kernel<<<grid2(frame.width, frame.height), block2(), 0, nv().stream>>>(y, cb, cr, frame.width, frame.height, state.slots[0].y, state.slots[0].cb, state.slots[0].cr,
         state.slots[0].pitchY, state.slots[0].pitchC);
-    cudaFree(y);
-    cudaFree(cb);
-    cudaFree(cr);
+    devFree(y);
+    devFree(cb);
+    devFree(cr);
     std::vector<std::uint8_t> jpeg;
     if (!encodePlanes(state.slots[0], quality, jpeg))
     {
         return {};
     }
     return jpeg;
+}
+
+void gpuReleaseHostMemory()
+{
+    // No queued copy may still read the memory when it is unlocked.
+    auto& state = nv();
+    if (state.ready)
+    {
+        cudaStreamSynchronize(state.stream);
+    }
+    hostMemory().release();
 }
 } // namespace replay

@@ -1,6 +1,7 @@
 #include "mxl/io.hpp"
 
 #include "domain/scan.hpp"
+#include "flow/cuda_flow.hpp"
 #include "media/timebase.hpp"
 #include "media/v210.hpp"
 #include "util/logging.hpp"
@@ -8,7 +9,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <map>
 #include <thread>
 #include <vector>
 
@@ -109,7 +109,13 @@ void MxlBridge::start()
     }
     active_ = true;
     run_ = true;
-    thread_ = std::thread([this] { readLoop(); });
+    for (auto const& camera : cfg.cameras)
+    {
+        for (int phase = 1; phase <= camera.phases; ++phase)
+        {
+            threads_.emplace_back([this, index = camera.index, phase] { readInput(index, phase); });
+        }
+    }
     logInfo("mxl_started", {{"domain", cfg.outputDomainId}});
 #endif
 }
@@ -117,10 +123,14 @@ void MxlBridge::start()
 void MxlBridge::stop()
 {
     run_ = false;
-    if (thread_.joinable())
+    for (auto& thread : threads_)
     {
-        thread_.join();
+        if (thread.joinable())
+        {
+            thread.join();
+        }
     }
+    threads_.clear();
 #if defined(REPLAY_WITH_MXL)
     if (impl_ != nullptr && impl_->instance != nullptr)
     {
@@ -212,14 +222,14 @@ void MxlBridge::publish(int channel, RenderedFrame const& frame, std::uint64_t t
 #endif
 }
 
-void MxlBridge::readLoop()
+void MxlBridge::readInput(int camera, int phase)
 {
 #if defined(REPLAY_WITH_MXL)
     auto const& cfg = engine_.config();
     mxlRational const rate{cfg.format.rateNum, cfg.format.rateDen};
-    // One reader per camera phase, kept open while its route stays the same.
-    // Opening a reader scans every domain and maps every grain of the flow, so
-    // doing it per grain recorded about 9 of 50 grains per camera.
+    // The reader is kept open while its route stays the same. Opening a reader scans
+    // every domain and maps every grain of the flow, so doing it per grain recorded
+    // about 9 of 50 grains per camera.
     struct Input
     {
         std::string domainId;
@@ -228,96 +238,94 @@ void MxlBridge::readLoop()
         mxlFlowReader reader = nullptr;
         std::uint64_t next = 0;
     };
-    std::map<std::pair<int, int>, Input> inputs;
-    auto close = [](Input& input) {
-        if (input.reader != nullptr)
+    Input input;
+    auto close = [](Input& open) {
+        if (open.reader != nullptr)
         {
-            mxlReleaseFlowReader(input.instance, input.reader);
+            // The encoder page-locked this reader's grains; unlock before they are unmapped.
+            gpuReleaseHostMemory();
+            mxlReleaseFlowReader(open.instance, open.reader);
         }
-        if (input.instance != nullptr)
+        if (open.instance != nullptr)
         {
-            mxlDestroyInstance(input.instance);
+            mxlDestroyInstance(open.instance);
         }
-        input = Input{};
+        open = Input{};
+    };
+    // Reads (and encodes) every grain due since the last call; false when nothing was read.
+    auto step = [&]() -> bool {
+        auto const route = engine_.route(camera, phase, true);
+        if (!route.active || route.flowId.empty() || route.domainId.empty())
+        {
+            close(input);
+            return false;
+        }
+        if (input.reader == nullptr || input.domainId != route.domainId || input.flowId != route.flowId)
+        {
+            close(input);
+            auto const domain = resolveDomain(cfg.scanPath, route.domainId);
+            if (domain)
+            {
+                input.instance = mxlCreateInstance(domain->path.c_str(), nullptr);
+            }
+            if (input.instance == nullptr || mxlCreateFlowReader(input.instance, route.flowId.c_str(), nullptr, &input.reader) != MXL_STATUS_OK)
+            {
+                close(input);
+                engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
+                return false;
+            }
+            input.domainId = route.domainId;
+            input.flowId = route.flowId;
+        }
+        // Stay two grains behind the current index, as before, and read every grain since the last one.
+        auto const now = mxlTimestampToIndex(&rate, mxlGetTime());
+        auto const last = now > 2 ? now - 2 : now;
+        if (input.next == 0 || input.next > last + 1)
+        {
+            input.next = last;
+        }
+        bool read = false;
+        for (; input.next <= last; ++input.next)
+        {
+            mxlGrainInfo info{};
+            std::uint8_t* payload = nullptr;
+            auto const status = mxlFlowReaderGetGrainNonBlocking(input.reader, input.next, &info, &payload);
+            if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
+            {
+                engine_.countDropped(camera, 1);
+                continue;
+            }
+            if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
+            {
+                break;
+            }
+            if (status != MXL_STATUS_OK)
+            {
+                close(input);
+                engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
+                break;
+            }
+            if (payload != nullptr && (info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
+            {
+                engine_.ingestV210(camera, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
+                engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});
+                read = true;
+            }
+        }
+        return read;
     };
     while (run_.load())
     {
-        bool read = false;
-        for (auto const& camera : cfg.cameras)
-        {
-            for (int phase = 1; phase <= camera.phases; ++phase)
-            {
-                auto& input = inputs[{camera.index, phase}];
-                auto const route = engine_.route(camera.index, phase, true);
-                if (!route.active || route.flowId.empty() || route.domainId.empty())
-                {
-                    close(input);
-                    continue;
-                }
-                if (input.reader == nullptr || input.domainId != route.domainId || input.flowId != route.flowId)
-                {
-                    close(input);
-                    auto const domain = resolveDomain(cfg.scanPath, route.domainId);
-                    if (domain)
-                    {
-                        input.instance = mxlCreateInstance(domain->path.c_str(), nullptr);
-                    }
-                    if (input.instance == nullptr || mxlCreateFlowReader(input.instance, route.flowId.c_str(), nullptr, &input.reader) != MXL_STATUS_OK)
-                    {
-                        close(input);
-                        engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
-                        continue;
-                    }
-                    input.domainId = route.domainId;
-                    input.flowId = route.flowId;
-                }
-                // Stay two grains behind the current index, as before, and read every grain since the last one.
-                auto const now = mxlTimestampToIndex(&rate, mxlGetTime());
-                auto const last = now > 2 ? now - 2 : now;
-                if (input.next == 0 || input.next > last + 1)
-                {
-                    input.next = last;
-                }
-                for (; input.next <= last; ++input.next)
-                {
-                    mxlGrainInfo info{};
-                    std::uint8_t* payload = nullptr;
-                    auto const status = mxlFlowReaderGetGrainNonBlocking(input.reader, input.next, &info, &payload);
-                    if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
-                    {
-                        engine_.countDropped(camera.index, 1);
-                        continue;
-                    }
-                    if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
-                    {
-                        break;
-                    }
-                    if (status != MXL_STATUS_OK)
-                    {
-                        close(input);
-                        engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
-                        break;
-                    }
-                    if (payload != nullptr && (info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
-                    {
-                        engine_.ingestV210(camera.index, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
-                        engine_.setRoute(camera.index, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});
-                        read = true;
-                    }
-                }
-            }
-        }
-        if (!read)
+        if (!step())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
-    for (auto& [key, input] : inputs)
-    {
-        close(input);
-    }
+    close(input);
 #else
     (void)engine_;
+    (void)camera;
+    (void)phase;
 #endif
 }
 } // namespace replay

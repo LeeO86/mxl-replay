@@ -28,8 +28,8 @@ int cudaFlowDeviceCount()
     return 0;
 }
 
-bool gpuRenderFromJpeg(std::uint8_t const*, std::size_t, std::uint8_t const*, std::size_t, float, bool, OperatingPoint const&, std::string const&, int, int,
-    GpuPicture&)
+bool gpuRenderFromJpeg(std::uint8_t const*, std::size_t, std::string const&, std::uint8_t const*, std::size_t, std::string const&, float, bool, OperatingPoint const&,
+    std::string const&, int, int, GpuPicture&)
 {
     return false;
 }
@@ -42,6 +42,10 @@ std::vector<std::uint8_t> gpuEncodeV210(std::uint8_t const*, int, int, int, int)
 std::vector<std::uint8_t> gpuEncodeFrame10(Frame10 const&, int)
 {
     return {};
+}
+
+void gpuReleaseHostMemory()
+{
 }
 #endif
 
