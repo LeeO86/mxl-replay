@@ -43,7 +43,7 @@ Two 1080p50 interpolate channels keep up on this GPU; four do not. The GPU is no
 
 ## Lab run 2026-10-04: per-thread GPU pipeline
 
-Same host, GPU and cameras as above; storage the OS disk. Image built from this repository with the per-thread GPU pipeline (CHANGELOG, Unreleased) against `mxl-replay:lab` (1.0.0 plus the recorder fix). Each case: the four test-player outputs routed to cameras 1–4 (all recording), every channel set to `interpolate` and played at 0.5× from 10 s back, 30 s measured. Recorded and dropped grains come from `/api/v1/status`, output grains/s and late reads from `mxl-verify` on each channel's video flow, latency from `mxl-info`, CPU from the container cgroup, SM load from `nvidia-smi dmon`.
+Same host, GPU and cameras as above; storage the OS disk. Image built from this repository with the per-thread GPU pipeline (1.0.1) against `mxl-replay:lab` (1.0.0 plus the recorder fix). Each case: the four test-player outputs routed to cameras 1–4 (all recording), every channel set to `interpolate` and played at 0.5× from 10 s back, 30 s measured. Recorded and dropped grains come from `/api/v1/status`, output grains/s and late reads from `mxl-verify` on each channel's video flow, latency from `mxl-info`, CPU from the container cgroup, SM load from `nvidia-smi dmon`.
 
 | Image | Channels | Recorded / dropped per camera per s | Output grains/s per channel | Output latency (grains) | CPU | GPU SM |
 | --- | --- | --- | --- | --- | --- | --- |

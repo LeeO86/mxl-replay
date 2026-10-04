@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.1
 
 - GPU work no longer runs behind one lock. Every recorder input and every playout channel has its own thread, CUDA stream and nvJPEG state; the engine lock is released while a channel decodes, interpolates and downloads. Before, one thread encoded every camera and one loop rendered every channel in turn, both behind a single mutex. On an NVIDIA A16 (one GA107) four cameras now record at full rate while four 1080p50 channels interpolate at 0.5×; before, two channels left each camera at about 19 of 50 grains per second ([docs/benchmarks/README.md](docs/benchmarks/README.md)).
 - Fewer GPU stalls and copies: device memory comes from the stream-ordered pool instead of per-frame `cudaMalloc`/`cudaFree` (which waits for the whole device), the v210 kernels run one thread per 6-pixel group instead of one per row, the MXL grain is page-locked for its upload, and a source frame still decoded from the previous output frame is not decoded again.

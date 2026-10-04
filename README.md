@@ -161,7 +161,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.0.0
+  ghcr.io/leeo86/mxl-replay:1.0.1
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.
