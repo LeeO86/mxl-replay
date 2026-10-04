@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <thread>
+#include <vector>
 
 namespace replay
 {
@@ -14,15 +15,18 @@ public:
     ~MxlBridge();
     void start();
     void stop();
+    // Writes one channel's grain; channels may call it from their own threads.
     void publish(int channel, RenderedFrame const& frame, std::uint64_t taiNs);
     [[nodiscard]] bool active() const { return active_; }
 
 private:
-    void readLoop();
+    // One thread per camera phase: each records (encodes) its own grains, so cameras
+    // no longer wait for each other.
+    void readInput(int camera, int phase);
     Engine& engine_;
     std::atomic<bool> run_{false};
     std::atomic<bool> active_{false};
-    std::thread thread_;
+    std::vector<std::thread> threads_;
     struct Impl;
     Impl* impl_ = nullptr;
 };

@@ -40,3 +40,19 @@ Not a target GPU: one GA107 of an A16 (PCIe Gen4 x4), driver 595.84, 2× Xeon Go
 | 4 channels, same | output heads 3–8 grains behind (up to 160 ms), SM 69–76 %, process 1.1 cores |
 
 Two 1080p50 interpolate channels keep up on this GPU; four do not. The GPU is not saturated in either case. Late output grains are not counted anywhere (no metric), so the lag was read from the output flows with `mxl-info`. GPU time per stage (`frame_gpu_seconds`) is described in the README but not exported. 2160p50, OFA and the Futatabi comparison were not run.
+
+## Lab run 2026-10-04: per-thread GPU pipeline
+
+Same host, GPU and cameras as above; storage the OS disk. Image built from this repository with the per-thread GPU pipeline (CHANGELOG, Unreleased) against `mxl-replay:lab` (1.0.0 plus the recorder fix). Each case: the four test-player outputs routed to cameras 1–4 (all recording), every channel set to `interpolate` and played at 0.5× from 10 s back, 30 s measured. Recorded and dropped grains come from `/api/v1/status`, output grains/s and late reads from `mxl-verify` on each channel's video flow, latency from `mxl-info`, CPU from the container cgroup, SM load from `nvidia-smi dmon`.
+
+| Image | Channels | Recorded / dropped per camera per s | Output grains/s per channel | Output latency (grains) | CPU | GPU SM |
+| --- | --- | --- | --- | --- | --- | --- |
+| before | 2 | 18–20 / 36–39 | 50.0, 50.0 | 0–2 | 1.2 cores | 63 % |
+| before | 4 | 34 / 20–22 for cameras 1–2; cameras 3–4 none ("Too many open files") | 49.7–50.0 | 2–5 | 1.2 cores | 60 % |
+| this tree | 2 | 52–53 / 0 | 50.0, 50.0 | 2 | 3.7 cores | 92 % |
+| this tree | 4 | 53 / 0 | 49.9–50.1 | 1–3 | 6.2 cores | 98 % |
+| this tree | 8 | 33 / 22 | 49.8–50.1 | 1–12 | 12.3 cores | 97 % |
+
+Recorded counts above 50 per second are cameras catching up on grains still in the input ring. The CPU rises because every camera is now actually recorded (200 encodes per second instead of about 75) and the nvJPEG decoder runs its Huffman stage on the CPU on this GPU.
+
+Result: four 1080p50 cameras record without drops while four channels interpolate, and the limit is now the GPU itself: dense optical flow (`dis-cuda` `balanced`) for one new frame pair per output pair at 0.5× keeps the GA107 at 97–98 % with four channels. Eight channels on this GPU take recording below full rate. A larger GPU (A4000, L4) is expected to scale with its SM count; that run is still open, as are 2160p50, OFA and the Futatabi comparison.

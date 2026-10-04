@@ -447,7 +447,7 @@ Frame10 Engine::frameAt(int camera, std::uint64_t taiNs, bool* found) const
 
 RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
 {
-    std::lock_guard lock{mutex_};
+    std::unique_lock lock{mutex_};
     RenderedFrame rendered;
     if (channel < 1 || channel > static_cast<int>(channels_.size()))
     {
@@ -493,10 +493,21 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         bool const second = storedB && storedA && storedB->taiNs != storedA->taiNs && pick.kind != SourcePick::Kind::Exact && pick.kind != SourcePick::Kind::Repeat;
         GpuPicture gpuPicture;
         auto const key = std::to_string(camera) + ":" + std::to_string(taiA) + ":" + std::to_string(taiB);
-        if (storedA && !storedA->jpeg.empty() &&
-            gpuRenderFromJpeg(storedA->jpeg.data(), storedA->jpeg.size(), second ? storedB->jpeg.data() : nullptr, second ? storedB->jpeg.size() : 0,
-                static_cast<float>(pick.phase), motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate, operatingPoint(config_.preset), key,
-                config_.format.width, config_.format.height, gpuPicture))
+        bool onGpu = false;
+        if (storedA && !storedA->jpeg.empty())
+        {
+            // The stored frames are copies: decode, interpolate and download without the
+            // engine lock, so channels and the recorder do not wait for each other's GPU work.
+            auto const op = operatingPoint(config_.preset);
+            lock.unlock();
+            auto const keyA = std::to_string(camera) + ":" + std::to_string(storedA->taiNs);
+            auto const keyB = second ? std::to_string(camera) + ":" + std::to_string(storedB->taiNs) : std::string{};
+            onGpu = gpuRenderFromJpeg(storedA->jpeg.data(), storedA->jpeg.size(), keyA, second ? storedB->jpeg.data() : nullptr, second ? storedB->jpeg.size() : 0,
+                keyB, static_cast<float>(pick.phase), motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate, op, key, config_.format.width,
+                config_.format.height, gpuPicture);
+            lock.lock();
+        }
+        if (onGpu)
         {
             rendered.v210 = std::move(gpuPicture.v210);
             runtime.preview = std::move(gpuPicture.preview);
