@@ -229,6 +229,14 @@ TEST_CASE("disk ring counts the segments a clip keeps and reads audio alone")
     CHECK(ring.findNearestAudio(2 * kSecond) == std::vector<float>{3.0F, 0.5F});
     CHECK(ring.newestNs() == 9 * kSecond / 2);
     CHECK(ring.writeFailures() == 0);
+    CHECK(ring.waitFor(4 * kSecond, std::chrono::milliseconds(0)));
+    std::thread later([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ring.push(frameAt(5 * kSecond, 9));
+    });
+    CHECK(ring.waitFor(5 * kSecond, std::chrono::seconds(5)));
+    later.join();
+    CHECK_FALSE(ring.waitFor(6 * kSecond, std::chrono::milliseconds(10)));
     std::filesystem::remove_all(dir);
 }
 
