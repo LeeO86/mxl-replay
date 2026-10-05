@@ -10,6 +10,7 @@
 #include "playout/shotbox.hpp"
 #include "record/ring.hpp"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -41,11 +42,20 @@ struct Route
     std::string state = "waiting";
 };
 
+// Clips of uploaded files play from the library ring, not from a camera.
+constexpr int kLibraryCamera = 0;
+
 class Engine
 {
 public:
+    // Checks the storage and opens the catalog. The buffer is opened by openBuffer().
     explicit Engine(Config config, std::map<std::string, std::string> settings = {});
     ~Engine();
+
+    // Indexes the retained segments (minutes for hours of buffer) and protects the
+    // clips again. Call once, before recording, playout or the API use the engine.
+    void openBuffer();
+    [[nodiscard]] bool bufferReady() const { return bufferReady_; }
 
     [[nodiscard]] Config const& config() const { return config_; }
     [[nodiscard]] Metrics& metrics() { return metrics_; }
@@ -113,6 +123,8 @@ public:
 
     [[nodiscard]] double storageBytesPerSecond() const { return storageBps_; }
     [[nodiscard]] std::uint64_t freeBytes() const;
+    // Sets the per-camera recorder and storage metrics (called by /metrics).
+    void updateMetrics();
 
 private:
     struct PhaseSlot
@@ -157,8 +169,14 @@ private:
         std::uint64_t ancSequence = 0;
     };
 
-    void flushHouse(CameraRuntime& camera, CameraConfig const& cfg);
-    void storeFrame(CameraRuntime& camera, std::uint64_t taiNs, Frame10 const& frame, std::vector<float> const& audio);
+    // Encode into `pending`; pushFrames() writes them after the engine lock is released.
+    void flushHouse(CameraRuntime& camera, CameraConfig const& cfg, std::vector<StoredFrame>& pending);
+    void storeFrame(CameraRuntime& camera, std::uint64_t taiNs, Frame10 const& frame, std::vector<float> const& audio, std::vector<StoredFrame>& pending);
+    void pushFrames(CameraRuntime& camera, std::vector<StoredFrame> frames);
+    // The ring a clip or channel camera plays from (kLibraryCamera: uploads); null when unknown.
+    [[nodiscard]] FrameRing const* ringOf(int camera) const;
+    [[nodiscard]] FrameRing* ringOf(int camera);
+    void removeStaleCameras();
     Frame10 frameAt(int camera, std::uint64_t taiNs, bool* found) const;
     void finishClip(int channel);
     [[nodiscard]] std::uint64_t sourcePeriod(int camera) const;
@@ -174,6 +192,10 @@ private:
     Catalog catalog_;
     mutable std::recursive_mutex mutex_;
     std::vector<CameraRuntime> cameras_;
+    std::unique_ptr<FrameRing> library_;
+    // One upload at a time: each starts after the library's newest frame.
+    std::mutex uploadMutex_;
+    std::atomic<bool> bufferReady_{false};
     std::vector<ChannelRuntime> channels_;
     std::map<std::string, Route> routes_;
     std::map<std::string, FlowPair> flowCache_;

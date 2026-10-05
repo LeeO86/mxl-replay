@@ -22,9 +22,11 @@
 #include "util/uuid.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 using namespace replay;
 
@@ -202,6 +204,73 @@ TEST_CASE("disk ring deletes expired segments unless a clip protects them")
     CHECK(ring.segmentCount() == 3);
     CHECK_FALSE(ring.findAtOrBefore(6 * kSecond));
     CHECK(ring.protectedCount() == 0);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("disk ring counts the segments a clip keeps and reads audio alone")
+{
+    auto const dir = freshDir("mxl-replay-ring-protected");
+    FrameRing ring(dir.string(), 3600 * kSecond, 1);
+    // 0.5 s steps, one segment per 1.5 s: [0.5-1.5] [2-3] [3.5-4.5]
+    for (int i = 0; i < 9; ++i)
+    {
+        CHECK(ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 2, static_cast<std::uint8_t>(i))));
+    }
+    CHECK(ring.protectedBytes() == 0);
+    ring.protect(2 * kSecond, 2 * kSecond);
+    // One protected frame keeps its whole segment: the file header and three records of
+    // 16 + 2 (JPEG) + 8 (audio) bytes.
+    CHECK(ring.protectedBytes() == 8 + 3 * (16 + 2 + 8));
+    CHECK(ring.findNearestAudio(2 * kSecond) == std::vector<float>{3.0F, 0.5F});
+    CHECK(ring.newestNs() == 9 * kSecond / 2);
+    CHECK(ring.writeFailures() == 0);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("disk ring counts the frames it cannot write")
+{
+    auto const dir = freshDir("mxl-replay-ring-failures");
+    FrameRing ring(dir.string(), 3600 * kSecond, 1);
+    std::filesystem::remove_all(dir);
+    CHECK_FALSE(ring.push(frameAt(kSecond, 1)));
+    CHECK_FALSE(ring.push(frameAt(2 * kSecond, 2)));
+    CHECK(ring.writeFailures() == 2);
+    std::filesystem::create_directories(dir);
+    CHECK(ring.push(frameAt(3 * kSecond, 3)));
+    CHECK(ring.writeFailures() == 2);
+    CHECK(ring.size() == 1);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("disk ring reads while it writes and deletes segments")
+{
+    auto const dir = freshDir("mxl-replay-ring-threads");
+    FrameRing ring(dir.string(), 2 * kSecond, 1);
+    std::atomic<bool> done{false};
+    std::atomic<int> reads{0};
+    std::thread reader([&] {
+        while (!done)
+        {
+            auto const newest = ring.newestNs();
+            if (auto const frame = ring.findNearest(newest > kSecond ? newest - kSecond : newest); frame && frame->jpeg.size() == 2)
+            {
+                ++reads;
+            }
+            (void)ring.findNearestAudio(newest);
+            (void)ring.protectedBytes();
+        }
+    });
+    bool pushed = true;
+    for (int i = 0; i < 400; ++i)
+    {
+        pushed = ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 20, static_cast<std::uint8_t>(i))) && pushed;
+    }
+    done = true;
+    reader.join();
+    CHECK(pushed);
+    CHECK(reads.load() > 0);
+    // 20 s recorded, 2 s kept: the old segments are gone.
+    CHECK(ring.segmentCount() <= 4);
     std::filesystem::remove_all(dir);
 }
 
@@ -412,6 +481,7 @@ TEST_CASE("engine records two angles, plays at half speed and creates a clip")
         {"HOST_ID", "test-host"},
     };
     Engine engine(loadConfig(env, {}).config);
+    engine.openBuffer();
     for (int i = 0; i < 8; ++i)
     {
         for (int camera = 1; camera <= 2; ++camera)
@@ -467,6 +537,95 @@ TEST_CASE("engine records two angles, plays at half speed and creates a clip")
     server.start(0, [&](HttpRequest const& request) { return handleApi(engine, request, "<html>replay</html>"); });
     CHECK(server.port() > 0);
     server.stop();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("engine answers livez while the buffer is indexed and removes unused camera buffers")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-ready";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir / "media" / "cam7");
+    std::ofstream(dir / "media" / "cam7" / "seg-00000000000000000001.bin") << "MXLR";
+    auto const loaded = loadConfig(
+        {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+            {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+            {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    Engine engine(loaded.config, loaded.flat);
+    // Camera 7 is not configured and no clip uses it.
+    CHECK_FALSE(std::filesystem::exists(dir / "media" / "cam7"));
+    HttpRequest request;
+    request.method = "GET";
+    request.path = "/livez";
+    CHECK(handleApi(engine, request, "").status == 200);
+    request.path = "/readyz";
+    CHECK(handleApi(engine, request, "").status == 503);
+    request.path = "/api/v1/status";
+    CHECK(handleApi(engine, request, "").status == 503);
+    engine.openBuffer();
+    CHECK(engine.bufferReady());
+    request.path = "/readyz";
+    CHECK(handleApi(engine, request, "").status == 200);
+    request.path = "/metrics";
+    CHECK(handleApi(engine, request, "").body.find("mxl_replay_storage_write_failed_total{camera=\"1\"} 0") != std::string::npos);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("engine plays camera audio and an upload made after recording")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-audio";
+    std::filesystem::remove_all(dir);
+    auto const loaded = loadConfig(
+        {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+            {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+            {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    Engine engine(loaded.config, loaded.flat);
+    engine.openBuffer();
+    std::uint64_t const period = 20000000ull;
+    std::uint64_t const base = 1000 * period;
+    for (int i = 0; i < 6; ++i)
+    {
+        auto const tai = base + static_cast<std::uint64_t>(i) * period;
+        engine.ingestAudio(1, tai, std::vector<float>(960 * 2, 0.25F + 0.01F * static_cast<float>(i)), 2);
+        Frame10 frame;
+        frame.allocate(64, 32);
+        frame.fill(300, 512, 512);
+        engine.ingestVideo(1, 1, tai, std::move(frame));
+    }
+    // Live, two frames behind: the output carries frame 2's audio.
+    auto const live = engine.render(1, base + 4 * period);
+    REQUIRE(live.audio.size() == 960 * 2);
+    CHECK(live.audio.front() == doctest::Approx(0.27F));
+    CHECK(live.audio.back() == doctest::Approx(0.27F));
+
+    // Camera 1 has recorded, so its ring only takes newer frames: the upload must go elsewhere.
+    Frame10 still;
+    still.allocate(64, 32);
+    still.fill(700, 512, 512);
+    auto const jpeg = encodeJpeg422(still, 90);
+    std::string error;
+    auto const id = engine.upload(jpeg.data(), jpeg.size(), "still", error);
+    REQUIRE(error.empty());
+    ClipRef clip;
+    for (auto const& item : engine.clips())
+    {
+        if (item.id == id)
+        {
+            clip = item;
+        }
+    }
+    CHECK(clip.camera == kLibraryCamera);
+    engine.playClip(1, id);
+    engine.pause(1);
+    engine.setPosition(1, clip.inNs);
+    auto const played = engine.render(1, base + 10 * period);
+    CHECK(played.camera == kLibraryCamera);
+    REQUIRE(played.v210.size() == v210Size(64, 32));
+    Frame10 picture;
+    picture.allocate(64, 32);
+    unpackV210(played.v210.data(), static_cast<int>(v210RowBytes(64)), picture);
+    CHECK(std::abs(static_cast<int>(picture.y[0]) - 700) < 16);
     std::filesystem::remove_all(dir);
 }
 
@@ -565,6 +724,7 @@ TEST_CASE("config export is json and import restores a clip")
             {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
         {});
     Engine engine(loaded.config, loaded.flat);
+    engine.openBuffer();
     auto const exported = engine.exportConfigJson();
     CHECK(exported.find("\"secrets\":false") != std::string::npos);
     CHECK(exported.find("10.4.4.4") != std::string::npos);

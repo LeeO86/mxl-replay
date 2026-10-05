@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0
+
+- Camera audio is recorded and played out. 1.1.0 accepted connections on the `<camera> Audio` receivers but never read them, so playout audio was silent. The recorder now reads, for every video grain, that frame's 48 kHz samples from the camera's audio flow and stores them with the frame (first two channels, mono doubled; the receiver reports `unsupported` for another sample rate). HFR cameras take their audio with phase 1. The playout audio flow is written at the sample index, one ring per channel. Before, it was written at the video grain index into the first channel's ring only.
+- Uploads are stored again when the cameras record. Since 1.1.0 an upload went to camera 1's buffer at TAI 1 ns onward, and that buffer only appends, so once camera 1 had recorded anything the frames were dropped while the clip was still created. Uploads now go to their own library buffer (`REPLAY_STORAGE_DIR/library/frames`, camera `0` in the clip list), which keeps a segment only while a clip uses it. Clips uploaded with 1.1.0 keep camera 1.
+- The start no longer waits for the re-index before HTTP. `/livez` answers at once; `/readyz` and the API answer 503 (`{"status":"indexing"}`) until the retained segments are indexed, and NMOS and MXL start after that. 4 cameras × 1.5 h are about a million small reads.
+- `REPLAY_PROTECT_MAX_PCT` counts the segments that clips keep. A clip keeps whole segments, but the cap counted only the protected frames, so clips could keep much more than the cap.
+- Frames that cannot be written (full disk or I/O error) are counted per camera in `mxl_replay_storage_write_failed_total`, and the log has one `segment_write_failed` per run of failures and a `segment_write_recovered` with the count. On a full disk every frame also left an empty segment file behind; it is removed now.
+- Disk I/O runs outside the engine lock. Each camera buffer has its own lock that is never held during a read or write, and the engine lock is released while recording writes, while a channel reads its frames and audio, and while a clip is exported. A slow disk used to stall every channel. A channel playing at 100 % reads one frame per output frame instead of two, and the audio no longer reads the frame's JPEG.
+- The buffers of cameras that are no longer configured are deleted at startup unless a clip uses that camera (`removed_camera_deleted`, or `removed_camera_kept` with the bytes).
+- `/metrics` has the per-camera series the README listed: `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `protected_bytes`, `disk_bytes`, and the new `storage_write_failed_total`.
+
 ## 1.1.0
 
 - The replay buffer lives on `REPLAY_STORAGE_DIR` instead of in RAM. 1.0.x kept every JPEG frame of the buffer in memory (4 cameras × 1.5 h is about 420 GB) and wrote segment files that were never read. Frames now go to the segments only; memory holds an index of about 32 bytes per frame and a few open files, and playback reads the frames back from the segments.

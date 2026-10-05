@@ -102,20 +102,23 @@ int main(int argc, char** argv)
         replay::setLogFormatJson(loaded.config.logFormat != "text");
         auto const flat = loaded.flat;
         replay::Engine engine(std::move(loaded.config), flat);
-        replay::NmosNode node(engine.config(), engine);
-        node.start();
-        replay::MxlBridge bridge(engine);
-        bridge.start();
         replay::HttpServer server;
         std::string indexHtml;
 #ifdef REPLAY_HAS_UI
         indexHtml = std::string(replay::webui::indexHtml());
 #endif
+        // HTTP first: /livez answers while the retained segments are indexed (minutes for
+        // hours of buffer); /readyz and the API answer 503 until the buffer is open.
         if (engine.config().webEnable)
         {
             server.start(engine.config().webPort, [&](replay::HttpRequest const& request) { return replay::handleApi(engine, request, indexHtml); });
             replay::logInfo("web_listen", {{"port", std::to_string(server.port())}});
         }
+        engine.openBuffer();
+        replay::NmosNode node(engine.config(), engine);
+        node.start();
+        replay::MxlBridge bridge(engine);
+        bridge.start();
         std::signal(SIGTERM, onSignal);
         std::signal(SIGINT, onSignal);
         auto const period = std::chrono::nanoseconds(replay::framePeriodNs(engine.config().format.rateNum, engine.config().format.rateDen));
