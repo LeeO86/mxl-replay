@@ -141,6 +141,8 @@ struct FrameRing::Impl
     std::uint64_t segmentNs = 0;
     // Guards the index, segments, ranges, totals and read descriptors. Never held during a read or write.
     mutable std::mutex mutex;
+    // Signalled when a frame is stored (live playout waits for the frame it is about to show).
+    mutable std::condition_variable stored;
     // One writer at a time; held across the write itself.
     std::mutex writeMutex;
     std::deque<Entry> index;
@@ -665,6 +667,7 @@ bool FrameRing::push(StoredFrame frame)
     d.index.push_back(entry);
     d.payloadTotal += payload(entry);
     d.setProtect(d.index.back(), covered(d.ranges, tai));
+    d.stored.notify_all();
     return true;
 }
 
@@ -723,6 +726,13 @@ std::optional<StoredFrame> FrameRing::findNearest(std::uint64_t taiNs) const
         return std::nullopt;
     }
     return d.load(*it, lock, true);
+}
+
+bool FrameRing::waitFor(std::uint64_t taiNs, std::chrono::nanoseconds timeout) const
+{
+    auto const& d = *impl_;
+    std::unique_lock lock{d.mutex};
+    return d.stored.wait_for(lock, timeout, [&] { return !d.index.empty() && d.index.back().taiNs >= taiNs; });
 }
 
 std::vector<float> FrameRing::findNearestAudio(std::uint64_t taiNs) const

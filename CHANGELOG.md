@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.1
+
+- Live playout no longer repeats a frame and skips the next. The recorder can read frame M−2 only once grain M starts, which is exactly when a live channel renders grain M from frame M−2 (`REPLAY_LIVE_DELAY_FRAMES=2`). When the render won, the channel showed frame M−3 and then jumped to M−1. On the lab that happened about once a minute in the audio; the video is looked up earlier in the render, so it can lose that race more often (not measured). A live channel now waits up to half a frame for that frame while its camera records close to live.
+- After a missed camera audio read, the recorder keeps waiting for the audio for three more frames before it falls back to one waiting read per 50 frames. One late packet no longer costs up to a second of audio.
+
 ## 1.2.0
 
 - Camera audio is recorded and played out. 1.1.0 accepted connections on the `<camera> Audio` receivers but never read them, so playout audio was silent. The recorder now reads, for every video grain, that frame's 48 kHz samples from the camera's audio flow and stores them with the frame (first two channels, mono doubled; the receiver reports `unsupported` for another sample rate). HFR cameras take their audio with phase 1. The playout audio flow is written at the sample index, one ring per channel. Before, it was written at the video grain index into the first channel's ring only.

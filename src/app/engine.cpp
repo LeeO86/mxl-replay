@@ -611,6 +611,19 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     }
     int const camera = runtime.scheduler.camera;
     auto const position = static_cast<std::uint64_t>(std::max<std::int64_t>(0, runtime.scheduler.positionNs));
+    // Live: the recorder stores frame M-2 just as grain M starts. Wait briefly for it instead of
+    // showing the frame before (and skipping it on the next grain). A camera that is not
+    // recording close to live is not waited for.
+    if (auto const* ring = ringOf(camera); runtime.liveMode && ring != nullptr)
+    {
+        auto const newest = ring->newestNs();
+        if (newest < position && newest + 3 * static_cast<std::uint64_t>(period) >= position)
+        {
+            lock.unlock();
+            ring->waitFor(position, std::chrono::nanoseconds(period / 2));
+            lock.lock();
+        }
+    }
     MotionMode motion = cfg.motion;
     if (motion == MotionMode::Interpolate && !gpuInterpolate())
     {
