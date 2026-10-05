@@ -164,7 +164,7 @@ onBeforeUnmount(() => {
       <div class="grid">
         <button v-for="(clip, index) in clips" :key="clip.id" class="shot" :style="{ borderColor: clip.colour }" @click="shot(clip.id)">
           <b>{{ index + 1 }} {{ clip.name }}</b>
-          <small>{{ clip.camera }} · {{ Math.round((clip.speed || 1) * 100) }}%</small>
+          <small>{{ clip.camera === 0 ? 'library' : clip.camera }} · {{ Math.round((clip.speed || 1) * 100) }}%</small>
         </button>
       </div>
       <p class="line">Recording {{ (status.cameras || []).filter((camera) => camera.record).length }} cameras · free {{ status.free_bytes }} · {{ status.preset }}</p>

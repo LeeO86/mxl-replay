@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -12,7 +13,9 @@
 #include <filesystem>
 #include <list>
 #include <map>
+#include <mutex>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -120,6 +123,15 @@ bool isLegacyName(std::string const& name)
 {
     return name.rfind("cam", 0) == 0 && name.find("_seg") != std::string::npos && endsWith(name, ".bin");
 }
+
+void removeFiles(std::vector<std::string> const& paths)
+{
+    for (auto const& path : paths)
+    {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+}
 } // namespace
 
 struct FrameRing::Impl
@@ -127,21 +139,90 @@ struct FrameRing::Impl
     std::string directory;
     std::uint64_t retentionNs = 0;
     std::uint64_t segmentNs = 0;
+    // Guards the index, segments, ranges, totals and read descriptors. Never held during a read or write.
+    mutable std::mutex mutex;
+    // One writer at a time; held across the write itself.
+    std::mutex writeMutex;
     std::deque<Entry> index;
     std::map<std::uint32_t, Segment> segments;
     std::uint32_t nextSegment = 0;
     std::vector<ProtectRange> ranges;
     std::uint64_t payloadTotal = 0;
-    std::uint64_t protectedTotal = 0;
     std::size_t protectedFrames = 0;
-    // The previous segment's writer, dropped from the page cache at the next rotation
-    // (its writeback has finished by then).
-    int adviseFd = -1;
     mutable std::list<std::pair<std::uint32_t, int>> readFds;
-    bool writeErrorLogged = false;
+    std::uint64_t writeFailures = 0;
+    std::uint64_t failedRun = 0;
+
+    // Background I/O: a finished segment's writeback and page-cache drop, and deletions. On a
+    // slow disk sync_file_range blocked the recorder for about a second at every rotation.
+    std::thread janitor;
+    std::mutex janitorMutex;
+    std::condition_variable janitorWake;
+    std::vector<int> finished;
+    std::vector<std::string> doomed;
+    bool stopping = false;
+
+    void janitorLoop()
+    {
+        // The previous finished segment, dropped from the page cache when the next one is
+        // handed over (its writeback has finished by then).
+        int adviseFd = -1;
+        std::unique_lock lock{janitorMutex};
+        for (;;)
+        {
+            janitorWake.wait(lock, [&] { return stopping || !finished.empty() || !doomed.empty(); });
+            if (stopping && finished.empty() && doomed.empty())
+            {
+                break;
+            }
+            auto fds = std::move(finished);
+            auto paths = std::move(doomed);
+            finished.clear();
+            doomed.clear();
+            lock.unlock();
+            for (int const fd : fds)
+            {
+                ::sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
+                if (adviseFd >= 0)
+                {
+                    ::posix_fadvise(adviseFd, 0, 0, POSIX_FADV_DONTNEED);
+                    ::close(adviseFd);
+                }
+                adviseFd = fd;
+            }
+            removeFiles(paths);
+            lock.lock();
+        }
+        if (adviseFd >= 0)
+        {
+            ::close(adviseFd);
+        }
+    }
+
+    void handOver(int fd, std::vector<std::string> paths)
+    {
+        {
+            std::lock_guard lock{janitorMutex};
+            if (fd >= 0)
+            {
+                finished.push_back(fd);
+            }
+            doomed.insert(doomed.end(), std::make_move_iterator(paths.begin()), std::make_move_iterator(paths.end()));
+        }
+        janitorWake.notify_one();
+    }
 
     ~Impl()
     {
+        if (janitor.joinable())
+        {
+            {
+                std::lock_guard lock{janitorMutex};
+                stopping = true;
+            }
+            janitorWake.notify_one();
+            janitor.join();
+        }
         for (auto& [seq, segment] : segments)
         {
             (void)seq;
@@ -149,10 +230,6 @@ struct FrameRing::Impl
             {
                 ::close(segment.writeFd);
             }
-        }
-        if (adviseFd >= 0)
-        {
-            ::close(adviseFd);
         }
         for (auto const& [seq, fd] : readFds)
         {
@@ -176,6 +253,26 @@ struct FrameRing::Impl
     std::deque<Entry>::const_iterator upper(std::uint64_t tai) const
     {
         return std::upper_bound(index.begin(), index.end(), tai, [](std::uint64_t v, Entry const& e) { return v < e.taiNs; });
+    }
+
+    // The entry nearest to `tai` (the earlier one on a tie); end() when the index is empty.
+    std::deque<Entry>::const_iterator nearest(std::uint64_t tai) const
+    {
+        if (index.empty())
+        {
+            return index.end();
+        }
+        auto const it = lower(tai);
+        if (it == index.end())
+        {
+            return std::prev(it);
+        }
+        if (it == index.begin() || it->taiNs == tai)
+        {
+            return it;
+        }
+        auto const prev = std::prev(it);
+        return tai - prev->taiNs <= it->taiNs - tai ? prev : it;
     }
 
     Segment* current()
@@ -229,21 +326,32 @@ struct FrameRing::Impl
         }
     }
 
-    std::optional<StoredFrame> read(Entry const& entry) const
+    // Reads `entry` (held under `lock`) and releases the lock before the reads: they use a
+    // duplicate descriptor, which stays valid when the cache closes its own or the segment
+    // is deleted.
+    std::optional<StoredFrame> load(Entry const& entry, std::unique_lock<std::mutex>& lock, bool withJpeg) const
     {
-        int const fd = readFd(entry.segment);
+        Entry const copy = entry;
+        int const cached = readFd(copy.segment);
+        int const fd = cached < 0 ? -1 : ::fcntl(cached, F_DUPFD_CLOEXEC, 0);
+        lock.unlock();
         if (fd < 0)
         {
             return std::nullopt;
         }
         StoredFrame frame;
-        frame.taiNs = entry.taiNs;
-        frame.protect = entry.protect;
-        frame.jpeg.resize(entry.jpegBytes);
-        frame.audio.resize(entry.audioSamples);
-        auto const data = entry.offset + kRecordHeaderBytes;
-        if (!readAll(fd, frame.jpeg.data(), frame.jpeg.size(), data) ||
-            !readAll(fd, frame.audio.data(), frame.audio.size() * sizeof(float), data + entry.jpegBytes))
+        frame.taiNs = copy.taiNs;
+        frame.protect = copy.protect;
+        frame.audio.resize(copy.audioSamples);
+        auto const data = copy.offset + kRecordHeaderBytes;
+        bool ok = readAll(fd, frame.audio.data(), frame.audio.size() * sizeof(float), data + copy.jpegBytes);
+        if (ok && withJpeg)
+        {
+            frame.jpeg.resize(copy.jpegBytes);
+            ok = readAll(fd, frame.jpeg.data(), frame.jpeg.size(), data);
+        }
+        ::close(fd);
+        if (!ok)
         {
             return std::nullopt;
         }
@@ -259,13 +367,30 @@ struct FrameRing::Impl
         entry.protect = value;
         if (value)
         {
-            protectedTotal += payload(entry);
             ++protectedFrames;
         }
         else
         {
-            protectedTotal -= payload(entry);
             --protectedFrames;
+        }
+    }
+
+    // Counts a frame that could not be written and logs the first one of a run.
+    void failed(char const* event, std::string const& path, int error)
+    {
+        ++writeFailures;
+        if (failedRun++ == 0)
+        {
+            logError(event, {{"path", path}, {"error", std::strerror(error)}});
+        }
+    }
+
+    void recovered()
+    {
+        if (failedRun > 0)
+        {
+            logInfo("segment_write_recovered", {{"directory", directory}, {"dropped", std::to_string(failedRun)}});
+            failedRun = 0;
         }
     }
 
@@ -366,19 +491,59 @@ struct FrameRing::Impl
         }
     }
 
-    bool rotate(std::uint64_t tai, FrameRing& ring)
+    // Drops expired, unprotected segments from the index (lock held) and returns their
+    // files, which the caller deletes after releasing the lock.
+    std::vector<std::string> retain()
     {
-        if (auto* open = current())
+        std::vector<std::string> expired;
+        if (index.empty() || retentionNs == 0 || index.back().taiNs <= retentionNs)
         {
-            int const fd = open->writeFd;
-            open->writeFd = -1;
-            ::sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
-            if (adviseFd >= 0)
+            return expired;
+        }
+        auto const cutoff = index.back().taiNs - retentionNs;
+        for (auto it = segments.begin(); it != segments.end();)
+        {
+            auto& segment = it->second;
+            if (segment.writeFd >= 0 || segment.lastNs >= cutoff || overlaps(ranges, segment.firstNs, segment.lastNs))
             {
-                ::posix_fadvise(adviseFd, 0, 0, POSIX_FADV_DONTNEED);
-                ::close(adviseFd);
+                ++it;
+                continue;
             }
-            adviseFd = fd;
+            auto const seq = it->first;
+            auto const first = lower(segment.firstNs);
+            auto const last = upper(segment.lastNs);
+            auto const kept = std::remove_if(first, last, [&](Entry const& entry) {
+                if (entry.segment != seq)
+                {
+                    return false;
+                }
+                payloadTotal -= payload(entry);
+                return true;
+            });
+            index.erase(kept, last);
+            dropReadFd(seq);
+            expired.push_back(segment.path);
+            it = segments.erase(it);
+        }
+        return expired;
+    }
+
+    // Starts a new segment at `tai`. Called with writeMutex held; takes the lock only
+    // to swap the segments, and hands the finished one to the janitor.
+    bool rotate(std::uint64_t tai)
+    {
+        int previous = -1;
+        {
+            std::lock_guard lock{mutex};
+            if (auto* open = current())
+            {
+                previous = open->writeFd;
+                open->writeFd = -1;
+            }
+        }
+        if (previous >= 0)
+        {
+            handOver(previous, {});
         }
         char name[48];
         std::snprintf(name, sizeof(name), "seg-%020llu.bin", static_cast<unsigned long long>(tai));
@@ -386,12 +551,19 @@ struct FrameRing::Impl
         int const fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
         if (fd < 0)
         {
-            logError("segment_open_failed", {{"path", path}, {"error", std::strerror(errno)}});
+            int const error = errno;
+            std::lock_guard lock{mutex};
+            failed("segment_open_failed", path, error);
             return false;
         }
         if (!writeAll(fd, kMagic, sizeof(kMagic)) || !writeAll(fd, &kVersion, sizeof(kVersion)))
         {
+            int const error = errno;
             ::close(fd);
+            // On a full disk every frame would otherwise leave an empty file behind.
+            ::unlink(path.c_str());
+            std::lock_guard lock{mutex};
+            failed("segment_write_failed", path, error);
             return false;
         }
         Segment segment;
@@ -400,8 +572,13 @@ struct FrameRing::Impl
         segment.lastNs = tai;
         segment.bytes = kFileHeaderBytes;
         segment.writeFd = fd;
-        segments.emplace(nextSegment++, std::move(segment));
-        ring.enforceRetention();
+        std::vector<std::string> expired;
+        {
+            std::lock_guard lock{mutex};
+            segments.emplace(nextSegment++, std::move(segment));
+            expired = retain();
+        }
+        handOver(-1, std::move(expired));
         return true;
     }
 };
@@ -413,6 +590,7 @@ FrameRing::FrameRing(std::string directory, std::uint64_t retentionNs, int segme
     impl_->retentionNs = retentionNs;
     impl_->segmentNs = static_cast<std::uint64_t>(std::max(1, segmentSeconds)) * 1000000000ull;
     impl_->scan();
+    impl_->janitor = std::thread([impl = impl_.get()] { impl->janitorLoop(); });
 }
 
 FrameRing::~FrameRing() = default;
@@ -422,54 +600,65 @@ FrameRing& FrameRing::operator=(FrameRing&&) noexcept = default;
 bool FrameRing::push(StoredFrame frame)
 {
     auto& d = *impl_;
+    std::lock_guard writer{d.writeMutex};
     auto const tai = frame.taiNs;
     bool replace = false;
-    if (!d.index.empty() && tai <= d.index.back().taiNs)
+    bool open = false;
     {
-        if (tai < d.index.back().taiNs || d.index.back().protect)
+        std::lock_guard lock{d.mutex};
+        if (!d.index.empty() && tai <= d.index.back().taiNs)
         {
-            return false;
+            if (tai < d.index.back().taiNs || d.index.back().protect)
+            {
+                return false;
+            }
+            replace = true;
         }
-        replace = true;
+        auto const* segment = d.current();
+        open = segment != nullptr && tai <= segment->firstNs + d.segmentNs;
     }
-    auto* segment = d.current();
-    if (segment == nullptr || tai > segment->firstNs + d.segmentNs)
+    if (!open && !d.rotate(tai))
     {
-        if (!d.rotate(tai, *this))
-        {
-            return false;
-        }
-        segment = d.current();
+        return false;
     }
+    // Only this writer closes or rotates the open segment, so it stays valid unlocked.
+    int fd = -1;
+    std::string path;
     Entry entry;
+    {
+        std::lock_guard lock{d.mutex};
+        auto const* segment = d.current();
+        fd = segment->writeFd;
+        path = segment->path;
+        entry.offset = segment->bytes;
+        entry.segment = d.segments.rbegin()->first;
+    }
     entry.taiNs = tai;
-    entry.offset = segment->bytes;
-    entry.segment = d.segments.rbegin()->first;
     entry.jpegBytes = static_cast<std::uint32_t>(frame.jpeg.size());
     entry.audioSamples = static_cast<std::uint32_t>(frame.audio.size());
     unsigned char record[kRecordHeaderBytes];
     std::memcpy(record, &entry.taiNs, 8);
     std::memcpy(record + 8, &entry.jpegBytes, 4);
     std::memcpy(record + 12, &entry.audioSamples, 4);
-    bool const ok = writeAll(segment->writeFd, record, sizeof(record)) && writeAll(segment->writeFd, frame.jpeg.data(), frame.jpeg.size()) &&
-                    writeAll(segment->writeFd, frame.audio.data(), frame.audio.size() * sizeof(float));
+    bool const ok = writeAll(fd, record, sizeof(record)) && writeAll(fd, frame.jpeg.data(), frame.jpeg.size()) &&
+                    writeAll(fd, frame.audio.data(), frame.audio.size() * sizeof(float));
+    int const error = ok ? 0 : errno;
+    std::lock_guard lock{d.mutex};
+    auto& segment = d.segments.at(entry.segment);
     if (!ok)
     {
         // The segment may now end in a partial record: close it; the next frame opens a new one.
-        if (!d.writeErrorLogged)
-        {
-            logError("segment_write_failed", {{"path", segment->path}, {"error", std::strerror(errno)}});
-            d.writeErrorLogged = true;
-        }
-        ::close(segment->writeFd);
-        segment->writeFd = -1;
+        d.failed("segment_write_failed", path, error);
+        ::close(fd);
+        segment.writeFd = -1;
         return false;
     }
-    d.writeErrorLogged = false;
-    segment->bytes += kRecordHeaderBytes + payload(entry);
-    segment->lastNs = tai;
-    if (replace)
+    d.recovered();
+    segment.bytes += kRecordHeaderBytes + payload(entry);
+    segment.lastNs = tai;
+    if (replace && !d.index.empty() && d.index.back().taiNs == tai)
     {
+        d.setProtect(d.index.back(), false);
         d.payloadTotal -= payload(d.index.back());
         d.index.pop_back();
     }
@@ -482,6 +671,7 @@ bool FrameRing::push(StoredFrame frame)
 void FrameRing::protect(std::uint64_t beginNs, std::uint64_t endNs)
 {
     auto& d = *impl_;
+    std::lock_guard lock{d.mutex};
     if (endNs < beginNs)
     {
         std::swap(beginNs, endNs);
@@ -496,6 +686,7 @@ void FrameRing::protect(std::uint64_t beginNs, std::uint64_t endNs)
 void FrameRing::unprotect(std::uint64_t beginNs, std::uint64_t endNs)
 {
     auto& d = *impl_;
+    std::lock_guard lock{d.mutex};
     d.ranges.erase(std::remove_if(d.ranges.begin(), d.ranges.end(),
                        [&](ProtectRange const& range) { return range.beginNs == beginNs && range.endNs == endNs; }),
         d.ranges.end());
@@ -508,112 +699,111 @@ void FrameRing::unprotect(std::uint64_t beginNs, std::uint64_t endNs)
 void FrameRing::enforceRetention()
 {
     auto& d = *impl_;
-    if (d.index.empty() || d.retentionNs == 0 || d.index.back().taiNs <= d.retentionNs)
+    std::vector<std::string> expired;
     {
-        return;
+        std::lock_guard lock{d.mutex};
+        expired = d.retain();
     }
-    auto const cutoff = d.index.back().taiNs - d.retentionNs;
-    for (auto it = d.segments.begin(); it != d.segments.end();)
-    {
-        auto& segment = it->second;
-        if (segment.writeFd >= 0 || segment.lastNs >= cutoff || overlaps(d.ranges, segment.firstNs, segment.lastNs))
-        {
-            ++it;
-            continue;
-        }
-        auto const seq = it->first;
-        auto const first = d.lower(segment.firstNs);
-        auto const last = d.upper(segment.lastNs);
-        auto const kept = std::remove_if(first, last, [&](Entry const& entry) {
-            if (entry.segment != seq)
-            {
-                return false;
-            }
-            d.payloadTotal -= payload(entry);
-            return true;
-        });
-        d.index.erase(kept, last);
-        d.dropReadFd(seq);
-        std::error_code ec;
-        std::filesystem::remove(segment.path, ec);
-        it = d.segments.erase(it);
-    }
+    d.handOver(-1, std::move(expired));
 }
 
 bool FrameRing::isProtected(std::uint64_t taiNs) const
 {
+    std::lock_guard lock{impl_->mutex};
     return covered(impl_->ranges, taiNs);
 }
 
 std::optional<StoredFrame> FrameRing::findNearest(std::uint64_t taiNs) const
 {
     auto const& d = *impl_;
-    if (d.index.empty())
+    std::unique_lock lock{d.mutex};
+    auto const it = d.nearest(taiNs);
+    if (it == d.index.end())
     {
         return std::nullopt;
     }
-    auto it = d.lower(taiNs);
+    return d.load(*it, lock, true);
+}
+
+std::vector<float> FrameRing::findNearestAudio(std::uint64_t taiNs) const
+{
+    auto const& d = *impl_;
+    std::unique_lock lock{d.mutex};
+    auto const it = d.nearest(taiNs);
     if (it == d.index.end())
     {
-        return d.read(*std::prev(it));
+        return {};
     }
-    if (it == d.index.begin() || it->taiNs == taiNs)
-    {
-        return d.read(*it);
-    }
-    auto const prev = std::prev(it);
-    if (taiNs - prev->taiNs <= it->taiNs - taiNs)
-    {
-        return d.read(*prev);
-    }
-    return d.read(*it);
+    auto frame = d.load(*it, lock, false);
+    return frame ? std::move(frame->audio) : std::vector<float>{};
 }
 
 std::optional<StoredFrame> FrameRing::findAtOrBefore(std::uint64_t taiNs) const
 {
     auto const& d = *impl_;
+    std::unique_lock lock{d.mutex};
     auto const it = d.upper(taiNs);
     if (it == d.index.begin())
     {
         return std::nullopt;
     }
-    return d.read(*std::prev(it));
+    return d.load(*std::prev(it), lock, true);
 }
 
 std::optional<StoredFrame> FrameRing::findAfter(std::uint64_t taiNs) const
 {
     auto const& d = *impl_;
+    std::unique_lock lock{d.mutex};
     auto const it = d.upper(taiNs);
     if (it == d.index.end())
     {
         return std::nullopt;
     }
-    return d.read(*it);
+    return d.load(*it, lock, true);
 }
 
 std::size_t FrameRing::size() const
 {
+    std::lock_guard lock{impl_->mutex};
     return impl_->index.size();
+}
+
+std::uint64_t FrameRing::newestNs() const
+{
+    std::lock_guard lock{impl_->mutex};
+    return impl_->index.empty() ? 0 : impl_->index.back().taiNs;
 }
 
 std::size_t FrameRing::protectedCount() const
 {
+    std::lock_guard lock{impl_->mutex};
     return impl_->protectedFrames;
 }
 
 std::uint64_t FrameRing::payloadBytes() const
 {
+    std::lock_guard lock{impl_->mutex};
     return impl_->payloadTotal;
 }
 
 std::uint64_t FrameRing::protectedBytes() const
 {
-    return impl_->protectedTotal;
+    std::lock_guard lock{impl_->mutex};
+    std::uint64_t total = 0;
+    for (auto const& [seq, segment] : impl_->segments)
+    {
+        (void)seq;
+        if (overlaps(impl_->ranges, segment.firstNs, segment.lastNs))
+        {
+            total += segment.bytes;
+        }
+    }
+    return total;
 }
 
 double FrameRing::protectedPercent() const
 {
-    auto const total = payloadBytes();
+    auto const total = diskBytes();
     if (total == 0)
     {
         return 0;
@@ -623,6 +813,7 @@ double FrameRing::protectedPercent() const
 
 std::uint64_t FrameRing::diskBytes() const
 {
+    std::lock_guard lock{impl_->mutex};
     std::uint64_t total = 0;
     for (auto const& [seq, segment] : impl_->segments)
     {
@@ -634,7 +825,14 @@ std::uint64_t FrameRing::diskBytes() const
 
 std::size_t FrameRing::segmentCount() const
 {
+    std::lock_guard lock{impl_->mutex};
     return impl_->segments.size();
+}
+
+std::uint64_t FrameRing::writeFailures() const
+{
+    std::lock_guard lock{impl_->mutex};
+    return impl_->writeFailures;
 }
 
 std::uint64_t segmentBytes(std::string const& directory)

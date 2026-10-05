@@ -208,13 +208,25 @@ void MxlBridge::publish(int channel, RenderedFrame const& frame, std::uint64_t t
     }
     if (writer.audio != nullptr && !frame.audio.empty())
     {
+        // The frame's samples [first, end) at 48 kHz, addressed by their end index; each
+        // channel has its own ring (`stride` apart), possibly wrapped into two fragments.
+        auto const first = audioSamplesUntil(index, cfg.format.rateNum, cfg.format.rateDen, 48000);
+        auto const end = audioSamplesUntil(index + 1, cfg.format.rateNum, cfg.format.rateDen, 48000);
+        auto const count = std::min(static_cast<std::size_t>(end - first), frame.audio.size() / 2);
         mxlMutableWrappedMultiBufferSlice slices{};
-        if (mxlFlowWriterOpenSamples(writer.audio, index, frame.audio.size() / 2, &slices) == MXL_STATUS_OK)
+        if (count > 0 && mxlFlowWriterOpenSamples(writer.audio, first + count, count, &slices) == MXL_STATUS_OK)
         {
-            auto* dst = static_cast<float*>(slices.base.fragments[0].pointer);
-            if (dst != nullptr)
+            for (std::size_t channel = 0; channel < slices.count && channel < 2; ++channel)
             {
-                std::memcpy(dst, frame.audio.data(), std::min(slices.base.fragments[0].size, frame.audio.size() * sizeof(float)));
+                std::size_t sample = 0;
+                for (auto const& fragment : slices.base.fragments)
+                {
+                    auto* out = reinterpret_cast<float*>(static_cast<std::uint8_t*>(fragment.pointer) + channel * slices.stride);
+                    for (std::size_t i = 0; i < fragment.size / sizeof(float) && sample < count; ++i, ++sample)
+                    {
+                        out[i] = frame.audio[sample * 2 + channel];
+                    }
+                }
             }
             mxlFlowWriterCommitSamples(writer.audio);
         }
@@ -239,11 +251,14 @@ void MxlBridge::readInput(int camera, int phase)
         std::uint64_t next = 0;
     };
     Input input;
-    auto close = [](Input& open) {
+    auto close = [](Input& open, bool pinned) {
         if (open.reader != nullptr)
         {
-            // The encoder page-locked this reader's grains; unlock before they are unmapped.
-            gpuReleaseHostMemory();
+            if (pinned)
+            {
+                // The encoder page-locked this reader's grains; unlock before they are unmapped.
+                gpuReleaseHostMemory();
+            }
             mxlReleaseFlowReader(open.instance, open.reader);
         }
         if (open.instance != nullptr)
@@ -252,30 +267,118 @@ void MxlBridge::readInput(int camera, int phase)
         }
         open = Input{};
     };
+    // Opens the reader for `route` unless it is open already; false when the flow cannot be read yet.
+    auto attach = [&](Input& open, Route const& route, bool pinned) -> bool {
+        if (open.reader != nullptr && open.domainId == route.domainId && open.flowId == route.flowId)
+        {
+            return true;
+        }
+        close(open, pinned);
+        auto const domain = resolveDomain(cfg.scanPath, route.domainId);
+        if (domain)
+        {
+            open.instance = mxlCreateInstance(domain->path.c_str(), nullptr);
+        }
+        if (open.instance == nullptr || mxlCreateFlowReader(open.instance, route.flowId.c_str(), nullptr, &open.reader) != MXL_STATUS_OK)
+        {
+            close(open, pinned);
+            return false;
+        }
+        open.domainId = route.domainId;
+        open.flowId = route.flowId;
+        return true;
+    };
+    // Phase 1 also reads the camera's audio: the samples of each video grain's frame time are
+    // stored with that frame (SPECIFICATION.md §4.2), as interleaved stereo (mono doubled).
+    bool const withAudio = phase == 1 && camera >= 1 && camera <= static_cast<int>(cfg.cameras.size()) &&
+                           cfg.cameras[static_cast<std::size_t>(camera - 1)].audio;
+    Input audio;
+    std::string audioState;
+    // A writer may commit a frame's audio a little after its video: wait up to one frame for
+    // it while the audio arrives. While it does not, wait once every 50 frames only, so a
+    // stalled audio flow costs the video at most one frame per 50.
+    bool audioArrives = false;
+    std::uint64_t audioMisses = 0;
+    auto const audioWaitNs = static_cast<std::uint64_t>(framePeriodNs(cfg.format.rateNum, cfg.format.rateDen));
+    auto audioRoute = [&](Route const& route, std::string const& state) {
+        if (state != audioState)
+        {
+            audioState = state;
+            engine_.setRoute(camera, 1, false, Route{true, route.domainId, route.flowId, route.senderId, state});
+        }
+    };
+    auto readAudio = [&](std::uint64_t index) -> std::vector<float> {
+        auto const route = engine_.route(camera, 1, false);
+        if (!route.active || route.flowId.empty() || route.domainId.empty())
+        {
+            close(audio, false);
+            audioState.clear();
+            audioArrives = false;
+            return {};
+        }
+        bool const reopened = audio.reader == nullptr || audio.domainId != route.domainId || audio.flowId != route.flowId;
+        if (!attach(audio, route, false))
+        {
+            audioRoute(route, "waiting");
+            return {};
+        }
+        if (reopened)
+        {
+            audioArrives = false;
+            mxlFlowConfigInfo info{};
+            if (mxlFlowReaderGetConfigInfo(audio.reader, &info) != MXL_STATUS_OK || info.common.grainRate.numerator != 48000 ||
+                info.common.grainRate.denominator != 1 || info.continuous.channelCount == 0)
+            {
+                logWarn("mxl_audio_unsupported", {{"camera", std::to_string(camera)}, {"flow", route.flowId}, {"reason", "needs 48 kHz float32 audio"}});
+                close(audio, false);
+                audioRoute(route, "unsupported");
+                return {};
+            }
+        }
+        auto const first = audioSamplesUntil(index, cfg.format.rateNum, cfg.format.rateDen, 48000);
+        auto const end = audioSamplesUntil(index + 1, cfg.format.rateNum, cfg.format.rateDen, 48000);
+        auto const count = static_cast<std::size_t>(end - first);
+        // The samples of [first, end): MXL addresses `count` samples ending at `end`.
+        mxlWrappedMultiBufferSlice slices{};
+        bool const wait = audioArrives || ++audioMisses % 50 == 0;
+        auto const status = count == 0 ? MXL_ERR_INVALID_ARG
+                            : wait     ? mxlFlowReaderGetSamples(audio.reader, end, count, audioWaitNs, &slices)
+                                       : mxlFlowReaderGetSamplesNonBlocking(audio.reader, end, count, &slices);
+        audioArrives = status == MXL_STATUS_OK && slices.count > 0;
+        if (!audioArrives)
+        {
+            return {};
+        }
+        audioMisses = 0;
+        std::vector<float> pcm(count * 2, 0.f);
+        for (std::size_t channel = 0; channel < 2; ++channel)
+        {
+            auto const source = std::min(channel, slices.count - 1);
+            std::size_t sample = 0;
+            for (auto const& fragment : slices.base.fragments)
+            {
+                auto const* in = reinterpret_cast<float const*>(static_cast<std::uint8_t const*>(fragment.pointer) + source * slices.stride);
+                for (std::size_t i = 0; i < fragment.size / sizeof(float) && sample < count; ++i, ++sample)
+                {
+                    pcm[sample * 2 + channel] = in[i];
+                }
+            }
+        }
+        audioRoute(route, "running");
+        return pcm;
+    };
     // Reads (and encodes) every grain due since the last call; false when nothing was read.
     auto step = [&]() -> bool {
         auto const route = engine_.route(camera, phase, true);
         if (!route.active || route.flowId.empty() || route.domainId.empty())
         {
-            close(input);
+            close(input, true);
             return false;
         }
-        if (input.reader == nullptr || input.domainId != route.domainId || input.flowId != route.flowId)
+        if (!attach(input, route, true))
         {
-            close(input);
-            auto const domain = resolveDomain(cfg.scanPath, route.domainId);
-            if (domain)
-            {
-                input.instance = mxlCreateInstance(domain->path.c_str(), nullptr);
-            }
-            if (input.instance == nullptr || mxlCreateFlowReader(input.instance, route.flowId.c_str(), nullptr, &input.reader) != MXL_STATUS_OK)
-            {
-                close(input);
-                engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
-                return false;
-            }
-            input.domainId = route.domainId;
-            input.flowId = route.flowId;
+            engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
+            return false;
         }
         // Stay two grains behind the current index, as before, and read every grain since the last one.
         auto const now = mxlTimestampToIndex(&rate, mxlGetTime());
@@ -301,12 +404,17 @@ void MxlBridge::readInput(int camera, int phase)
             }
             if (status != MXL_STATUS_OK)
             {
-                close(input);
+                close(input, true);
                 engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
                 break;
             }
             if (payload != nullptr && (info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
             {
+                if (withAudio)
+                {
+                    // Taken by the next frame this phase stores, which is this grain's.
+                    engine_.ingestAudio(camera, mxlIndexToTimestamp(&rate, input.next), readAudio(input.next), 2);
+                }
                 engine_.ingestV210(camera, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
                 engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});
                 read = true;
@@ -321,7 +429,8 @@ void MxlBridge::readInput(int camera, int phase)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
-    close(input);
+    close(input, true);
+    close(audio, false);
 #else
     (void)engine_;
     (void)camera;

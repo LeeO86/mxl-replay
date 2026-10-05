@@ -102,20 +102,23 @@ int main(int argc, char** argv)
         replay::setLogFormatJson(loaded.config.logFormat != "text");
         auto const flat = loaded.flat;
         replay::Engine engine(std::move(loaded.config), flat);
-        replay::NmosNode node(engine.config(), engine);
-        node.start();
-        replay::MxlBridge bridge(engine);
-        bridge.start();
         replay::HttpServer server;
         std::string indexHtml;
 #ifdef REPLAY_HAS_UI
         indexHtml = std::string(replay::webui::indexHtml());
 #endif
+        // HTTP first: /livez answers while the retained segments are indexed (minutes for
+        // hours of buffer); /readyz and the API answer 503 until the buffer is open.
         if (engine.config().webEnable)
         {
             server.start(engine.config().webPort, [&](replay::HttpRequest const& request) { return replay::handleApi(engine, request, indexHtml); });
             replay::logInfo("web_listen", {{"port", std::to_string(server.port())}});
         }
+        engine.openBuffer();
+        replay::NmosNode node(engine.config(), engine);
+        node.start();
+        replay::MxlBridge bridge(engine);
+        bridge.start();
         std::signal(SIGTERM, onSignal);
         std::signal(SIGINT, onSignal);
         auto const period = std::chrono::nanoseconds(replay::framePeriodNs(engine.config().format.rateNum, engine.config().format.rateDen));
@@ -124,15 +127,30 @@ int main(int argc, char** argv)
         std::vector<std::thread> playout;
         for (int channel = 1; channel <= engine.config().channels; ++channel)
         {
-            playout.emplace_back([&engine, &bridge, period, channel] {
-                auto due = std::chrono::steady_clock::now();
+            playout.emplace_back([&engine, &bridge, channel] {
+                // One grain per house period on the TAI grid, rendered for the grain's own time.
+                // Rendering for the wake-up time put live playout between two source frames
+                // (interpolated, or flipping between them) and could write a grain index twice.
+                auto const num = engine.config().format.rateNum;
+                auto const den = engine.config().format.rateDen;
+                std::uint64_t next = 0;
                 while (!gStop.load())
                 {
-                    auto const tai = replay::taiNowNs();
+                    auto const current = replay::timestampToIndex(num, den, replay::taiNowNs());
+                    // Start, or more than two grains late: continue at the current grain.
+                    if (next == 0 || next + 2 < current || next > current + 1)
+                    {
+                        next = current;
+                    }
+                    auto const tai = replay::indexToTimestamp(num, den, next);
                     auto rendered = engine.render(channel, tai);
                     bridge.publish(channel, rendered, tai);
-                    due += period;
-                    std::this_thread::sleep_until(due);
+                    ++next;
+                    auto const wait = static_cast<std::int64_t>(replay::indexToTimestamp(num, den, next)) - static_cast<std::int64_t>(replay::taiNowNs());
+                    if (wait > 0)
+                    {
+                        std::this_thread::sleep_for(std::chrono::nanoseconds(wait));
+                    }
                 }
             });
         }

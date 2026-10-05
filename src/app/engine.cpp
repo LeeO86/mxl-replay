@@ -16,11 +16,14 @@
 #include <sys/statvfs.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
+#include <utility>
 
 namespace replay
 {
@@ -127,6 +130,19 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
     {
         throw StartupError(75, "cannot create storage directory " + config_.storageDir + ": " + ec.message());
     }
+    auto const catalogPath = config_.stateDir + "/index.sqlite";
+    auto const legacyCatalog = config_.storageDir + "/index.sqlite";
+    if (!std::filesystem::exists(catalogPath, ec) && std::filesystem::exists(legacyCatalog, ec))
+    {
+        std::filesystem::copy_file(legacyCatalog, catalogPath, ec);
+        if (!ec)
+        {
+            logInfo("catalog_migrated", {{"from", legacyCatalog}, {"to", catalogPath}});
+        }
+    }
+    catalog_.open(catalogPath);
+    continueSerial();
+    removeStaleCameras();
     struct statvfs st{};
     if (statvfs(config_.storageDir.c_str(), &st) != 0)
     {
@@ -158,42 +174,12 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
     }
     libraryDir_ = config_.storageDir + "/library";
     std::filesystem::create_directories(libraryDir_, ec);
-    auto const catalogPath = config_.stateDir + "/index.sqlite";
-    auto const legacyCatalog = config_.storageDir + "/index.sqlite";
-    if (!std::filesystem::exists(catalogPath, ec) && std::filesystem::exists(legacyCatalog, ec))
-    {
-        std::filesystem::copy_file(legacyCatalog, catalogPath, ec);
-        if (!ec)
-        {
-            logInfo("catalog_migrated", {{"from", legacyCatalog}, {"to", catalogPath}});
-        }
-    }
-    catalog_.open(catalogPath);
     loadRoutes();
     gpu_ = cudaFlowAvailable();
     auto const period = framePeriodNs(config_.format.rateNum, config_.format.rateDen);
     if (config_.odirect)
     {
         logWarn("odirect_ignored", {{"reason", "the buffer writes buffered and drops finished segments from the page cache"}});
-    }
-    cameras_.reserve(config_.cameras.size());
-    for (auto const& camera : config_.cameras)
-    {
-        auto const retention = static_cast<std::uint64_t>(camera.bufferHours * 3600.0 * 1e9);
-        cameras_.emplace_back(config_.storageDir + "/cam" + std::to_string(camera.index), retention, config_.segmentSeconds);
-        cameras_.back().phases.resize(static_cast<std::size_t>(camera.phases));
-    }
-    // Clips keep their frames: protect them again before old segments expire.
-    for (auto const& clip : catalog_.clips())
-    {
-        if (clip.camera >= 1 && clip.camera <= static_cast<int>(cameras_.size()))
-        {
-            cameras_[static_cast<std::size_t>(clip.camera - 1)].ring.protect(clip.inNs, clip.outNs);
-        }
-    }
-    for (auto& camera : cameras_)
-    {
-        camera.ring.enforceRetention();
     }
     for (auto const& channel : config_.channelList)
     {
@@ -226,6 +212,131 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
 
 Engine::~Engine() = default;
 
+void Engine::openBuffer()
+{
+    auto const started = std::chrono::steady_clock::now();
+    // Indexing reads every record header of the retained segments: no engine lock here.
+    std::vector<CameraRuntime> cameras;
+    cameras.reserve(config_.cameras.size());
+    for (auto const& camera : config_.cameras)
+    {
+        auto const retention = static_cast<std::uint64_t>(camera.bufferHours * 3600.0 * 1e9);
+        cameras.emplace_back(config_.storageDir + "/cam" + std::to_string(camera.index), retention, config_.segmentSeconds);
+        cameras.back().phases.resize(static_cast<std::size_t>(camera.phases));
+    }
+    // A retention of 1 ns keeps only the segments a clip touches (and the open one).
+    auto library = std::make_unique<FrameRing>(libraryDir_ + "/frames", 1, config_.segmentSeconds);
+    std::lock_guard lock{mutex_};
+    cameras_ = std::move(cameras);
+    library_ = std::move(library);
+    // Clips keep their frames: protect them again before old segments expire.
+    for (auto const& clip : catalog_.clips())
+    {
+        if (auto* ring = ringOf(clip.camera))
+        {
+            ring->protect(clip.inNs, clip.outNs);
+        }
+    }
+    for (auto& camera : cameras_)
+    {
+        camera.ring.enforceRetention();
+    }
+    library_->enforceRetention();
+    bufferReady_ = true;
+    auto const seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    logInfo("buffer_ready", {{"cameras", std::to_string(cameras_.size())}, {"seconds", std::to_string(seconds)}});
+}
+
+FrameRing const* Engine::ringOf(int camera) const
+{
+    if (camera == kLibraryCamera)
+    {
+        return library_.get();
+    }
+    if (camera < 1 || camera > static_cast<int>(cameras_.size()))
+    {
+        return nullptr;
+    }
+    return &cameras_[static_cast<std::size_t>(camera - 1)].ring;
+}
+
+FrameRing* Engine::ringOf(int camera)
+{
+    return const_cast<FrameRing*>(std::as_const(*this).ringOf(camera));
+}
+
+void Engine::continueSerial()
+{
+    // Ids end in "-<serial>" (clip-, upload-, group-, playlist-). Continue after the catalog's:
+    // starting at 1 again after a restart replaced the clips that already had those ids.
+    auto const serialOf = [](std::string const& id) -> std::uint64_t {
+        auto const dash = id.rfind('-');
+        if (dash == std::string::npos || dash + 1 >= id.size() || id.find_first_not_of("0123456789", dash + 1) != std::string::npos)
+        {
+            return 0;
+        }
+        return std::strtoull(id.c_str() + dash + 1, nullptr, 10);
+    };
+    for (auto const& clip : catalog_.clips())
+    {
+        clipSerial_ = std::max({clipSerial_, serialOf(clip.id) + 1, serialOf(clip.groupId) + 1});
+    }
+    for (auto const& playlist : catalog_.playlists())
+    {
+        clipSerial_ = std::max(clipSerial_, serialOf(playlist.id) + 1);
+    }
+}
+
+void Engine::removeStaleCameras()
+{
+    std::set<int> configured;
+    for (auto const& camera : config_.cameras)
+    {
+        configured.insert(camera.index);
+    }
+    std::set<int> clipped;
+    for (auto const& clip : catalog_.clips())
+    {
+        clipped.insert(clip.camera);
+    }
+    std::error_code ec;
+    for (auto const& item : std::filesystem::directory_iterator(config_.storageDir, ec))
+    {
+        auto const name = item.path().filename().string();
+        std::error_code typeError;
+        if (!item.is_directory(typeError) || name.size() < 4 || name.rfind("cam", 0) != 0 ||
+            name.find_first_not_of("0123456789", 3) != std::string::npos)
+        {
+            continue;
+        }
+        int const camera = std::atoi(name.c_str() + 3);
+        if (configured.count(camera) != 0)
+        {
+            continue;
+        }
+        auto const bytes = segmentBytes(item.path().string());
+        if (clipped.count(camera) != 0)
+        {
+            logWarn("removed_camera_kept", {{"camera", std::to_string(camera)}, {"bytes", std::to_string(bytes)}, {"reason", "clips use it"}});
+            continue;
+        }
+        // Only the buffer's own files go; anything else keeps the directory.
+        for (auto const& file : std::filesystem::directory_iterator(item.path(), ec))
+        {
+            auto const fileName = file.path().filename().string();
+            if (fileName.size() > 4 && fileName.compare(fileName.size() - 4, 4, ".bin") == 0 &&
+                (fileName.rfind("seg-", 0) == 0 || fileName.rfind("cam", 0) == 0))
+            {
+                std::error_code removeError;
+                std::filesystem::remove(file.path(), removeError);
+            }
+        }
+        std::error_code dirError;
+        std::filesystem::remove(item.path(), dirError);
+        logInfo("removed_camera_deleted", {{"camera", std::to_string(camera)}, {"bytes", std::to_string(bytes)}});
+    }
+}
+
 double Engine::hfrFactor(int camera) const
 {
     if (camera < 1 || camera > static_cast<int>(config_.cameras.size()))
@@ -247,7 +358,7 @@ std::uint64_t Engine::sourcePeriod(int camera) const
     return static_cast<std::uint64_t>(static_cast<double>(framePeriodNs(config_.format.rateNum, config_.format.rateDen)) / factor);
 }
 
-void Engine::storeFrame(CameraRuntime& camera, std::uint64_t taiNs, Frame10 const& frame, std::vector<float> const& audio)
+void Engine::storeFrame(CameraRuntime& camera, std::uint64_t taiNs, Frame10 const& frame, std::vector<float> const& audio, std::vector<StoredFrame>& pending)
 {
     StoredFrame stored;
     stored.taiNs = taiNs;
@@ -257,16 +368,24 @@ void Engine::storeFrame(CameraRuntime& camera, std::uint64_t taiNs, Frame10 cons
         stored.jpeg = encodeJpeg422(frame, config_.jpegQuality);
     }
     stored.audio = audio;
-    if (!camera.ring.push(std::move(stored)))
-    {
-        ++camera.dropped;
-        return;
-    }
-    ++camera.recorded;
+    pending.push_back(std::move(stored));
     camera.preview = tinyPreview(frame);
 }
 
-void Engine::flushHouse(CameraRuntime& camera, CameraConfig const& cfg)
+void Engine::pushFrames(CameraRuntime& camera, std::vector<StoredFrame> frames)
+{
+    // The ring has its own lock: a slow disk stalls this camera only, not the channels.
+    std::uint64_t recorded = 0;
+    for (auto& frame : frames)
+    {
+        recorded += camera.ring.push(std::move(frame)) ? 1 : 0;
+    }
+    std::lock_guard lock{mutex_};
+    camera.recorded += recorded;
+    camera.dropped += frames.size() - recorded;
+}
+
+void Engine::flushHouse(CameraRuntime& camera, CameraConfig const& cfg, std::vector<StoredFrame>& pending)
 {
     if (!camera.houseOpen)
     {
@@ -303,7 +422,7 @@ void Engine::flushHouse(CameraRuntime& camera, CameraConfig const& cfg)
         {
             audio = camera.audio;
         }
-        storeFrame(camera, item.timeNs, picture.empty() ? slot.frame : picture, audio);
+        storeFrame(camera, item.timeNs, picture.empty() ? slot.frame : picture, audio, pending);
     }
     for (auto& slot : camera.phases)
     {
@@ -328,23 +447,25 @@ void Engine::ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t
         ingestVideo(camera, phase, taiNs, std::move(frame));
         return;
     }
-    std::lock_guard lock{mutex_};
-    if (camera < 1 || camera > static_cast<int>(cameras_.size()) || !config_.cameras[static_cast<std::size_t>(camera - 1)].record)
+    std::vector<StoredFrame> pending(1);
+    pending[0].taiNs = taiNs;
+    pending[0].jpeg = std::move(jpeg);
+    CameraRuntime* runtime = nullptr;
     {
-        return;
+        std::lock_guard lock{mutex_};
+        if (camera < 1 || camera > static_cast<int>(cameras_.size()) || !config_.cameras[static_cast<std::size_t>(camera - 1)].record)
+        {
+            return;
+        }
+        runtime = &cameras_[static_cast<std::size_t>(camera - 1)];
+        // The camera's audio arrives with phase 1 (SPECIFICATION.md §4.2).
+        if (phase <= 1)
+        {
+            pending[0].audio = std::move(runtime->audio);
+            runtime->audio.clear();
+        }
     }
-    auto& runtime = cameras_[static_cast<std::size_t>(camera - 1)];
-    StoredFrame stored;
-    stored.taiNs = taiNs;
-    stored.jpeg = std::move(jpeg);
-    stored.audio = runtime.audio;
-    runtime.audio.clear();
-    if (!runtime.ring.push(std::move(stored)))
-    {
-        ++runtime.dropped;
-        return;
-    }
-    ++runtime.recorded;
+    pushFrames(*runtime, std::move(pending));
 }
 
 void Engine::countDropped(int camera, std::uint64_t grains)
@@ -358,53 +479,64 @@ void Engine::countDropped(int camera, std::uint64_t grains)
 
 void Engine::ingestVideo(int camera, int phase, std::uint64_t taiNs, Frame10 frame)
 {
-    std::lock_guard lock{mutex_};
-    if (camera < 1 || camera > static_cast<int>(cameras_.size()))
+    std::vector<StoredFrame> pending;
+    CameraRuntime* target = nullptr;
     {
-        return;
+        std::lock_guard lock{mutex_};
+        if (camera < 1 || camera > static_cast<int>(cameras_.size()))
+        {
+            return;
+        }
+        auto& runtime = cameras_[static_cast<std::size_t>(camera - 1)];
+        auto const& cfg = config_.cameras[static_cast<std::size_t>(camera - 1)];
+        if (!cfg.record)
+        {
+            return;
+        }
+        target = &runtime;
+        if (frame.width != config_.format.width || frame.height != config_.format.height)
+        {
+            Frame10 scaled;
+            scaled.allocate(config_.format.width, config_.format.height);
+            scaleFrame(frame, scaled, ScaleFilter::Bicubic);
+            frame = std::move(scaled);
+            runtime.scaled = true;
+        }
+        if (cfg.phases <= 1)
+        {
+            storeFrame(runtime, taiNs, frame, runtime.audio, pending);
+            runtime.audio.clear();
+        }
+        else
+        {
+            auto const houseIndex = timestampToIndex(config_.format.rateNum, config_.format.rateDen, taiNs);
+            if (runtime.houseOpen && houseIndex != runtime.openHouse)
+            {
+                flushHouse(runtime, cfg, pending);
+            }
+            runtime.houseOpen = true;
+            runtime.openHouse = houseIndex;
+            if (phase >= 1 && phase <= cfg.phases)
+            {
+                auto& slot = runtime.phases[static_cast<std::size_t>(phase - 1)];
+                slot.present = true;
+                slot.frame = std::move(frame);
+                slot.taiNs = taiNs;
+            }
+            bool full = true;
+            for (auto const& slot : runtime.phases)
+            {
+                full = full && slot.present;
+            }
+            if (full)
+            {
+                flushHouse(runtime, cfg, pending);
+            }
+        }
     }
-    auto& runtime = cameras_[static_cast<std::size_t>(camera - 1)];
-    auto const& cfg = config_.cameras[static_cast<std::size_t>(camera - 1)];
-    if (!cfg.record)
+    if (!pending.empty())
     {
-        return;
-    }
-    if (frame.width != config_.format.width || frame.height != config_.format.height)
-    {
-        Frame10 scaled;
-        scaled.allocate(config_.format.width, config_.format.height);
-        scaleFrame(frame, scaled, ScaleFilter::Bicubic);
-        frame = std::move(scaled);
-        runtime.scaled = true;
-    }
-    if (cfg.phases <= 1)
-    {
-        storeFrame(runtime, taiNs, frame, runtime.audio);
-        runtime.audio.clear();
-        return;
-    }
-    auto const houseIndex = timestampToIndex(config_.format.rateNum, config_.format.rateDen, taiNs);
-    if (runtime.houseOpen && houseIndex != runtime.openHouse)
-    {
-        flushHouse(runtime, cfg);
-    }
-    runtime.houseOpen = true;
-    runtime.openHouse = houseIndex;
-    if (phase >= 1 && phase <= cfg.phases)
-    {
-        auto& slot = runtime.phases[static_cast<std::size_t>(phase - 1)];
-        slot.present = true;
-        slot.frame = std::move(frame);
-        slot.taiNs = taiNs;
-    }
-    bool full = true;
-    for (auto const& slot : runtime.phases)
-    {
-        full = full && slot.present;
-    }
-    if (full)
-    {
-        flushHouse(runtime, cfg);
+        pushFrames(*target, std::move(pending));
     }
 }
 
@@ -428,11 +560,12 @@ Frame10 Engine::frameAt(int camera, std::uint64_t taiNs, bool* found) const
     {
         *found = false;
     }
-    if (camera < 1 || camera > static_cast<int>(cameras_.size()))
+    auto const* ring = ringOf(camera);
+    if (ring == nullptr)
     {
         return frame;
     }
-    auto const stored = cameras_[static_cast<std::size_t>(camera - 1)].ring.findNearest(taiNs);
+    auto const stored = ring->findNearest(taiNs);
     if (!stored)
     {
         return frame;
@@ -489,27 +622,28 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     std::uint64_t const taiB = static_cast<std::uint64_t>(pick.frameB) * periodSrc;
     bool exact = pick.kind == SourcePick::Kind::Exact;
     bool renderedOnGpu = false;
-    if (!runtime.black && cudaFlowAvailable() && camera >= 1 && camera <= static_cast<int>(cameras_.size()))
+    if (auto const* ring = ringOf(camera); !runtime.black && cudaFlowAvailable() && ring != nullptr)
     {
-        auto const storedA = cameras_[static_cast<std::size_t>(camera - 1)].ring.findNearest(taiA);
-        auto const storedB = cameras_[static_cast<std::size_t>(camera - 1)].ring.findNearest(taiB);
-        bool const second = storedB && storedA && storedB->taiNs != storedA->taiNs && pick.kind != SourcePick::Kind::Exact && pick.kind != SourcePick::Kind::Repeat;
+        // Read, decode, interpolate and download without the engine lock, so channels and
+        // the recorder do not wait for each other's disk or GPU work.
+        auto const op = operatingPoint(config_.preset);
+        bool const wantB = pick.kind != SourcePick::Kind::Exact && pick.kind != SourcePick::Kind::Repeat;
+        lock.unlock();
+        auto const storedA = ring->findNearest(taiA);
+        auto const storedB = wantB ? ring->findNearest(taiB) : std::nullopt;
+        bool const second = storedB && storedA && storedB->taiNs != storedA->taiNs;
         GpuPicture gpuPicture;
         auto const key = std::to_string(camera) + ":" + std::to_string(taiA) + ":" + std::to_string(taiB);
         bool onGpu = false;
         if (storedA && !storedA->jpeg.empty())
         {
-            // The stored frames are copies: decode, interpolate and download without the
-            // engine lock, so channels and the recorder do not wait for each other's GPU work.
-            auto const op = operatingPoint(config_.preset);
-            lock.unlock();
             auto const keyA = std::to_string(camera) + ":" + std::to_string(storedA->taiNs);
             auto const keyB = second ? std::to_string(camera) + ":" + std::to_string(storedB->taiNs) : std::string{};
             onGpu = gpuRenderFromJpeg(storedA->jpeg.data(), storedA->jpeg.size(), keyA, second ? storedB->jpeg.data() : nullptr, second ? storedB->jpeg.size() : 0,
                 keyB, static_cast<float>(pick.phase), motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate, op, key, config_.format.width,
                 config_.format.height, gpuPicture);
-            lock.lock();
         }
+        lock.lock();
         if (onGpu)
         {
             rendered.v210 = std::move(gpuPicture.v210);
@@ -533,8 +667,10 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     }
     else
     {
+        lock.unlock();
         frameA = frameAt(camera, taiA, &foundA);
         frameB = frameAt(camera, taiB, &foundB);
+        lock.lock();
     }
     if (runtime.black || (!foundA && !foundB))
     {
@@ -545,7 +681,9 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         }
         else if (cfg.idle == IdleSource::E2e && !runtime.black)
         {
+            lock.unlock();
             picture = frameAt(camera, outputTaiNs, &foundA);
+            lock.lock();
             if (!foundA)
             {
                 picture.allocate(config_.format.width, config_.format.height);
@@ -619,13 +757,18 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         config_.format.rateDen, 48000);
     int const audioCamera = cfg.atmosCamera > 0 ? cfg.atmosCamera : camera;
     std::vector<float> pcm(static_cast<std::size_t>(samples) * 2, 0.f);
-    if (audioCamera >= 1 && audioCamera <= static_cast<int>(cameras_.size()))
+    if (auto const* ring = ringOf(audioCamera))
     {
-        auto const stored = cameras_[static_cast<std::size_t>(audioCamera - 1)].ring.findNearest(position);
-        if (stored && !stored->audio.empty())
+        // Audio is stored with the frames on house times (phase 1 of an HFR camera).
+        auto const house = static_cast<std::uint64_t>(std::max<std::int64_t>(1, period));
+        auto const at = (position + house / 2) / house * house;
+        lock.unlock();
+        auto audio = ring->findNearestAudio(at);
+        lock.lock();
+        if (!audio.empty())
         {
-            pcm.assign(stored->audio.begin(), stored->audio.begin() + static_cast<std::ptrdiff_t>(std::min(stored->audio.size(), pcm.size())));
-            pcm.resize(static_cast<std::size_t>(samples) * 2, 0.f);
+            audio.resize(pcm.size(), 0.f);
+            pcm = std::move(audio);
         }
     }
     double const speed = std::fabs(runtime.scheduler.speed);
@@ -953,12 +1096,14 @@ std::string Engine::createClip(int channel, std::string const& name, bool allAng
     int const to = allAngles ? static_cast<int>(cameras_.size()) : runtime.scheduler.camera;
     for (int camera = from; camera <= to; ++camera)
     {
+        // Null for kLibraryCamera: a clip marked while an upload plays.
+        auto const* cameraCfg = camera >= 1 && camera <= static_cast<int>(config_.cameras.size()) ? &config_.cameras[static_cast<std::size_t>(camera - 1)] : nullptr;
         ClipRef clip;
         clip.id = "clip-" + std::to_string(clipSerial_++);
         clip.name = name.empty() ? clip.id : name;
-        if (allAngles)
+        if (allAngles && cameraCfg != nullptr)
         {
-            clip.name += " " + config_.cameras[static_cast<std::size_t>(camera - 1)].label;
+            clip.name += " " + cameraCfg->label;
         }
         clip.camera = camera;
         clip.inNs = runtime.inNs;
@@ -966,11 +1111,17 @@ std::string Engine::createClip(int channel, std::string const& name, bool allAng
         clip.speed = runtime.scheduler.speed;
         clip.motion = motionName(config_.channelList[static_cast<std::size_t>(channel - 1)].motion);
         clip.audio = audioModeName(config_.channelList[static_cast<std::size_t>(channel - 1)].audio);
-        clip.colour = config_.cameras[static_cast<std::size_t>(camera - 1)].colour;
+        if (cameraCfg != nullptr)
+        {
+            clip.colour = cameraCfg->colour;
+        }
         clip.end = EndAction::Freeze;
         clip.groupId = allAngles ? group : "";
         catalog_.upsertClip(clip);
-        cameras_[static_cast<std::size_t>(camera - 1)].ring.protect(clip.inNs, clip.outNs);
+        if (auto* ring = ringOf(camera))
+        {
+            ring->protect(clip.inNs, clip.outNs);
+        }
         if (first.empty())
         {
             first = clip.id;
@@ -996,20 +1147,29 @@ void Engine::updateClip(ClipRef clip)
         clip.name = existing.name;
     }
     catalog_.upsertClip(clip);
-    if (clip.camera >= 1 && clip.camera <= static_cast<int>(cameras_.size()))
+    if (auto* ring = ringOf(clip.camera))
     {
-        cameras_[static_cast<std::size_t>(clip.camera - 1)].ring.protect(clip.inNs, clip.outNs);
+        ring->protect(clip.inNs, clip.outNs);
     }
 }
 
 void Engine::deleteClip(std::string const& id)
 {
-    std::lock_guard lock{mutex_};
-    auto clip = catalog_.clip(id);
-    catalog_.deleteClip(id);
-    if (!clip.id.empty() && clip.camera >= 1 && clip.camera <= static_cast<int>(cameras_.size()))
+    FrameRing* ring = nullptr;
     {
-        cameras_[static_cast<std::size_t>(clip.camera - 1)].ring.unprotect(clip.inNs, clip.outNs);
+        std::lock_guard lock{mutex_};
+        auto clip = catalog_.clip(id);
+        catalog_.deleteClip(id);
+        ring = clip.id.empty() ? nullptr : ringOf(clip.camera);
+        if (ring != nullptr)
+        {
+            ring->unprotect(clip.inNs, clip.outNs);
+        }
+    }
+    // Camera rings drop expired segments when they rotate; the library ring only here.
+    if (ring != nullptr)
+    {
+        ring->enforceRetention();
     }
 }
 
@@ -1137,76 +1297,96 @@ std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::stri
         error = converted.error.empty() ? "upload failed" : converted.error;
         return {};
     }
-    std::lock_guard lock{mutex_};
     error.clear();
-    auto const id = "upload-" + std::to_string(clipSerial_++);
     auto const period = static_cast<std::uint64_t>(framePeriodNs(config_.format.rateNum, config_.format.rateDen));
-    std::uint64_t const origin = 1;
+    // Uploads go to the library ring, on the frame grid after its newest frame: a camera
+    // ring only appends, so frames older than its live recording would be refused.
+    std::lock_guard serial{uploadMutex_};
+    auto const origin = (library_->newestNs() / period + 1) * period;
+    ClipRef clip;
+    clip.camera = kLibraryCamera;
+    clip.inNs = origin;
+    clip.outNs = origin + static_cast<std::uint64_t>(converted.frames.size() - 1) * period;
+    // Protected first: the library ring keeps only segments a clip touches.
+    library_->protect(clip.inNs, clip.outNs);
+    std::size_t stored = 0;
     for (std::size_t i = 0; i < converted.frames.size(); ++i)
     {
-        std::vector<float> audio;
+        StoredFrame frame;
+        frame.taiNs = origin + static_cast<std::uint64_t>(i) * period;
+        frame.jpeg = gpuEncodeFrame10(converted.frames[i], config_.jpegQuality);
+        if (frame.jpeg.empty())
+        {
+            frame.jpeg = encodeJpeg422(converted.frames[i], config_.jpegQuality);
+        }
         if (!converted.audio.empty())
         {
             int const samples = audioSamplesForFrame(i, config_.format.rateNum, config_.format.rateDen, 48000);
             std::size_t const offset = i * static_cast<std::size_t>(samples) * static_cast<std::size_t>(converted.channels);
             if (offset < converted.audio.size())
             {
-                audio.assign(converted.audio.begin() + static_cast<std::ptrdiff_t>(offset),
+                frame.audio.assign(converted.audio.begin() + static_cast<std::ptrdiff_t>(offset),
                     converted.audio.begin() + static_cast<std::ptrdiff_t>(std::min(converted.audio.size(), offset + static_cast<std::size_t>(samples * converted.channels))));
             }
         }
-        storeFrame(cameras_[0], origin + static_cast<std::uint64_t>(i) * period, converted.frames[i], audio);
+        stored += library_->push(std::move(frame)) ? 1 : 0;
     }
-    ClipRef clip;
-    clip.id = id;
-    clip.name = name.empty() ? id : name;
-    clip.camera = 1;
-    clip.inNs = origin;
-    clip.outNs = origin + static_cast<std::uint64_t>(converted.frames.size() - 1) * period;
+    if (stored == 0)
+    {
+        library_->unprotect(clip.inNs, clip.outNs);
+        error = "upload could not be stored";
+        return {};
+    }
+    std::lock_guard lock{mutex_};
+    clip.id = "upload-" + std::to_string(clipSerial_++);
+    clip.name = name.empty() ? clip.id : name;
     clip.speed = 1;
     clip.motion = "interpolate";
     clip.audio = "mute";
     clip.library = true;
     clip.end = EndAction::Freeze;
     catalog_.upsertClip(clip);
-    cameras_[0].ring.protect(clip.inNs, clip.outNs);
-    if (converted.error == "scaled")
-    {
-        cameras_[0].scaled = true;
-    }
-    return id;
+    return clip.id;
 }
 
 std::string Engine::exportClip(std::string const& id, std::string& error)
 {
-    std::lock_guard lock{mutex_};
-    auto clip = catalog_.clip(id);
-    if (clip.id.empty())
+    ClipRef clip;
+    std::uint64_t period = 0;
+    FrameRing const* ring = nullptr;
     {
-        error = "unknown clip";
+        std::lock_guard lock{mutex_};
+        clip = catalog_.clip(id);
+        if (clip.id.empty())
+        {
+            error = "unknown clip";
+            return {};
+        }
+        period = sourcePeriod(clip.camera);
+        ring = ringOf(clip.camera);
+    }
+    if (ring == nullptr)
+    {
+        error = "the clip's camera is not configured";
         return {};
     }
+    // Reads, decoding and file writes run without the engine lock (the ring has its own).
     auto const dir = libraryDir_ + "/" + id;
     std::filesystem::create_directories(dir);
-    auto const period = sourcePeriod(clip.camera);
     std::vector<float> audio;
     int index = 0;
     for (std::uint64_t tai = clip.inNs; tai <= clip.outNs; tai += period)
     {
-        bool found = false;
-        auto frame = frameAt(clip.camera, tai, &found);
-        if (!found)
+        auto const stored = ring->findNearest(tai);
+        Frame10 frame;
+        if (!stored || !decodeJpeg422(stored->jpeg.data(), stored->jpeg.size(), frame))
         {
             continue;
         }
         auto const jpeg = encodeJpeg422(frame, config_.jpegQuality);
         std::ofstream out(dir + "/frame_" + std::to_string(index) + ".jpg", std::ios::binary);
         out.write(reinterpret_cast<char const*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
-        auto const stored = cameras_[static_cast<std::size_t>(clip.camera - 1)].ring.findNearest(tai);
-        if (stored)
-        {
-            audio.insert(audio.end(), stored->audio.begin(), stored->audio.end());
-        }
+        audio.insert(audio.end(), stored->audio.begin(), stored->audio.end());
         ++index;
     }
     auto const wav = writeWav(audio, 2, 48000);
@@ -1784,6 +1964,7 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             }
             catalog_.upsertPlaylist(playlist);
         }
+        continueSerial();
         result.ok = true;
         return result;
     }
@@ -1828,6 +2009,23 @@ bool Engine::gpuInterpolate() const
 void Engine::setGpuPresent(bool present)
 {
     gpu_ = present || cudaFlowAvailable();
+}
+
+void Engine::updateMetrics()
+{
+    std::lock_guard lock{mutex_};
+    for (std::size_t i = 0; i < cameras_.size(); ++i)
+    {
+        auto const& camera = cameras_[i];
+        Labels const labels{{"camera", std::to_string(config_.cameras[i].index)}};
+        metrics_.set("record_frames_total", labels, static_cast<double>(camera.recorded));
+        metrics_.set("record_dropped_total", labels, static_cast<double>(camera.dropped));
+        metrics_.set("phase_missing_total", labels, static_cast<double>(camera.phaseMissing));
+        // Frames lost to a full disk or an I/O error (also part of record_dropped_total).
+        metrics_.set("storage_write_failed_total", labels, static_cast<double>(camera.ring.writeFailures()));
+        metrics_.set("protected_bytes", labels, static_cast<double>(camera.ring.protectedBytes()));
+        metrics_.set("disk_bytes", labels, static_cast<double>(camera.ring.diskBytes()));
+    }
 }
 
 std::uint64_t Engine::freeBytes() const

@@ -112,6 +112,11 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
     {
         return json(200, "{\"status\":\"ok\"}");
     }
+    // The retained segments are indexed after HTTP starts; until then only /livez works.
+    if (!engine.bufferReady())
+    {
+        return json(503, "{\"status\":\"indexing\"}");
+    }
     if (path == "/readyz")
     {
         auto const& cfg = engine.config();
@@ -133,6 +138,7 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
     {
         HttpResponse response;
         response.contentType = "text/plain; version=0.0.4";
+        engine.updateMetrics();
         auto& metrics = engine.metrics();
         metrics.set("free_bytes", {}, static_cast<double>(engine.freeBytes()));
         metrics.set("write_bytes_per_second", {}, engine.storageBytesPerSecond());

@@ -27,9 +27,11 @@ bytes/frame = width * height * (quality / 92) * 0.1875
 
 High frame rate scales with the frame rate. Audio is float32 PCM, 48 kHz. The process refuses to start when `REPLAY_BUFFER_HOURS` does not fit on `REPLAY_STORAGE_DIR`, and it says how many bytes it needs. Its own segments from an earlier run count as available.
 
-The buffer lives on `REPLAY_STORAGE_DIR`: one series of segment files (`cam<N>/seg-<TAI>.bin`, `REPLAY_SEGMENT_SECONDS` each) per camera. Memory holds only an index of about 32 bytes per frame (4 cameras × 1.5 h at 50p: about 35 MB) and a few open files. Segments whose newest frame is older than the camera's buffer duration behind its newest frame are deleted, so disk use stays at the configured duration. After a restart the existing segments are indexed again: the buffer and the clips survive.
+The buffer lives on `REPLAY_STORAGE_DIR`: one series of segment files (`cam<N>/seg-<TAI>.bin`, `REPLAY_SEGMENT_SECONDS` each) per camera. Memory holds only an index of about 32 bytes per frame (4 cameras × 1.5 h at 50p: about 35 MB) and a few open files. Segments whose newest frame is older than the camera's buffer duration behind its newest frame are deleted, so disk use stays at the configured duration. After a restart the existing segments are indexed again: the buffer and the clips survive. HTTP starts first, so `/livez` answers while the index is built; `/readyz` and the API answer 503 until it is done. The buffers of cameras that are no longer configured are deleted at startup, unless a clip uses that camera.
 
-Use a dedicated NVMe, not the operating-system disk. Protected clip ranges are never overwritten: a segment that a clip touches stays until the clip is deleted. New clips warn once protected data exceeds `REPLAY_PROTECT_MAX_PCT` (default 50%) of the budget.
+Use a dedicated NVMe, not the operating-system disk. Protected clip ranges are never overwritten: a segment that a clip touches stays until the clip is deleted. New clips warn once the segments that clips keep exceed `REPLAY_PROTECT_MAX_PCT` (default 50%) of the budget. Frames that cannot be written (full disk or I/O error) are dropped and counted in `storage_write_failed_total`; the log has `segment_write_failed` once per run of failures and `segment_write_recovered` with the count.
+
+Uploaded files are stored in their own library buffer (`REPLAY_STORAGE_DIR/library/frames`); their clips list camera `0`. A library segment stays as long as a clip uses it.
 
 10-bit and 12-bit JPEG are not used. nvJPEG's baseline 4:2:2 encoder is 8-bit. See `IMPLEMENTATION_PLAN.md`.
 
@@ -124,17 +126,17 @@ HTTP on `WEB_PORT`:
 | DELETE | `/api/v1/clips/{id}` |
 | WebSocket | `/api/v1/events` |
 
-`/readyz` is 200 when the process is serving. If `NMOS_REGISTRY_ADDRESS` is set and NMOS is enabled, it is 200 only after the Query API at `NMOS_QUERY_ADDRESS:NMOS_QUERY_PORT` lists this node. `/metrics` is Prometheus text with the prefix `mxl_replay_`.
+`/livez` is 200 as soon as HTTP listens. `/readyz` and the API are 503 (`{"status":"indexing"}`) until the buffer is indexed, then `/readyz` is 200 when the process is serving. If `NMOS_REGISTRY_ADDRESS` is set and NMOS is enabled, it is 200 only after the Query API at `NMOS_QUERY_ADDRESS:NMOS_QUERY_PORT` lists this node. `/metrics` is Prometheus text with the prefix `mxl_replay_`.
 
 On SIGTERM the process stops playout, releases MXL readers and writers, removes its NMOS resources so the registry receives DELETEs, and, when `MXL_CLEANUP_ON_EXIT=true`, deletes only its own output domain. It then exits 143. Work still running after `SHUTDOWN_TIMEOUT_S` is abandoned.
 
-Playout channels are NMOS senders (video `video/v210`, audio `audio/float32`, data `video/smpte291`) in the replay's own domain, labelled `<channel label> Video`, `Audio` and `Data`. Inputs are receivers, labelled `<camera label> Video` and `Audio` the same way. A receiver accepts activation before the flow exists and stays `waiting` until the grain can be read. The process does not write into a mirror domain.
+Playout channels are NMOS senders (video `video/v210`, audio `audio/float32`, data `video/smpte291`) in the replay's own domain, labelled `<channel label> Video`, `Audio` and `Data`. Inputs are receivers, labelled `<camera label> Video` and `Audio` the same way. A receiver accepts activation before the flow exists and stays `waiting` until the grain can be read. Camera audio (`CAM<n>_AUDIO`, default on) is stored with each video frame: the frame's samples of a 48 kHz `audio/float32` flow, first two channels, mono doubled. Another sample rate leaves the audio receiver `unsupported`. An HFR camera takes its audio with phase 1. The process does not write into a mirror domain.
 
 `REPLAY_SYNTHETIC=true` feeds a moving test raster into the recorder so the UI and the integration test can run without other MXL flows.
 
 ## Metrics
 
-Prefix `mxl_replay_`. Cameras report record rate, drops, missing phases, and buffer occupancy. Channels report state, speed, and late grains. `frame_gpu_seconds` is a histogram labelled by stage. Storage reports write rate, free bytes, and protected bytes. A Grafana dashboard is in `deploy/grafana/`.
+Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, and `disk_bytes`. Channels report state, speed, and late grains. `frame_gpu_seconds` is a histogram labelled by stage. Storage reports write rate, free bytes, and protected bytes. A Grafana dashboard is in `deploy/grafana/`.
 
 ## Deploy
 
@@ -163,7 +165,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.1.0
+  ghcr.io/leeo86/mxl-replay:1.2.0
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.

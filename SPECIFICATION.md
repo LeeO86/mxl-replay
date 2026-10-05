@@ -331,8 +331,10 @@ REST under `/api/v1/…` (cameras, channels: transport/position/speed/angle, cli
 playlists, library, uploads, exports, config) and WebSocket `/api/v1/events`
 (positions, states, thumbnails at low rate, alarms) so several UIs stay in sync and
 other systems (e.g. a control surface or a vision mixer macro) can drive the replay.
-`/livez`, `/readyz`, `/statusz`, `/metrics` on `WEB_PORT`. `/readyz` stays 503 until
-the node is visible on the Query API when a registry address is set.
+`/livez`, `/readyz`, `/statusz`, `/metrics` on `WEB_PORT`. HTTP starts before the
+retained segments are indexed: `/livez` answers at once, while `/readyz` and the API stay
+503 until the index is built and, when a registry address is set, until the node is
+visible on the Query API.
 `GET /api/v1/config/export` and `POST /api/v1/config/import` exchange one JSON
 document. There are no secret settings.
 
@@ -380,6 +382,7 @@ document. There are no secret settings.
 | `WEB_PORT` / `SHUTDOWN_TIMEOUT_S` | 8150 / 10 |
 
 Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`,
+`storage_write_failed_total` (frames lost to a full disk or an I/O error),
 `phase_missing_total`, `buffer_seconds`, `jpeg_encode_seconds`; per channel
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,
 `frame_gpu_seconds` (histogram by stage: decode, flow, interpolate, pack),

@@ -28,6 +28,8 @@ struct ProtectRange
 // frame is older than the newest recorded frame minus `retentionNs` are deleted,
 // unless a protected range (a clip) touches them. Existing segments are indexed
 // again on construction, so the buffer and the clips survive a restart.
+// Thread-safe: an internal lock guards the index, and no file is read or written
+// while it is held, so a slow disk does not stall readers of other frames.
 class FrameRing
 {
 public:
@@ -50,13 +52,20 @@ public:
     [[nodiscard]] std::optional<StoredFrame> findNearest(std::uint64_t taiNs) const;
     [[nodiscard]] std::optional<StoredFrame> findAtOrBefore(std::uint64_t taiNs) const;
     [[nodiscard]] std::optional<StoredFrame> findAfter(std::uint64_t taiNs) const;
+    // The audio of the nearest frame, without reading its JPEG.
+    [[nodiscard]] std::vector<float> findNearestAudio(std::uint64_t taiNs) const;
     [[nodiscard]] std::size_t size() const;
+    // TAI of the newest frame; 0 when the ring is empty.
+    [[nodiscard]] std::uint64_t newestNs() const;
     [[nodiscard]] std::size_t protectedCount() const;
     [[nodiscard]] std::uint64_t payloadBytes() const;
+    // Bytes of the segments that protected ranges keep: a clip keeps whole segments.
     [[nodiscard]] std::uint64_t protectedBytes() const;
     [[nodiscard]] double protectedPercent() const;
     [[nodiscard]] std::uint64_t diskBytes() const;
     [[nodiscard]] std::size_t segmentCount() const;
+    // Frames that could not be written (full disk or I/O error) since construction.
+    [[nodiscard]] std::uint64_t writeFailures() const;
 
 private:
     struct Impl;
