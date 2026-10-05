@@ -167,6 +167,7 @@ private:
         std::vector<std::uint8_t> preview;
         std::uint64_t late = 0;
         std::uint64_t ancSequence = 0;
+        std::uint64_t frames = 0; // rendered, for the thumbnail rate of the CPU path
     };
 
     // Encode into `pending`; pushFrames() writes them after the engine lock is released.
@@ -179,6 +180,9 @@ private:
     void removeStaleCameras();
     void continueSerial();
     Frame10 frameAt(int camera, std::uint64_t taiNs, bool* found) const;
+    // The stored frame nearest `taiNs` decoded straight into `v210` (house format). `found` says
+    // whether a frame exists; false with found set means it is not in the house format.
+    bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found) const;
     void finishClip(int channel);
     [[nodiscard]] std::uint64_t sourcePeriod(int camera) const;
     [[nodiscard]] double hfrFactor(int camera) const;
@@ -194,6 +198,9 @@ private:
     mutable std::recursive_mutex mutex_;
     std::vector<CameraRuntime> cameras_;
     std::unique_ptr<FrameRing> library_;
+    // One black grain and its thumbnail, made once (idle and black channels).
+    std::vector<std::uint8_t> blackV210_;
+    std::vector<std::uint8_t> blackPreview_;
     // One upload at a time: each starts after the library's newest frame.
     std::mutex uploadMutex_;
     std::atomic<bool> bufferReady_{false};

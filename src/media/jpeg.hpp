@@ -18,6 +18,14 @@ namespace replay
 std::vector<std::uint8_t> encodeJpeg422(Frame10 const& frame, int quality);
 bool decodeJpeg422(std::uint8_t const* data, std::size_t size, Frame10& frame);
 
+// The same JPEG as encodeJpeg422(unpackV210(v210)), straight from packed v210 (`rowBytes`
+// per line, 0 = v210RowBytes): no 16-bit frame, and the codec and its buffers are kept per
+// thread. Throws like encodeJpeg422.
+std::vector<std::uint8_t> encodeJpegV210(std::uint8_t const* v210, int width, int height, int rowBytes, int quality);
+// The same bytes as packV210(decodeJpeg422(data)), straight into `v210` (`rowBytes` per line,
+// 0 = v210RowBytes). False when the JPEG is not width × height 4:2:2.
+bool decodeJpegToV210(std::uint8_t const* data, std::size_t size, int width, int height, int rowBytes, std::uint8_t* v210);
+
 // Bytes per hour used to refuse a buffer that does not fit.
 // 1920x1080 at quality 92 is 0.1875 bytes/pixel ≈ 70 GB/h at 50 fps.
 [[nodiscard]] double bytesPerFrameEstimate(int width, int height, int quality);

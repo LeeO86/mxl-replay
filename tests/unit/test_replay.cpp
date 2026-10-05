@@ -325,6 +325,47 @@ TEST_CASE("time stretch length and mute fade")
     CHECK(fade.back() < 0.01f);
 }
 
+TEST_CASE("jpeg straight from and to v210 gives the bytes of the 16-bit path")
+{
+    for (int const width : {64, 1920})
+    {
+        CAPTURE(width);
+        int const height = width == 64 ? 20 : 1080;
+        Frame10 frame;
+        frame.allocate(width, height);
+        std::uint32_t seed = 12345;
+        auto next = [&] { return seed = seed * 1103515245u + 12345u; };
+        for (auto& v : frame.y)
+        {
+            v = static_cast<std::uint16_t>(64 + (next() >> 8) % 877);
+        }
+        for (std::size_t i = 0; i < frame.cb.size(); ++i)
+        {
+            frame.cb[i] = static_cast<std::uint16_t>(64 + (next() >> 8) % 897);
+            frame.cr[i] = static_cast<std::uint16_t>(64 + (next() >> 8) % 897);
+        }
+        std::vector<std::uint8_t> packed(v210Size(width, height));
+        packV210(frame, packed.data(), 0);
+        Frame10 unpacked;
+        unpacked.allocate(width, height);
+        unpackV210(packed.data(), 0, unpacked);
+        auto const reference = encodeJpeg422(unpacked, 92);
+        auto const direct = encodeJpegV210(packed.data(), width, height, 0, 92);
+        CHECK(direct == reference);
+        // Twice on the same thread: the kept codec gives the same bytes again.
+        CHECK(encodeJpegV210(packed.data(), width, height, 0, 92) == reference);
+
+        Frame10 decoded;
+        REQUIRE(decodeJpeg422(reference.data(), reference.size(), decoded));
+        std::vector<std::uint8_t> viaFrame(v210Size(width, height));
+        packV210(decoded, viaFrame.data(), 0);
+        std::vector<std::uint8_t> straight(v210Size(width, height), 0xAA);
+        CHECK(decodeJpegToV210(reference.data(), reference.size(), width, height, 0, straight.data()));
+        CHECK(straight == viaFrame);
+        CHECK_FALSE(decodeJpegToV210(reference.data(), reference.size(), width + 6, height, 0, straight.data()));
+    }
+}
+
 TEST_CASE("jpeg 4:2:2 round trip and v210 pack")
 {
     CHECK(jpegStorageBitDepth() == 8);
