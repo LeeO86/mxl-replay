@@ -35,7 +35,7 @@ Uploaded files are stored in their own library buffer (`REPLAY_STORAGE_DIR/libra
 
 10-bit and 12-bit JPEG are not used. nvJPEG's baseline 4:2:2 encoder is 8-bit. See `IMPLEMENTATION_PLAN.md`.
 
-The container image is the GPU build. It still starts with no GPU, which is enough for clip playback (`repeat` / `blend`). Interpolation and nvJPEG run when the NVIDIA container toolkit injects a device (`docker run --gpus all` or the Kubernetes `nvidia` runtime). Set `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility` (the image already does). The process runs as uid/gid 1000. One GPU is shared by every channel. The device holds three 4:2:2 frames and up to nine flow pairs: about 180 MB resident at 1080p and about 700 MB at 2160p, before nvJPEG's own workspace. A 4 GB GPU covers that path. These figures are the sizes of the allocations in `src/flow/dis_cuda.cu`, not a profile on an A4000 or an L4.
+The container image is the GPU build. It still starts with no GPU, which is enough for recording and clip playback (`repeat` / `blend`): on 2× Xeon Gold 6136 without a GPU, 4 cameras at 1080p50 plus 4 channels blending at 0.5× take about 6 cores (libjpeg-turbo). Interpolation and nvJPEG run when the NVIDIA container toolkit injects a device (`docker run --gpus all` or the Kubernetes `nvidia` runtime). Set `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility` (the image already does). The process runs as uid/gid 1000. One GPU is shared by every channel. The device holds three 4:2:2 frames and up to nine flow pairs: about 180 MB resident at 1080p and about 700 MB at 2160p, before nvJPEG's own workspace. A 4 GB GPU covers that path. These figures are the sizes of the allocations in `src/flow/dis_cuda.cu`, not a profile on an A4000 or an L4.
 
 ## Build
 
@@ -165,7 +165,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.2.1
+  ghcr.io/leeo86/mxl-replay:1.2.2
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.

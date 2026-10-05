@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -65,24 +66,23 @@ Frame10 fromFloat(Yuv422 const& frame)
     return out;
 }
 
-Frame10 blendFrames(Frame10 const& a, Frame10 const& b, double phase)
+// a = a·(1−phase) + b·phase in place, in 1/1024 steps (the compiler vectorises the integer loop;
+// the double version allocated a frame and ran one pixel at a time).
+void blendInto(Frame10& a, Frame10 const& b, double phase)
 {
-    Frame10 out;
-    out.allocate(a.width, a.height);
-    auto mix = [&](std::uint16_t left, std::uint16_t right) {
-        double const v = static_cast<double>(left) * (1.0 - phase) + static_cast<double>(right) * phase;
-        return static_cast<std::uint16_t>(std::clamp(v, 0.0, 1023.0));
+    auto const w = static_cast<std::uint32_t>(std::clamp(std::lround(phase * 1024.0), 0L, 1024L));
+    auto const blend = [w](std::vector<std::uint16_t>& left, std::vector<std::uint16_t> const& right) {
+        std::size_t const n = std::min(left.size(), right.size());
+        std::uint16_t* l = left.data();
+        std::uint16_t const* r = right.data();
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            l[i] = static_cast<std::uint16_t>((l[i] * (1024u - w) + r[i] * w) >> 10);
+        }
     };
-    for (std::size_t i = 0; i < out.y.size(); ++i)
-    {
-        out.y[i] = mix(a.y[i], b.y[i]);
-    }
-    for (std::size_t i = 0; i < out.cb.size(); ++i)
-    {
-        out.cb[i] = mix(a.cb[i], b.cb[i]);
-        out.cr[i] = mix(a.cr[i], b.cr[i]);
-    }
-    return out;
+    blend(a.y, b.y);
+    blend(a.cb, b.cb);
+    blend(a.cr, b.cr);
 }
 
 std::vector<std::uint8_t> tinyPreview(Frame10 const& frame)
@@ -90,6 +90,37 @@ std::vector<std::uint8_t> tinyPreview(Frame10 const& frame)
     Frame10 small;
     small.allocate(32, 16);
     scaleFrame(frame, small, ScaleFilter::Bilinear);
+    return encodeJpeg422(small, 70);
+}
+
+// The same 32×16 thumbnail, point-sampled from a v210 grain (no full-size 16-bit frame).
+std::vector<std::uint8_t> tinyPreviewV210(std::uint8_t const* v210, int width, int height)
+{
+    Frame10 small;
+    small.allocate(32, 16);
+    auto const rowBytes = v210RowBytes(width);
+    for (int oy = 0; oy < small.height; ++oy)
+    {
+        auto const* line = v210 + static_cast<std::size_t>(oy * height / small.height) * rowBytes;
+        for (int ox = 0; ox < small.width; ++ox)
+        {
+            int const x = (ox * width / small.width) & ~1; // even: the pixel that carries the chroma
+            std::uint32_t w[4];
+            std::memcpy(w, line + static_cast<std::size_t>(x / 6) * 16u, sizeof(w));
+            auto const s = [&](int word, int shift) { return static_cast<std::uint16_t>((w[word] >> shift) & 0x3ffu); };
+            // Pixels 0, 2, 4 of a group: Y and the Cb/Cr pair they carry.
+            static constexpr int kY[3][2] = {{0, 10}, {1, 20}, {3, 0}};
+            static constexpr int kCb[3][2] = {{0, 0}, {1, 10}, {2, 20}};
+            static constexpr int kCr[3][2] = {{0, 20}, {2, 0}, {3, 10}};
+            int const k = (x % 6) / 2;
+            small.y[static_cast<std::size_t>(oy * small.width + ox)] = s(kY[k][0], kY[k][1]);
+            if ((ox & 1) == 0)
+            {
+                small.cb[static_cast<std::size_t>(oy * (small.width / 2) + ox / 2)] = s(kCb[k][0], kCb[k][1]);
+                small.cr[static_cast<std::size_t>(oy * (small.width / 2) + ox / 2)] = s(kCr[k][0], kCr[k][1]);
+            }
+        }
+    }
     return encodeJpeg422(small, 70);
 }
 
@@ -181,6 +212,12 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
     {
         logWarn("odirect_ignored", {{"reason", "the buffer writes buffered and drops finished segments from the page cache"}});
     }
+    Frame10 black;
+    black.allocate(config_.format.width, config_.format.height);
+    black.fill(64, 512, 512);
+    blackV210_.resize(v210Size(black.width, black.height));
+    packV210(black, blackV210_.data(), 0);
+    blackPreview_ = tinyPreview(black);
     for (auto const& channel : config_.channelList)
     {
         ChannelRuntime runtime;
@@ -188,8 +225,9 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         runtime.scheduler.camera = 1;
         runtime.scheduler.rampFrames = config_.rampFrames;
         runtime.shot.playOnFirstClick = config_.playOnFirstClick;
-        runtime.last.allocate(config_.format.width, config_.format.height);
-        runtime.last.fill(64, 512, 512);
+        runtime.last = black;
+        runtime.lastV210 = blackV210_;
+        runtime.preview = blackPreview_;
         (void)channel;
         channels_.push_back(std::move(runtime));
     }
@@ -438,14 +476,27 @@ void Engine::ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t
     {
         return;
     }
-    auto jpeg = gpuEncodeV210(packed, config_.format.width, config_.format.height, static_cast<int>(v210RowBytes(config_.format.width)), config_.jpegQuality);
+    auto const rowBytes = static_cast<int>(v210RowBytes(config_.format.width));
+    auto jpeg = gpuEncodeV210(packed, config_.format.width, config_.format.height, rowBytes, config_.jpegQuality);
     if (jpeg.empty())
     {
-        Frame10 frame;
-        frame.allocate(config_.format.width, config_.format.height);
-        unpackV210(packed, static_cast<int>(v210RowBytes(config_.format.width)), frame);
-        ingestVideo(camera, phase, taiNs, std::move(frame));
-        return;
+        // CPU: a camera with one phase encodes here, without the engine lock, like the GPU path
+        // (under the lock every camera waited for the others' encodes). HFR phases are
+        // interleaved under the lock.
+        bool single = false;
+        {
+            std::lock_guard lock{mutex_};
+            single = camera >= 1 && camera <= static_cast<int>(cameras_.size()) && config_.cameras[static_cast<std::size_t>(camera - 1)].phases <= 1;
+        }
+        if (!single)
+        {
+            Frame10 frame;
+            frame.allocate(config_.format.width, config_.format.height);
+            unpackV210(packed, rowBytes, frame);
+            ingestVideo(camera, phase, taiNs, std::move(frame));
+            return;
+        }
+        jpeg = encodeJpegV210(packed, config_.format.width, config_.format.height, rowBytes, config_.jpegQuality);
     }
     std::vector<StoredFrame> pending(1);
     pending[0].taiNs = taiNs;
@@ -581,6 +632,24 @@ Frame10 Engine::frameAt(int camera, std::uint64_t taiNs, bool* found) const
     return frame;
 }
 
+bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found) const
+{
+    *found = false;
+    auto const* ring = ringOf(camera);
+    if (ring == nullptr)
+    {
+        return false;
+    }
+    auto const stored = ring->findNearest(taiNs);
+    if (!stored)
+    {
+        return false;
+    }
+    *found = true;
+    v210.resize(v210Size(config_.format.width, config_.format.height));
+    return decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, v210.data());
+}
+
 RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
 {
     std::unique_lock lock{mutex_};
@@ -674,59 +743,78 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     Frame10 frameA;
     Frame10 frameB;
     Frame10 picture;
+    // CPU: an exact frame is decoded straight into the output grain; only blends and
+    // interpolation need the 16-bit frames, and only they need frame B.
+    bool directV210 = false;
     if (renderedOnGpu)
     {
         foundA = true;
     }
     else
     {
+        bool const needB = pick.kind != SourcePick::Kind::Exact && pick.kind != SourcePick::Kind::Repeat && std::fabs(pick.phase) >= 1e-6;
+        bool const black = runtime.black;
         lock.unlock();
-        frameA = frameAt(camera, taiA, &foundA);
-        frameB = frameAt(camera, taiB, &foundB);
+        bool decoded = false;
+        if (!needB && !black)
+        {
+            decoded = v210At(camera, taiA, rendered.v210, &foundA);
+            directV210 = decoded;
+        }
+        // A black channel shows no frame; a frame not in the house format takes the 16-bit path.
+        if (!decoded && !black && (needB || foundA))
+        {
+            frameA = frameAt(camera, taiA, &foundA);
+            if (needB)
+            {
+                frameB = frameAt(camera, taiB, &foundB);
+            }
+        }
         lock.lock();
     }
+    // Black is one cached grain: filling, packing and thumbnailing a black frame for every
+    // grain made idle channels cost about as much as playing ones.
+    bool blackFrame = false;
     if (runtime.black || (!foundA && !foundB))
     {
-        picture.allocate(config_.format.width, config_.format.height);
-        if (cfg.idle == IdleSource::Last && !runtime.last.empty() && !runtime.black)
+        if (!runtime.black && cfg.idle == IdleSource::Last && !runtime.lastV210.empty())
+        {
+            rendered.v210 = runtime.lastV210;
+            renderedOnGpu = true;
+        }
+        else if (!runtime.black && cfg.idle == IdleSource::Last && !runtime.last.empty())
         {
             picture = runtime.last;
         }
-        else if (cfg.idle == IdleSource::E2e && !runtime.black)
+        else if (!runtime.black && cfg.idle == IdleSource::E2e)
         {
             lock.unlock();
             picture = frameAt(camera, outputTaiNs, &foundA);
             lock.lock();
-            if (!foundA)
-            {
-                picture.allocate(config_.format.width, config_.format.height);
-                picture.fill(64, 512, 512);
-            }
+            blackFrame = !foundA;
         }
         else
         {
-            picture.fill(64, 512, 512);
+            blackFrame = true;
         }
-        rendered.black = runtime.black || (!foundA && !foundB);
-        if (!runtime.black && cfg.idle == IdleSource::Last && !runtime.lastV210.empty() && !foundA)
-        {
-            rendered.v210 = runtime.lastV210;
-            renderedOnGpu = true;
-            rendered.black = false;
-        }
+        rendered.black = !renderedOnGpu && (runtime.black || (!foundA && !foundB));
     }
-    else if (renderedOnGpu)
+    else if (renderedOnGpu || directV210)
     {
-        exact = pick.kind == SourcePick::Kind::Exact || pick.kind == SourcePick::Kind::Repeat;
+        exact = pick.kind == SourcePick::Kind::Exact || pick.kind == SourcePick::Kind::Repeat || directV210;
     }
     else if (!foundB || pick.kind == SourcePick::Kind::Exact || pick.kind == SourcePick::Kind::Repeat || std::fabs(pick.phase) < 1e-6)
     {
-        picture = foundA ? frameA : frameB;
+        picture = foundA ? std::move(frameA) : std::move(frameB);
         exact = true;
     }
     else if (pick.kind == SourcePick::Kind::Blend || motion == MotionMode::Blend)
     {
-        picture = blendFrames(frameA, frameB, pick.phase);
+        // The frames are local copies: blend without the engine lock (the recorders wait for it).
+        lock.unlock();
+        blendInto(frameA, frameB, pick.phase);
+        lock.lock();
+        picture = std::move(frameA);
     }
     else
     {
@@ -745,14 +833,33 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         auto const op = operatingPoint(config_.preset);
         picture = fromFloat(interpolateFrames(toFloat(frameA), toFloat(frameB), pair.forward, pair.backward, static_cast<float>(pick.phase), op));
     }
-    if (!renderedOnGpu)
+    if (blackFrame)
     {
-        runtime.last = picture;
-        runtime.preview = tinyPreview(picture);
+        rendered.v210 = blackV210_;
+        runtime.lastV210 = blackV210_;
+        runtime.preview = blackPreview_;
+    }
+    else if (directV210)
+    {
+        runtime.lastV210 = rendered.v210;
+        // The thumbnail is for the UI: every 10th frame is enough.
+        if (runtime.frames % 10 == 0 || runtime.preview.empty())
+        {
+            runtime.preview = tinyPreviewV210(rendered.v210.data(), config_.format.width, config_.format.height);
+        }
+    }
+    else if (!renderedOnGpu)
+    {
         rendered.v210.resize(v210Size(picture.width, picture.height));
         packV210(picture, rendered.v210.data(), 0);
         runtime.lastV210 = rendered.v210;
+        if (runtime.frames % 10 == 0 || runtime.preview.empty())
+        {
+            runtime.preview = tinyPreview(picture);
+        }
+        runtime.last = std::move(picture);
     }
+    ++runtime.frames;
     rendered.positionNs = position;
     rendered.speed = runtime.scheduler.speed;
     rendered.motion = motionName(exact && motion == MotionMode::Interpolate ? MotionMode::Repeat : motion);

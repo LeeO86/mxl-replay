@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.2.2
 
+- Without a GPU the replay records every frame. The CPU JPEG encode ran under the engine lock, so the cameras waited for each other: on the lab (2× Xeon Gold 6136, 4 cameras 1080p50, no GPU) each camera recorded about 11.5 and dropped about 45 grains per second. A camera with one phase now encodes on its own reader thread, straight from the v210 grain into the stored JPEG (no 16-bit frame, codec and buffers kept per thread). 4 cameras + 2 channels at 1×: every grain recorded, 3.8 cores; 4 cameras + 4 channels blending at 0.5×: every grain recorded, 50 grains/s per output, 6.0 cores.
+- CPU playout: an exact frame (live, 1×, repeat) is decoded straight into the output grain; only a blend decodes two 16-bit frames (before, every frame decoded frame B as well). The blend runs without the engine lock, in integer steps of 1/1024, in place.
+- Idle and black channels use one cached black grain, and thumbnails of the CPU path are refreshed every 10th frame: two idle channels went from 0.90 to 0.30 cores (with a GPU).
 - Documentation: a dedicated local NVMe for `REPLAY_STORAGE_DIR` is a requirement (README, specification §4.3 and §10). The OS disk, rotating disks and network storage are not supported.
 - The unit test "disk ring reads while it writes" no longer fails when the writer finishes before the reader thread has run.
 
