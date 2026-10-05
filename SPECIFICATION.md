@@ -116,7 +116,8 @@ of sequences beyond playlists, compressed outputs, HDR.
 
 ### 4.3 Storage
 
-- Ring buffer on a local NVMe volume (`REPLAY_STORAGE_DIR`, hostPath on the node),
+- Ring buffer on a dedicated local NVMe volume (`REPLAY_STORAGE_DIR`, hostPath on the
+  node; required, see §10),
   one segment file series per camera (e.g. 10 s segments) plus the SQLite index.
   RAM holds only a frame index; frames are read back from the segments. Expired
   segments are deleted unless a clip touches them; a restart indexes the existing
@@ -392,7 +393,8 @@ utilisation. Grafana dashboard in `deploy/grafana/`.
 
 Deployment:
 - Pod network; MXL root `hostPath`; **node-pinned** with local NVMe `hostPath` for
-  storage (documented: dedicated NVMe recommended, not the OS disk).
+  storage. A dedicated NVMe is a requirement, not a recommendation: the OS disk, a
+  rotating disk or network storage stalls the recorder (§4.3).
 - GPU required for `interpolate` (CPU fallback only offers `repeat`/`blend` and
   fewer inputs): `nvidia.com/gpu: 1`, `runtimeClassName: nvidia`,
   `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility` (add `graphics` only for the

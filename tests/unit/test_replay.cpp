@@ -275,7 +275,10 @@ TEST_CASE("disk ring reads while it writes and deletes segments")
             }
         });
         bool pushed = true;
-        for (int i = 0; i < 400; ++i)
+        // At least 400 frames, and on until the reader has read one (a fast disk can finish the
+        // 400 before the reader thread runs at all); at most 5 s.
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        for (int i = 0; i < 400 || (reads.load() == 0 && std::chrono::steady_clock::now() < deadline); ++i)
         {
             pushed = ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 20, static_cast<std::uint8_t>(i))) && pushed;
         }

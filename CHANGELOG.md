@@ -1,8 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Documentation: a dedicated local NVMe for `REPLAY_STORAGE_DIR` is a requirement (README, specification §4.3 and §10). The OS disk, rotating disks and network storage are not supported.
+- The unit test "disk ring reads while it writes" no longer fails when the writer finishes before the reader thread has run.
+
 ## 1.2.1
 
-- Live playout no longer repeats a frame and skips the next. The recorder can read frame M−2 only once grain M starts, which is exactly when a live channel renders grain M from frame M−2 (`REPLAY_LIVE_DELAY_FRAMES=2`). When the render won, the channel showed frame M−3 and then jumped to M−1. On the lab that happened about once a minute in the audio; the video is looked up earlier in the render, so it can lose that race more often (not measured). A live channel now waits up to half a frame for that frame while its camera records close to live.
+- A live channel waits up to half a frame for its frame when the recorder stores it late (while the camera records close to live). Without the frame, the channel showed M−3 and then jumped to M−1. Measured on the lab after the release: the late frames come from the storage. With the buffer in RAM, 1.2.0 showed none in 60 windows of 80 frames. On the lab's SAS disk, where one `write()` can block the recorder for 20–30 ms, 1.2.0 and 1.2.1 both showed a few (57/60 and 56–58/60 clean windows), so the wait does not cover a slow disk. Keep the buffer on a dedicated NVMe.
 - After a missed camera audio read, the recorder keeps waiting for the audio for three more frames before it falls back to one waiting read per 50 frames. One late packet no longer costs up to a second of audio.
 
 ## 1.2.0
