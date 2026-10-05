@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -14,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -137,7 +139,7 @@ struct FrameRing::Impl
     std::string directory;
     std::uint64_t retentionNs = 0;
     std::uint64_t segmentNs = 0;
-    // Guards everything below except adviseFd. Never held during a read or write.
+    // Guards the index, segments, ranges, totals and read descriptors. Never held during a read or write.
     mutable std::mutex mutex;
     // One writer at a time; held across the write itself.
     std::mutex writeMutex;
@@ -147,15 +149,80 @@ struct FrameRing::Impl
     std::vector<ProtectRange> ranges;
     std::uint64_t payloadTotal = 0;
     std::size_t protectedFrames = 0;
-    // The previous segment's writer, dropped from the page cache at the next rotation
-    // (its writeback has finished by then). Only the writer uses it.
-    int adviseFd = -1;
     mutable std::list<std::pair<std::uint32_t, int>> readFds;
     std::uint64_t writeFailures = 0;
     std::uint64_t failedRun = 0;
 
+    // Background I/O: a finished segment's writeback and page-cache drop, and deletions. On a
+    // slow disk sync_file_range blocked the recorder for about a second at every rotation.
+    std::thread janitor;
+    std::mutex janitorMutex;
+    std::condition_variable janitorWake;
+    std::vector<int> finished;
+    std::vector<std::string> doomed;
+    bool stopping = false;
+
+    void janitorLoop()
+    {
+        // The previous finished segment, dropped from the page cache when the next one is
+        // handed over (its writeback has finished by then).
+        int adviseFd = -1;
+        std::unique_lock lock{janitorMutex};
+        for (;;)
+        {
+            janitorWake.wait(lock, [&] { return stopping || !finished.empty() || !doomed.empty(); });
+            if (stopping && finished.empty() && doomed.empty())
+            {
+                break;
+            }
+            auto fds = std::move(finished);
+            auto paths = std::move(doomed);
+            finished.clear();
+            doomed.clear();
+            lock.unlock();
+            for (int const fd : fds)
+            {
+                ::sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
+                if (adviseFd >= 0)
+                {
+                    ::posix_fadvise(adviseFd, 0, 0, POSIX_FADV_DONTNEED);
+                    ::close(adviseFd);
+                }
+                adviseFd = fd;
+            }
+            removeFiles(paths);
+            lock.lock();
+        }
+        if (adviseFd >= 0)
+        {
+            ::close(adviseFd);
+        }
+    }
+
+    void handOver(int fd, std::vector<std::string> paths)
+    {
+        {
+            std::lock_guard lock{janitorMutex};
+            if (fd >= 0)
+            {
+                finished.push_back(fd);
+            }
+            doomed.insert(doomed.end(), std::make_move_iterator(paths.begin()), std::make_move_iterator(paths.end()));
+        }
+        janitorWake.notify_one();
+    }
+
     ~Impl()
     {
+        if (janitor.joinable())
+        {
+            {
+                std::lock_guard lock{janitorMutex};
+                stopping = true;
+            }
+            janitorWake.notify_one();
+            janitor.join();
+        }
         for (auto& [seq, segment] : segments)
         {
             (void)seq;
@@ -163,10 +230,6 @@ struct FrameRing::Impl
             {
                 ::close(segment.writeFd);
             }
-        }
-        if (adviseFd >= 0)
-        {
-            ::close(adviseFd);
         }
         for (auto const& [seq, fd] : readFds)
         {
@@ -466,7 +529,7 @@ struct FrameRing::Impl
     }
 
     // Starts a new segment at `tai`. Called with writeMutex held; takes the lock only
-    // to swap the segments, so the file work does not block readers.
+    // to swap the segments, and hands the finished one to the janitor.
     bool rotate(std::uint64_t tai)
     {
         int previous = -1;
@@ -480,13 +543,7 @@ struct FrameRing::Impl
         }
         if (previous >= 0)
         {
-            ::sync_file_range(previous, 0, 0, SYNC_FILE_RANGE_WRITE);
-            if (adviseFd >= 0)
-            {
-                ::posix_fadvise(adviseFd, 0, 0, POSIX_FADV_DONTNEED);
-                ::close(adviseFd);
-            }
-            adviseFd = previous;
+            handOver(previous, {});
         }
         char name[48];
         std::snprintf(name, sizeof(name), "seg-%020llu.bin", static_cast<unsigned long long>(tai));
@@ -521,7 +578,7 @@ struct FrameRing::Impl
             segments.emplace(nextSegment++, std::move(segment));
             expired = retain();
         }
-        removeFiles(expired);
+        handOver(-1, std::move(expired));
         return true;
     }
 };
@@ -533,6 +590,7 @@ FrameRing::FrameRing(std::string directory, std::uint64_t retentionNs, int segme
     impl_->retentionNs = retentionNs;
     impl_->segmentNs = static_cast<std::uint64_t>(std::max(1, segmentSeconds)) * 1000000000ull;
     impl_->scan();
+    impl_->janitor = std::thread([impl = impl_.get()] { impl->janitorLoop(); });
 }
 
 FrameRing::~FrameRing() = default;
@@ -646,7 +704,7 @@ void FrameRing::enforceRetention()
         std::lock_guard lock{d.mutex};
         expired = d.retain();
     }
-    removeFiles(expired);
+    d.handOver(-1, std::move(expired));
 }
 
 bool FrameRing::isProtected(std::uint64_t taiNs) const

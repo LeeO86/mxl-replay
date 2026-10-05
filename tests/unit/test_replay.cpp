@@ -185,25 +185,30 @@ TEST_CASE("disk ring reads frames back and survives a restart")
 TEST_CASE("disk ring deletes expired segments unless a clip protects them")
 {
     auto const dir = freshDir("mxl-replay-ring-retention");
-    FrameRing ring(dir.string(), 3 * kSecond, 1);
-    ring.protect(kSecond, kSecond);
-    // 0.5 s steps, one segment per 1.5 s: [0.5-1.5] [2-3] [3.5-4.5] [5-6] [6.5-7.5] [8-9] [9.5-10]
-    for (int i = 0; i < 20; ++i)
     {
-        CHECK(ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 2, static_cast<std::uint8_t>(i))));
+        FrameRing ring(dir.string(), 3 * kSecond, 1);
+        ring.protect(kSecond, kSecond);
+        // 0.5 s steps, one segment per 1.5 s: [0.5-1.5] [2-3] [3.5-4.5] [5-6] [6.5-7.5] [8-9] [9.5-10]
+        for (int i = 0; i < 20; ++i)
+        {
+            CHECK(ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 2, static_cast<std::uint8_t>(i))));
+        }
+        ring.enforceRetention();
+        // Newest 10 s, retention 3 s: segments ending before 7 s go, except the protected first one.
+        CHECK(ring.segmentCount() == 4);
+        CHECK(ring.size() == 11);
+        CHECK(ring.protectedCount() == 1);
+        CHECK(ring.findNearest(kSecond)->jpeg[0] == 1);
+        CHECK(ring.findAtOrBefore(6 * kSecond)->taiNs == 3 * kSecond / 2);
+        ring.unprotect(kSecond, kSecond);
+        ring.enforceRetention();
+        CHECK(ring.segmentCount() == 3);
+        CHECK_FALSE(ring.findAtOrBefore(6 * kSecond));
+        CHECK(ring.protectedCount() == 0);
     }
-    ring.enforceRetention();
-    // Newest 10 s, retention 3 s: segments ending before 7 s go, except the protected first one.
-    CHECK(ring.segmentCount() == 4);
-    CHECK(ring.size() == 11);
-    CHECK(ring.protectedCount() == 1);
-    CHECK(ring.findNearest(kSecond)->jpeg[0] == 1);
-    CHECK(ring.findAtOrBefore(6 * kSecond)->taiNs == 3 * kSecond / 2);
-    ring.unprotect(kSecond, kSecond);
-    ring.enforceRetention();
-    CHECK(ring.segmentCount() == 3);
-    CHECK_FALSE(ring.findAtOrBefore(6 * kSecond));
-    CHECK(ring.protectedCount() == 0);
+    // The files are deleted in the background; the ring's destructor waits for that.
+    auto const files = std::distance(std::filesystem::directory_iterator(dir), std::filesystem::directory_iterator{});
+    CHECK(files == 3);
     std::filesystem::remove_all(dir);
 }
 
@@ -245,32 +250,34 @@ TEST_CASE("disk ring counts the frames it cannot write")
 TEST_CASE("disk ring reads while it writes and deletes segments")
 {
     auto const dir = freshDir("mxl-replay-ring-threads");
-    FrameRing ring(dir.string(), 2 * kSecond, 1);
-    std::atomic<bool> done{false};
-    std::atomic<int> reads{0};
-    std::thread reader([&] {
-        while (!done)
-        {
-            auto const newest = ring.newestNs();
-            if (auto const frame = ring.findNearest(newest > kSecond ? newest - kSecond : newest); frame && frame->jpeg.size() == 2)
-            {
-                ++reads;
-            }
-            (void)ring.findNearestAudio(newest);
-            (void)ring.protectedBytes();
-        }
-    });
-    bool pushed = true;
-    for (int i = 0; i < 400; ++i)
     {
-        pushed = ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 20, static_cast<std::uint8_t>(i))) && pushed;
+        FrameRing ring(dir.string(), 2 * kSecond, 1);
+        std::atomic<bool> done{false};
+        std::atomic<int> reads{0};
+        std::thread reader([&] {
+            while (!done)
+            {
+                auto const newest = ring.newestNs();
+                if (auto const frame = ring.findNearest(newest > kSecond ? newest - kSecond : newest); frame && frame->jpeg.size() == 2)
+                {
+                    ++reads;
+                }
+                (void)ring.findNearestAudio(newest);
+                (void)ring.protectedBytes();
+            }
+        });
+        bool pushed = true;
+        for (int i = 0; i < 400; ++i)
+        {
+            pushed = ring.push(frameAt(static_cast<std::uint64_t>(i + 1) * kSecond / 20, static_cast<std::uint8_t>(i))) && pushed;
+        }
+        done = true;
+        reader.join();
+        CHECK(pushed);
+        CHECK(reads.load() > 0);
+        // 20 s recorded, 2 s kept: the old segments are gone.
+        CHECK(ring.segmentCount() <= 4);
     }
-    done = true;
-    reader.join();
-    CHECK(pushed);
-    CHECK(reads.load() > 0);
-    // 20 s recorded, 2 s kept: the old segments are gone.
-    CHECK(ring.segmentCount() <= 4);
     std::filesystem::remove_all(dir);
 }
 
@@ -626,6 +633,37 @@ TEST_CASE("engine plays camera audio and an upload made after recording")
     picture.allocate(64, 32);
     unpackV210(played.v210.data(), static_cast<int>(v210RowBytes(64)), picture);
     CHECK(std::abs(static_cast<int>(picture.y[0]) - 700) < 16);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("clip ids continue after a restart")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-serial";
+    std::filesystem::remove_all(dir);
+    auto const loaded = loadConfig(
+        {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+            {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+            {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    Frame10 still;
+    still.allocate(64, 32);
+    still.fill(500, 512, 512);
+    auto const jpeg = encodeJpeg422(still, 90);
+    std::string first;
+    {
+        Engine engine(loaded.config, loaded.flat);
+        engine.openBuffer();
+        std::string error;
+        first = engine.upload(jpeg.data(), jpeg.size(), "first", error);
+        REQUIRE(error.empty());
+    }
+    Engine engine(loaded.config, loaded.flat);
+    engine.openBuffer();
+    std::string error;
+    auto const second = engine.upload(jpeg.data(), jpeg.size(), "second", error);
+    REQUIRE(error.empty());
+    CHECK(second != first);
+    CHECK(engine.clips().size() == 2);
     std::filesystem::remove_all(dir);
 }
 

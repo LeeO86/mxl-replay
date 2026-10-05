@@ -141,6 +141,7 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         }
     }
     catalog_.open(catalogPath);
+    continueSerial();
     removeStaleCameras();
     struct statvfs st{};
     if (statvfs(config_.storageDir.c_str(), &st) != 0)
@@ -262,6 +263,28 @@ FrameRing const* Engine::ringOf(int camera) const
 FrameRing* Engine::ringOf(int camera)
 {
     return const_cast<FrameRing*>(std::as_const(*this).ringOf(camera));
+}
+
+void Engine::continueSerial()
+{
+    // Ids end in "-<serial>" (clip-, upload-, group-, playlist-). Continue after the catalog's:
+    // starting at 1 again after a restart replaced the clips that already had those ids.
+    auto const serialOf = [](std::string const& id) -> std::uint64_t {
+        auto const dash = id.rfind('-');
+        if (dash == std::string::npos || dash + 1 >= id.size() || id.find_first_not_of("0123456789", dash + 1) != std::string::npos)
+        {
+            return 0;
+        }
+        return std::strtoull(id.c_str() + dash + 1, nullptr, 10);
+    };
+    for (auto const& clip : catalog_.clips())
+    {
+        clipSerial_ = std::max({clipSerial_, serialOf(clip.id) + 1, serialOf(clip.groupId) + 1});
+    }
+    for (auto const& playlist : catalog_.playlists())
+    {
+        clipSerial_ = std::max(clipSerial_, serialOf(playlist.id) + 1);
+    }
 }
 
 void Engine::removeStaleCameras()
@@ -1941,6 +1964,7 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             }
             catalog_.upsertPlaylist(playlist);
         }
+        continueSerial();
         result.ok = true;
         return result;
     }

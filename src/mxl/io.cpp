@@ -294,6 +294,12 @@ void MxlBridge::readInput(int camera, int phase)
                            cfg.cameras[static_cast<std::size_t>(camera - 1)].audio;
     Input audio;
     std::string audioState;
+    // A writer may commit a frame's audio a little after its video: wait up to one frame for
+    // it while the audio arrives. While it does not, wait once every 50 frames only, so a
+    // stalled audio flow costs the video at most one frame per 50.
+    bool audioArrives = false;
+    std::uint64_t audioMisses = 0;
+    auto const audioWaitNs = static_cast<std::uint64_t>(framePeriodNs(cfg.format.rateNum, cfg.format.rateDen));
     auto audioRoute = [&](Route const& route, std::string const& state) {
         if (state != audioState)
         {
@@ -307,6 +313,7 @@ void MxlBridge::readInput(int camera, int phase)
         {
             close(audio, false);
             audioState.clear();
+            audioArrives = false;
             return {};
         }
         bool const reopened = audio.reader == nullptr || audio.domainId != route.domainId || audio.flowId != route.flowId;
@@ -317,6 +324,7 @@ void MxlBridge::readInput(int camera, int phase)
         }
         if (reopened)
         {
+            audioArrives = false;
             mxlFlowConfigInfo info{};
             if (mxlFlowReaderGetConfigInfo(audio.reader, &info) != MXL_STATUS_OK || info.common.grainRate.numerator != 48000 ||
                 info.common.grainRate.denominator != 1 || info.continuous.channelCount == 0)
@@ -332,10 +340,16 @@ void MxlBridge::readInput(int camera, int phase)
         auto const count = static_cast<std::size_t>(end - first);
         // The samples of [first, end): MXL addresses `count` samples ending at `end`.
         mxlWrappedMultiBufferSlice slices{};
-        if (count == 0 || mxlFlowReaderGetSamplesNonBlocking(audio.reader, end, count, &slices) != MXL_STATUS_OK || slices.count == 0)
+        bool const wait = audioArrives || ++audioMisses % 50 == 0;
+        auto const status = count == 0 ? MXL_ERR_INVALID_ARG
+                            : wait     ? mxlFlowReaderGetSamples(audio.reader, end, count, audioWaitNs, &slices)
+                                       : mxlFlowReaderGetSamplesNonBlocking(audio.reader, end, count, &slices);
+        audioArrives = status == MXL_STATUS_OK && slices.count > 0;
+        if (!audioArrives)
         {
             return {};
         }
+        audioMisses = 0;
         std::vector<float> pcm(count * 2, 0.f);
         for (std::size_t channel = 0; channel < 2; ++channel)
         {

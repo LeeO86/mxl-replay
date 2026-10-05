@@ -177,6 +177,7 @@ private:
     [[nodiscard]] FrameRing const* ringOf(int camera) const;
     [[nodiscard]] FrameRing* ringOf(int camera);
     void removeStaleCameras();
+    void continueSerial();
     Frame10 frameAt(int camera, std::uint64_t taiNs, bool* found) const;
     void finishClip(int channel);
     [[nodiscard]] std::uint64_t sourcePeriod(int camera) const;

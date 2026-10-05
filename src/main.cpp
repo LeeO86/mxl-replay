@@ -127,15 +127,30 @@ int main(int argc, char** argv)
         std::vector<std::thread> playout;
         for (int channel = 1; channel <= engine.config().channels; ++channel)
         {
-            playout.emplace_back([&engine, &bridge, period, channel] {
-                auto due = std::chrono::steady_clock::now();
+            playout.emplace_back([&engine, &bridge, channel] {
+                // One grain per house period on the TAI grid, rendered for the grain's own time.
+                // Rendering for the wake-up time put live playout between two source frames
+                // (interpolated, or flipping between them) and could write a grain index twice.
+                auto const num = engine.config().format.rateNum;
+                auto const den = engine.config().format.rateDen;
+                std::uint64_t next = 0;
                 while (!gStop.load())
                 {
-                    auto const tai = replay::taiNowNs();
+                    auto const current = replay::timestampToIndex(num, den, replay::taiNowNs());
+                    // Start, or more than two grains late: continue at the current grain.
+                    if (next == 0 || next + 2 < current || next > current + 1)
+                    {
+                        next = current;
+                    }
+                    auto const tai = replay::indexToTimestamp(num, den, next);
                     auto rendered = engine.render(channel, tai);
                     bridge.publish(channel, rendered, tai);
-                    due += period;
-                    std::this_thread::sleep_until(due);
+                    ++next;
+                    auto const wait = static_cast<std::int64_t>(replay::indexToTimestamp(num, den, next)) - static_cast<std::int64_t>(replay::taiNowNs());
+                    if (wait > 0)
+                    {
+                        std::this_thread::sleep_for(std::chrono::nanoseconds(wait));
+                    }
                 }
             });
         }
