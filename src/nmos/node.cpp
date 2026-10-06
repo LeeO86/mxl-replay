@@ -217,9 +217,16 @@ void NmosNode::start()
                 nmos::experimental::node_implementation()
                     .on_parse_transport_file([](nmos::resource const&, nmos::resource const&, utility::string_t const&, utility::string_t const&,
                                                  slog::base_gate&) -> web::json::value { throw std::runtime_error("MXL does not use a transport file"); })
-                    .on_resolve_auto([](nmos::resource const&, nmos::resource const&, web::json::value& params) {
+                    .on_resolve_auto([this](nmos::resource const& resource, nmos::resource const&, web::json::value& params) {
                         if (!params.is_array() || params.size() == 0)
                         {
+                            return;
+                        }
+                        if (resource.type == nmos::types::sender)
+                        {
+                            // A Sender's "auto" is its own output domain and flow (BCP-007-03).
+                            nmos::details::resolve_auto(params.at(0), U("mxl_domain_id"), [this] { return web::json::value::string(us(impl_->config.outputDomainId)); });
+                            nmos::details::resolve_auto(params.at(0), U("mxl_flow_id"), [&resource] { return resource.data.at(U("flow_id")); });
                             return;
                         }
                         nmos::details::resolve_auto(params.at(0), U("mxl_domain_id"), [] { return web::json::value::string(U("00000000-0000-0000-0000-000000000000")); });
@@ -326,6 +333,14 @@ void NmosNode::start()
                     restoreReceiver(audioConnection, impl_->engine.route(camera.index, 1, false));
                     nmos::insert_resource(nodeModel.connection_resources, std::move(audioConnection));
                 }
+                // make_connection_mxl_sender leaves "auto" in /active. A Sender reports its real domain and
+                // flow from the start (BCP-007-03): controllers copy them into the receiver's PATCH.
+                auto const activeParams = [this](nmos::resource& connection, std::string const& flowId) {
+                    web::json::value leg = web::json::value::object();
+                    leg[U("mxl_domain_id")] = web::json::value::string(us(impl_->config.outputDomainId));
+                    leg[U("mxl_flow_id")] = web::json::value::string(us(flowId));
+                    connection.data[U("active")][U("transport_params")] = web::json::value::array({leg});
+                };
                 for (auto const& channel : impl_->config.channelList)
                 {
                     auto source = nmos::make_video_source(us(impl_->ids.videoSource(channel.index)), us(impl_->ids.device), rate, nodeModel.settings);
@@ -343,6 +358,7 @@ void NmosNode::start()
                     nmos::insert_resource(nodeModel.node_resources, std::move(sender));
                     auto connection = nmos::make_connection_mxl_sender(us(impl_->ids.videoSender(channel.index)), us(impl_->config.outputDomainId),
                         us(impl_->ids.videoFlow(channel.index, impl_->config.format.token())));
+                    activeParams(connection, impl_->ids.videoFlow(channel.index, impl_->config.format.token()));
                     connection.data[U("active")][U("master_enable")] = web::json::value::boolean(true);
                     nmos::insert_resource(nodeModel.connection_resources, std::move(connection));
 
@@ -362,6 +378,7 @@ void NmosNode::start()
                     nmos::insert_resource(nodeModel.node_resources, std::move(audioSender));
                     auto audioConnection = nmos::make_connection_mxl_sender(us(impl_->ids.audioSender(channel.index)), us(impl_->config.outputDomainId),
                         us(impl_->ids.audioFlow(channel.index)));
+                    activeParams(audioConnection, impl_->ids.audioFlow(channel.index));
                     audioConnection.data[U("active")][U("master_enable")] = web::json::value::boolean(true);
                     nmos::insert_resource(nodeModel.connection_resources, std::move(audioConnection));
 
@@ -381,6 +398,7 @@ void NmosNode::start()
                     nmos::insert_resource(nodeModel.node_resources, std::move(dataSender));
                     auto dataConnection = nmos::make_connection_mxl_sender(us(impl_->ids.dataSender(channel.index)), us(impl_->config.outputDomainId),
                         us(impl_->ids.dataFlow(channel.index, impl_->config.format.token())));
+                    activeParams(dataConnection, impl_->ids.dataFlow(channel.index, impl_->config.format.token()));
                     dataConnection.data[U("active")][U("master_enable")] = web::json::value::boolean(true);
                     nmos::insert_resource(nodeModel.connection_resources, std::move(dataConnection));
                 }
