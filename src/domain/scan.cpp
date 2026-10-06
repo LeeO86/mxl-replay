@@ -144,7 +144,8 @@ DomainResult ensureOutputDomain(std::string const& directory, std::string const&
         {
             return {DomainStatus::Failed, "cannot write domain_def.json"};
         }
-        out << "{\"id\":\"" << id << "\",\"label\":\"MXL Replay\"}\n";
+        // BCP-007-03 requires id, label, description and tags.
+        out << "{\"id\":\"" << id << "\",\"label\":\"MXL Replay\",\"description\":\"Output domain of mxl-replay\",\"tags\":{}}\n";
     }
     auto const optionsPath = std::filesystem::path(directory) / "options.json";
     if (!std::filesystem::exists(optionsPath, ec))

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.5
+
+- A new output `domain_def.json` carries `description` and `tags`, as BCP-007-03 requires (`id`, `label`, `description`, `tags`). Replay wrote only `id` and `label`, and mxl-st2110-gateway 1.0.2 skipped such domains. An existing file is still not rewritten.
+
 ## 1.2.4
 
 - Senders report their real `mxl_domain_id` and `mxl_flow_id` in IS-05 `/active`. Until now `/active` said `auto` from the start (nmos-cpp's `make_connection_mxl_sender` leaves it, and its own comment says the caller must resolve it), and a PATCH with `auto` resolved to an all-zero domain and a `null` flow. A controller that copies a sender's active parameters into a receiver's PATCH (the platform's crosspoint does) sent `auto`, which receivers reject: on the platform's test-all production the PGM → multiviewer route failed. Now the output domain and the sender's own flow, from the start and after a PATCH with `auto` (BCP-007-03). Receivers are unchanged. No settings change.
