@@ -794,6 +794,10 @@ TEST_CASE("output domain is created once and only removed when the id matches")
     std::string body;
     std::getline(in, body);
     CHECK(body.find("11111111-1111-1111-1111-111111111111") != std::string::npos);
+    // BCP-007-03 schema: id, label, description and tags are required.
+    CHECK(body.find("\"label\":\"") != std::string::npos);
+    CHECK(body.find("\"description\":\"") != std::string::npos);
+    CHECK(body.find("\"tags\":{}") != std::string::npos);
     auto const other = root / "other";
     ensureOutputDomain(other.string(), "33333333-3333-3333-3333-333333333333", 1);
     std::string error;
