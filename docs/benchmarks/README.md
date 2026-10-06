@@ -41,6 +41,23 @@ Not a target GPU: one GA107 of an A16 (PCIe Gen4 x4), driver 595.84, 2× Xeon Go
 
 Two 1080p50 interpolate channels keep up on this GPU; four do not. The GPU is not saturated in either case. Late output grains are not counted anywhere (no metric), so the lag was read from the output flows with `mxl-info`. GPU time per stage (`frame_gpu_seconds`) is described in the README but not exported. 2160p50, OFA and the Futatabi comparison were not run.
 
+## Lab run 2026-10-06: blocking CUDA sync (1.2.3)
+
+Same host and procedure as below (four test-player outputs recorded as cameras 1–4, every channel `interpolate` at 0.5× or played at 1× from 10 s back, 30 s measured). `perf` on 1.2.2 with 4 channels: 84 % of the process in libcuda, the CUDA runtime spinning in `cudaStreamSynchronize` (CUDA's default scheduling spins while the machine has spare cores). 1.2.3 sets `cudaDeviceScheduleBlockingSync`.
+
+| Image | Channels | Speed | Recorded / dropped per camera per s | Output grains/s per channel | Output latency (grains) | CPU | GPU SM |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1.2.2 | 2 | 0.5× | 56.7–56.8 / 0 | 50.0, 50.0 | 4, 4 | 3.79 cores | 92 % |
+| 1.2.3 | 2 | 0.5× | 56.8 / 0 | 50.0, 49.9 | 3, 2 | 0.82 cores | 91 % |
+| 1.2.2 | 4 | 0.5× | 56.2–56.5 / 0 | 50.0–50.1 | 1–7 | 7.37 cores | 99 % |
+| 1.2.3 | 4 | 0.5× | 56.7 / 0 | 49.9–50.2 | 2–6 | 0.89 cores | 100 % |
+| 1.2.2 | 4 | 1× | 56.7–56.8 / 0 | 50.0 | 1 | 3.29 cores | 57 % |
+| 1.2.3 | 4 | 1× | 56.4 / 0 | 50.0 | 1–2 | 1.75 cores | 58 % |
+| 1.2.2 | 8 | 0.5× | 28–30 / 27–29 | 49.9–50.2 | 3–13 | 12.11 cores | 97 % |
+| 1.2.3 | 8 | 0.5× | 30–31 / 26–27 | 49.9–50.3 | 5–10 | 0.93 cores | 98 % |
+
+Recorded counts above 50 per second are cameras catching up on grains still in the input ring. The CPU growth of the 2026-10-04 run below ("every camera is now actually recorded … nvJPEG's Huffman stage on the CPU") was mostly this spinning: with a blocking sync, four cameras and four interpolating channels take under a core. The GPU stays the limit for interpolation: at 8 channels it is saturated and the cameras drop about half their grains with either version.
+
 ## Lab run 2026-10-04: per-thread GPU pipeline
 
 Same host, GPU and cameras as above; storage the OS disk. Image built from this repository with the per-thread GPU pipeline (1.0.1) against `mxl-replay:lab` (1.0.0 plus the recorder fix). Each case: the four test-player outputs routed to cameras 1–4 (all recording), every channel set to `interpolate` and played at 0.5× from 10 s back, 30 s measured. Recorded and dropped grains come from `/api/v1/status`, output grains/s and late reads from `mxl-verify` on each channel's video flow, latency from `mxl-info`, CPU from the container cgroup, SM load from `nvidia-smi dmon`.

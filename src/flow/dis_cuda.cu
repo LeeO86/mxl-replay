@@ -287,6 +287,10 @@ bool prepareNv()
         return false;
     }
     static bool const poolKept = [] {
+        // Sleep in a blocking sync while the GPU works. CUDA's default spins while there are
+        // spare cores: every channel thread's cudaStreamSynchronize held a core (4 channels
+        // took 6.5 of 7.4 cores inside libcuda). Set before the context exists.
+        cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
         // Keep freed stream-ordered memory in the pool instead of returning it each sync.
         cudaMemPool_t pool{};
         std::uint64_t keep = UINT64_MAX;
