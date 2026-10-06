@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.3
+
+- The GPU path waits for the GPU in a blocking sync instead of spinning a CPU core. CUDA's default scheduling spins while the machine has spare cores, so every `cudaStreamSynchronize` of every channel and camera thread held a core busy. Lab host (2× Xeon Gold 6136, A16), 4 cameras recording, channels interpolating at 0.5×: 2 channels 3.79 → 0.82 cores, 4 channels 7.37 → 0.89 (6.5 cores had been inside libcuda), 8 channels 12.11 → 0.93; 4 channels at 1× 3.29 → 1.75. Output 50 grains/s per channel, no recording drops and the same output latency as before. No settings change.
+
 ## 1.2.2
 
 - Without a GPU the replay records every frame. The CPU JPEG encode ran under the engine lock, so the cameras waited for each other: on the lab (2× Xeon Gold 6136, 4 cameras 1080p50, no GPU) each camera recorded about 11.5 and dropped about 45 grains per second. A camera with one phase now encodes on its own reader thread, straight from the v210 grain into the stored JPEG (no 16-bit frame, codec and buffers kept per thread). 4 cameras + 2 channels at 1×: every grain recorded, 3.8 cores; 4 cameras + 4 channels blending at 0.5×: every grain recorded, 50 grains/s per output, 6.0 cores.
