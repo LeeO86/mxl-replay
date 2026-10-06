@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.4
+
+- Senders report their real `mxl_domain_id` and `mxl_flow_id` in IS-05 `/active`. Until now `/active` said `auto` from the start (nmos-cpp's `make_connection_mxl_sender` leaves it, and its own comment says the caller must resolve it), and a PATCH with `auto` resolved to an all-zero domain and a `null` flow. A controller that copies a sender's active parameters into a receiver's PATCH (the platform's crosspoint does) sent `auto`, which receivers reject: on the platform's test-all production the PGM → multiviewer route failed. Now the output domain and the sender's own flow, from the start and after a PATCH with `auto` (BCP-007-03). Receivers are unchanged. No settings change.
+
 ## 1.2.3
 
 - The GPU path waits for the GPU in a blocking sync instead of spinning a CPU core. CUDA's default scheduling spins while the machine has spare cores, so every `cudaStreamSynchronize` of every channel and camera thread held a core busy. Lab host (2× Xeon Gold 6136, A16), 4 cameras recording, channels interpolating at 0.5×: 2 channels 3.79 → 0.82 cores, 4 channels 7.37 → 0.89 (6.5 cores had been inside libcuda), 8 channels 12.11 → 0.93; 4 channels at 1× 3.29 → 1.75. Output 50 grains/s per channel, no recording drops and the same output latency as before. No settings change.
