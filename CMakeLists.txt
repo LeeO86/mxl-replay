@@ -20,6 +20,7 @@ add_library(replay-core STATIC
     src/util/sha1.cpp
     src/util/uuid.cpp
     src/util/logging.cpp
+    src/util/json.cpp
     src/media/timebase.cpp
     src/media/format.cpp
     src/media/v210.cpp

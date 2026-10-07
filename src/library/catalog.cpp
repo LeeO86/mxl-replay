@@ -92,31 +92,41 @@ void Catalog::deleteClip(std::string const& id)
     sqlite3_finalize(stmt);
 }
 
+namespace
+{
+constexpr char const* kClipColumns = "SELECT id,name,camera,in_ns,out_ns,speed,motion,audio,colour,tags,end_action,group_id,library FROM clips";
+
+// One row of kClipColumns.
+ClipRef readClip(sqlite3_stmt* stmt)
+{
+    ClipRef clip;
+    clip.id = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 0));
+    clip.name = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 1));
+    clip.camera = sqlite3_column_int(stmt, 2);
+    clip.inNs = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
+    clip.outNs = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 4));
+    clip.speed = sqlite3_column_double(stmt, 5);
+    clip.motion = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 6));
+    clip.audio = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 7));
+    clip.colour = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 8));
+    auto const tags = sqlite3_column_text(stmt, 9);
+    clip.tags = tags != nullptr ? reinterpret_cast<char const*>(tags) : "";
+    clip.end = parseEndAction(reinterpret_cast<char const*>(sqlite3_column_text(stmt, 10)));
+    auto const group = sqlite3_column_text(stmt, 11);
+    clip.groupId = group != nullptr ? reinterpret_cast<char const*>(group) : "";
+    clip.library = sqlite3_column_int(stmt, 12) != 0;
+    return clip;
+}
+} // namespace
+
 std::vector<ClipRef> Catalog::clips() const
 {
     std::vector<ClipRef> out;
     sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db_, "SELECT id,name,camera,in_ns,out_ns,speed,motion,audio,colour,tags,end_action,group_id,library FROM clips ORDER BY name", -1,
-        &stmt, nullptr);
+    sqlite3_prepare_v2(db_, (std::string(kClipColumns) + " ORDER BY name").c_str(), -1, &stmt, nullptr);
     while (sqlite3_step(stmt) == SQLITE_ROW)
     {
-        ClipRef clip;
-        clip.id = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 0));
-        clip.name = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 1));
-        clip.camera = sqlite3_column_int(stmt, 2);
-        clip.inNs = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
-        clip.outNs = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 4));
-        clip.speed = sqlite3_column_double(stmt, 5);
-        clip.motion = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 6));
-        clip.audio = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 7));
-        clip.colour = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 8));
-        auto const tags = sqlite3_column_text(stmt, 9);
-        clip.tags = tags != nullptr ? reinterpret_cast<char const*>(tags) : "";
-        clip.end = parseEndAction(reinterpret_cast<char const*>(sqlite3_column_text(stmt, 10)));
-        auto const group = sqlite3_column_text(stmt, 11);
-        clip.groupId = group != nullptr ? reinterpret_cast<char const*>(group) : "";
-        clip.library = sqlite3_column_int(stmt, 12) != 0;
-        out.push_back(std::move(clip));
+        out.push_back(readClip(stmt));
     }
     sqlite3_finalize(stmt);
     return out;
@@ -124,14 +134,16 @@ std::vector<ClipRef> Catalog::clips() const
 
 ClipRef Catalog::clip(std::string const& id) const
 {
-    for (auto const& clip : clips())
+    ClipRef clip;
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db_, (std::string(kClipColumns) + " WHERE id=?").c_str(), -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW)
     {
-        if (clip.id == id)
-        {
-            return clip;
-        }
+        clip = readClip(stmt);
     }
-    return {};
+    sqlite3_finalize(stmt);
+    return clip;
 }
 
 void Catalog::upsertPlaylist(Playlist const& playlist)

@@ -15,9 +15,14 @@ const addClip = ref("");
 
 const selected = computed(() => state.playlists.find((p) => p.id === selectedId.value) || null);
 const dirty = computed(() => draft.value && JSON.stringify(draft.value) !== saved.value);
+// Each entry plays forward at 1–200 % (0 % would never reach the clip's OUT).
+const speedOk = (speed) => typeof speed === "number" && speed >= 1 && speed <= 200;
+const entriesOk = computed(() => (draft.value?.entries || []).every((e) => speedOk(e.speed)));
 const playingOn = (id) => channels.value.filter((c) => c.playlist === id && !c.live);
 
 async function load(id) {
+  // Another playlist: unsaved edits are only dropped when the operator says so.
+  if (id !== selectedId.value && dirty.value && !confirm(`Discard the unsaved changes to "${draft.value.name}"?`)) return;
   selectedId.value = id;
   message.value = "";
   const playlist = await act(() => api.get(`/api/v1/playlists/${encodeURIComponent(id)}`));
@@ -143,7 +148,7 @@ async function play(id) {
               <span v-else class="muted">{{ e.clip_id }} (deleted, skipped)</span>
             </td>
             <td class="num">{{ clipsById[e.clip_id] ? fmtNs(playNs(clipsById[e.clip_id], e.speed / 100)) : "–" }}</td>
-            <td><input v-model.number="e.speed" type="number" min="0" max="200" step="1" :aria-label="`Speed of entry ${i + 1}`" /></td>
+            <td><input v-model.number="e.speed" type="number" min="1" max="200" step="1" :class="{ invalid: !speedOk(e.speed) }" :aria-label="`Speed of entry ${i + 1}`" /></td>
             <td>
               <select v-model="e.end" :aria-label="`End action of entry ${i + 1}`">
                 <option v-for="a in END_ACTIONS" :key="a.value" :value="a.value">{{ a.label }}</option>
@@ -167,12 +172,13 @@ async function play(id) {
         <button class="btn secondary" style="flex: none" :disabled="!addClip" @click="add">Add</button>
       </div>
       <div class="note">Total {{ fmtNs(draftLength) }}. At the end: <em>Next</em> goes to the next clip; with auto-advance it plays at once, otherwise it waits cued.</div>
+      <div v-if="!entriesOk" class="msg err">Each speed is 1 to 200 %.</div>
       <div v-if="message" class="msg err">{{ message }}</div>
       <div class="actions">
         <button class="btn danger" @click="remove">Delete</button>
         <span class="spacer"></span>
         <button class="btn secondary" :disabled="!dirty" @click="load(selectedId)">Revert</button>
-        <button class="btn" :disabled="!dirty" @click="save">Save</button>
+        <button class="btn" :disabled="!dirty || !entriesOk" @click="save">Save</button>
         <button class="btn" :disabled="dirty || !draft.entries.length" :title="dirty ? 'save first' : ''" @click="play(selectedId)">
           Play on {{ channels.find((c) => c.index === state.channel)?.label }}
         </button>

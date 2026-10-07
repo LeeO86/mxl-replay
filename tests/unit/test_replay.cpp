@@ -22,8 +22,14 @@
 #include "util/logging.hpp"
 #include "util/uuid.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -906,12 +912,13 @@ std::string idOf(std::string const& body)
 }
 
 // One camera with frames 0 … count-1 on the 50p grid (TAI 1000 s onward), one channel.
-std::unique_ptr<Engine> recordedEngine(std::filesystem::path const& dir, int count)
+// `cap`: REPLAY_PROTECT_MAX_PCT.
+std::unique_ptr<Engine> recordedEngine(std::filesystem::path const& dir, int count, std::string const& cap = "100")
 {
     auto const loaded = loadConfig(
         {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
             {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
-            {"REPLAY_PROTECT_MAX_PCT", "100"}, {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+            {"REPLAY_PROTECT_MAX_PCT", cap}, {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
         {});
     auto engine = std::make_unique<Engine>(loaded.config, loaded.flat);
     engine->openBuffer();
@@ -1119,4 +1126,179 @@ TEST_CASE("playlist entries bring their speed, end action and auto-advance; a pa
     CHECK(engine->statusJson().find("\"playlist\":\"" + id + "\"") != std::string::npos);
     engine.reset();
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("clip edits stay on recorded frames, under the protection cap and forward")
+{
+    auto const dir = freshDir("mxl-replay-edit-checks");
+    auto engine = recordedEngine(dir, 40, "1");
+    engine->setPosition(1, frameTime(2));
+    engine->markIn(1);
+    // An OUT between frames, as a mark in slow motion gives.
+    engine->setPosition(1, frameTime(6) + 12000000);
+    engine->markOut(1);
+    std::string error;
+    auto const id = engine->createClip(1, "edit", false, false, error);
+    REQUIRE(error.empty());
+    auto const path = "/api/v1/clips/" + id;
+    // IN lands on frame 7, after the unchanged OUT.
+    CHECK(call(*engine, "PATCH", path, "{\"in_ns\":" + std::to_string(frameTime(6) + 11000000) + "}").status == 400);
+    CHECK(call(*engine, "PATCH", path, "{\"in_ns\":0}").status == 400);
+    CHECK(call(*engine, "PATCH", path, "{\"out_ns\":" + std::to_string(frameTime(60)) + "}").status == 400);
+    CHECK(call(*engine, "PATCH", path, "{\"speed\":0}").status == 400);
+    CHECK(call(*engine, "PATCH", path, "{\"speed\":-0.5}").status == 400);
+    CHECK(call(*engine, "PATCH", path, "{\"speed\":\"\"}").status == 400);
+    CHECK(engine->clip(id).inNs == frameTime(2));
+    // The clip keeps 1 % or more of this small budget: a longer range needs force, a shorter one not.
+    CHECK(call(*engine, "PATCH", path, "{\"out_ns\":" + std::to_string(frameTime(9)) + "}").status == 409);
+    CHECK(call(*engine, "PATCH", path, "{\"out_ns\":" + std::to_string(frameTime(9)) + ",\"force\":true}").status == 200);
+    CHECK(engine->clip(id).outNs == frameTime(9));
+    CHECK(call(*engine, "PATCH", path, "{\"in_ns\":" + std::to_string(frameTime(4)) + "}").status == 200);
+    CHECK(call(*engine, "POST", "/api/v1/playlists", "{\"entries\":[{\"clip_id\":\"" + id + "\",\"speed\":0}]}").status == 400);
+    // A thumbnail needs the IN frame: an imported clip far outside the buffer has none.
+    REQUIRE(engine->importConfigJson("{\"clips\":[{\"id\":\"far\",\"name\":\"far\",\"camera\":1,\"in_ns\":5,\"out_ns\":9}]}").ok);
+    CHECK(call(*engine, "GET", "/api/v1/clips/far/thumbnail.jpg").status == 404);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("ranges: a consolidated clip releases once, an import protects at once, a name round-trips")
+{
+    auto const dir = freshDir("mxl-replay-ranges");
+    auto engine = recordedEngine(dir, 20);
+    engine->setPosition(1, frameTime(2));
+    engine->markIn(1);
+    engine->setPosition(1, frameTime(6));
+    engine->markOut(1);
+    std::string error;
+    auto const first = engine->createClip(1, "a \"b\"\tc", false, false, error);
+    auto const second = engine->createClip(1, "same range", false, false, error);
+    auto const keeps = [&] { return engine->statusJson().find("\"protected_bytes\":0,") == std::string::npos; };
+    REQUIRE(engine->consolidate(first, error));
+    REQUIRE(engine->consolidate(first, error));
+    CHECK(engine->deleteClip(first));
+    CHECK(keeps()); // the second clip's range is still protected
+    auto const exported = engine->exportConfigJson();
+    CHECK(engine->deleteClip(second));
+    CHECK_FALSE(keeps());
+    // Import brings the clip back with its name and protects its range without a restart.
+    REQUIRE(engine->importConfigJson(exported).ok);
+    CHECK(engine->clip(second).name == "same range");
+    CHECK(keeps());
+    REQUIRE(engine->importConfigJson(R"({"clips":[{"id":"q","name":"a \"b\"\tc","camera":1,"in_ns":1,"out_ns":2}]})").ok);
+    CHECK(engine->clip("q").name == "a \"b\"\tc");
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a playlist keeps deleted clips as skipped entries and a playing channel on its entry")
+{
+    auto const dir = freshDir("mxl-replay-playlist-edit");
+    auto engine = recordedEngine(dir, 20);
+    auto const clipFrom = [&](int in, int out) {
+        engine->setPosition(1, frameTime(in));
+        engine->markIn(1);
+        engine->setPosition(1, frameTime(out));
+        engine->markOut(1);
+        std::string error;
+        return engine->createClip(1, "", false, false, error);
+    };
+    auto const first = clipFrom(0, 4);
+    auto const second = clipFrom(10, 14);
+    auto const gone = clipFrom(15, 16);
+    auto const id = engine->createPlaylist("p", {PlaylistEntry{first, 1, EndAction::Next, true}, PlaylistEntry{second, 1, EndAction::Next, true},
+                                                    PlaylistEntry{gone, 1, EndAction::Next, true}});
+    CHECK(engine->deleteClip(gone));
+    auto const entries = [&](std::vector<std::string> const& ids) {
+        std::string out;
+        for (auto const& clip : ids)
+        {
+            out += (out.empty() ? "" : ",") + std::string("{\"clip_id\":\"") + clip + "\"}";
+        }
+        return "{\"name\":\"renamed\",\"entries\":[" + out + "]}";
+    };
+    CHECK(call(*engine, "PUT", "/api/v1/playlists/" + id, entries({first, second, gone})).status == 200);
+    CHECK(call(*engine, "PUT", "/api/v1/playlists/" + id, entries({first, "clip-999"})).status == 400);
+    // Play into the second entry, then move it to the front: the channel stays on it.
+    engine->playPlaylist(1, id);
+    for (int i = 0; i < 6; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    REQUIRE(engine->statusJson().find("\"playlist_index\":1") != std::string::npos);
+    CHECK(call(*engine, "PUT", "/api/v1/playlists/" + id, entries({second, first})).status == 200);
+    CHECK(engine->statusJson().find("\"playlist_index\":0") != std::string::npos);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("return to live at the end of an upload follows a camera")
+{
+    auto const dir = freshDir("mxl-replay-upload-live");
+    auto engine = recordedEngine(dir, 6);
+    Frame10 still;
+    still.allocate(64, 32);
+    still.fill(700, 512, 512);
+    auto const jpeg = encodeJpeg422(still, 90);
+    std::string error;
+    auto const id = engine->upload(jpeg.data(), jpeg.size(), "still", error);
+    REQUIRE_FALSE(id.empty());
+    REQUIRE(call(*engine, "PATCH", "/api/v1/clips/" + id, "{\"end\":\"return-to-live\"}").status == 200);
+    engine->playClip(1, id);
+    (void)engine->render(1, frameTime(8));
+    CHECK(engine->render(1, frameTime(9)).camera == 1);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("preview decode is scaled down by libjpeg")
+{
+    Frame10 frame;
+    frame.allocate(64, 32);
+    frame.fill(500, 512, 512);
+    auto const jpeg = encodeJpeg422(frame, 90);
+    Frame10 small;
+    REQUIRE(decodeJpegPreview(jpeg.data(), jpeg.size(), 16, small));
+    CHECK(small.width == 16);
+    CHECK(small.height == 8);
+    CHECK(std::abs(static_cast<int>(small.y[0]) - 500) < 16);
+    REQUIRE(decodeJpegPreview(jpeg.data(), jpeg.size(), 64, small));
+    CHECK(small.width == 64);
+}
+
+TEST_CASE("a websocket client that does not read is dropped, not waited for")
+{
+    HttpServer server;
+    server.start(0, [](HttpRequest const& request) {
+        HttpResponse response;
+        response.websocket = request.path == "/ws";
+        return response;
+    });
+    int const fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    int const small = 4096;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<std::uint16_t>(server.port()));
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    std::string const upgrade = "GET /ws HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    REQUIRE(::send(fd, upgrade.data(), upgrade.size(), 0) == static_cast<ssize_t>(upgrade.size()));
+    char answer[256];
+    auto const n = ::recv(fd, answer, sizeof(answer), 0);
+    REQUIRE(n > 0);
+    CHECK(std::string(answer, static_cast<std::size_t>(n)).rfind("HTTP/1.1 101", 0) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // 10 MB to a client that reads nothing: a blocking send would never return.
+    std::string const message(256 * 1024, 'x');
+    auto const started = std::chrono::steady_clock::now();
+    for (int i = 0; i < 40; ++i)
+    {
+        server.broadcast(message);
+    }
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(1));
+    CHECK(httpGetStatus("127.0.0.1", server.port(), "/", 1000) == 200);
+    ::close(fd);
+    server.stop();
 }

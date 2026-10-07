@@ -11,6 +11,7 @@
 #include "media/timebase.hpp"
 #include "media/v210.hpp"
 #include "record/hfr.hpp"
+#include "util/json.hpp"
 #include "util/logging.hpp"
 
 #include <sys/statvfs.h>
@@ -277,10 +278,12 @@ void Engine::openBuffer()
     std::lock_guard lock{mutex_};
     cameras_ = std::move(cameras);
     library_ = std::move(library);
-    // Clips keep their frames: protect them again before old segments expire.
+    // Clips keep their frames: protect them again before old segments expire. A clip
+    // consolidated out of a camera buffer released its range.
     for (auto const& clip : catalog_.clips())
     {
-        if (auto* ring = ringOf(clip.camera))
+        auto* ring = holdsRange(clip) ? ringOf(clip.camera) : nullptr;
+        if (ring != nullptr)
         {
             ring->protect(clip.inNs, clip.outNs);
         }
@@ -952,12 +955,7 @@ void Engine::finishClip(int channel)
     }
     else if (action == EndAction::ReturnToLive)
     {
-        runtime.liveMode = true;
-        runtime.scheduler.playing = false;
-        runtime.black = false;
-        runtime.clipId.clear();
-        runtime.playlistId.clear();
-        runtime.playlistIndex = -1;
+        goLive(runtime);
     }
     else if (action == EndAction::Next && entry != nullptr)
     {
@@ -1024,10 +1022,15 @@ void Engine::live(int channel)
         return;
     }
     auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    goLive(runtime);
+    runtime.shot.state = ShotState::Idle;
+}
+
+void Engine::goLive(ChannelRuntime& runtime)
+{
     runtime.liveMode = true;
     runtime.black = false;
     runtime.scheduler.playing = false;
-    // Uploads have no live picture: after one, live follows the first camera.
     if (runtime.scheduler.camera == kLibraryCamera)
     {
         runtime.scheduler.camera = 1;
@@ -1035,7 +1038,20 @@ void Engine::live(int channel)
     runtime.clipId.clear();
     runtime.playlistId.clear();
     runtime.playlistIndex = -1;
-    runtime.shot.state = ShotState::Idle;
+}
+
+bool Engine::protectionFull() const
+{
+    std::uint64_t budget = 0;
+    std::uint64_t protectedBytes = 0;
+    for (std::size_t i = 0; i < cameras_.size(); ++i)
+    {
+        double const fps = static_cast<double>(config_.format.rateNum) / static_cast<double>(config_.format.rateDen) * hfrFactor(static_cast<int>(i + 1));
+        budget += static_cast<std::uint64_t>(bytesPerFrameEstimate(config_.format.width, config_.format.height, config_.jpegQuality) * fps * 3600.0 *
+                                              config_.cameras[i].bufferHours);
+        protectedBytes += cameras_[i].ring.protectedBytes();
+    }
+    return budget > 0 && (100.0 * static_cast<double>(protectedBytes) / static_cast<double>(budget)) >= config_.protectMaxPct;
 }
 
 void Engine::setSpeed(int channel, double speed)
@@ -1212,16 +1228,7 @@ std::string Engine::createClip(int channel, std::string const& name, bool allAng
         error = "mark IN and OUT first";
         return {};
     }
-    std::uint64_t budget = 0;
-    std::uint64_t protectedBytes = 0;
-    for (std::size_t i = 0; i < cameras_.size(); ++i)
-    {
-        double const fps = static_cast<double>(config_.format.rateNum) / static_cast<double>(config_.format.rateDen) * hfrFactor(static_cast<int>(i + 1));
-        budget += static_cast<std::uint64_t>(bytesPerFrameEstimate(config_.format.width, config_.format.height, config_.jpegQuality) * fps * 3600.0 *
-                                              config_.cameras[i].bufferHours);
-        protectedBytes += cameras_[i].ring.protectedBytes();
-    }
-    if (budget > 0 && (100.0 * static_cast<double>(protectedBytes) / static_cast<double>(budget)) >= config_.protectMaxPct && !force)
+    if (!force && protectionFull())
     {
         error = "protected ranges exceed " + std::to_string(config_.protectMaxPct) + "% of storage; export or delete clips, or pass force";
         return {};
@@ -1244,8 +1251,10 @@ std::string Engine::createClip(int channel, std::string const& name, bool allAng
         clip.camera = camera;
         clip.inNs = runtime.inNs;
         clip.outNs = runtime.outNs;
-        // The speed the operator set (a ramp only runs while playing).
-        clip.speed = runtime.scheduler.targetSpeed;
+        // The speed the operator set (a ramp only runs while playing). A clip plays forward:
+        // from a paused (0) or reverse setting it plays at 100 %.
+        double const speed = runtime.scheduler.targetSpeed;
+        clip.speed = speed >= kMinClipSpeed && speed <= kMaxClipSpeed ? speed : 1.0;
         clip.motion = motionName(config_.channelList[static_cast<std::size_t>(channel - 1)].motion);
         clip.audio = audioModeName(config_.channelList[static_cast<std::size_t>(channel - 1)].audio);
         if (!colour.empty())
@@ -1272,43 +1281,62 @@ std::string Engine::createClip(int channel, std::string const& name, bool allAng
     return first;
 }
 
-bool Engine::updateClip(ClipRef clip)
+ClipEdit Engine::updateClip(ClipRef clip, bool force)
 {
     std::lock_guard lock{mutex_};
     auto const existing = clip.id.empty() ? ClipRef{} : catalog_.clip(clip.id);
     if (existing.id.empty())
     {
-        return false;
+        return ClipEdit::Unknown;
     }
     if (clip.name.empty())
     {
         clip.name = existing.name;
     }
-    // A new IN or OUT lands on the nearest recorded frame (an index lookup, no read).
-    if (auto const* ring = ringOf(clip.camera))
+    bool const moved = existing.camera != clip.camera || existing.inNs != clip.inNs || existing.outNs != clip.outNs;
+    if (moved)
     {
+        // A new IN or OUT needs a recorded frame within one frame period and lands on it (an
+        // index lookup, no read): no range outside the buffer that retention could never free.
+        auto const* ring = ringOf(clip.camera);
         auto const period = sourcePeriod(clip.camera);
-        auto const snap = [&](std::uint64_t ns) {
-            auto const nearest = ring->nearestNs(ns);
-            return nearest != 0 && (nearest > ns ? nearest - ns : ns - nearest) <= period ? nearest : ns;
+        auto const snap = [&](std::uint64_t& ns) {
+            auto const nearest = ring != nullptr ? ring->nearestNs(ns) : 0;
+            if (nearest == 0 || (nearest > ns ? nearest - ns : ns - nearest) > period)
+            {
+                return false;
+            }
+            ns = nearest;
+            return true;
         };
-        clip.inNs = clip.inNs == existing.inNs ? clip.inNs : snap(clip.inNs);
-        clip.outNs = clip.outNs == existing.outNs ? clip.outNs : snap(clip.outNs);
+        if ((clip.inNs != existing.inNs && !snap(clip.inNs)) || (clip.outNs != existing.outNs && !snap(clip.outNs)))
+        {
+            return ClipEdit::NoFrame;
+        }
+        if (clip.outNs < clip.inNs)
+        {
+            return ClipEdit::OutBeforeIn;
+        }
+        bool const grows = existing.camera != clip.camera || clip.inNs < existing.inNs || clip.outNs > existing.outNs;
+        if (grows && holdsRange(existing) && !force && protectionFull())
+        {
+            return ClipEdit::OverCap;
+        }
     }
     catalog_.upsertClip(clip);
-    // The protected range moves with IN and OUT.
-    if (existing.camera != clip.camera || existing.inNs != clip.inNs || existing.outNs != clip.outNs)
+    if (moved && holdsRange(existing))
     {
-        if (auto* ring = ringOf(existing.camera))
-        {
-            ring->unprotect(existing.inNs, existing.outNs);
-        }
+        // The new range first: frames both ranges share stay protected throughout.
         if (auto* ring = ringOf(clip.camera))
         {
             ring->protect(clip.inNs, clip.outNs);
         }
+        if (auto* ring = ringOf(existing.camera))
+        {
+            ring->unprotect(existing.inNs, existing.outNs);
+        }
     }
-    return true;
+    return ClipEdit::Ok;
 }
 
 bool Engine::deleteClip(std::string const& id)
@@ -1322,7 +1350,9 @@ bool Engine::deleteClip(std::string const& id)
             return false;
         }
         catalog_.deleteClip(id);
-        ring = ringOf(clip.camera);
+        // A consolidated clip released its range already; releasing it again could remove
+        // another clip's identical range.
+        ring = holdsRange(clip) ? ringOf(clip.camera) : nullptr;
         if (ring != nullptr)
         {
             ring->unprotect(clip.inNs, clip.outNs);
@@ -1459,6 +1489,30 @@ bool Engine::updatePlaylist(Catalog::Playlist const& playlist)
         stored.name = stored.id;
     }
     catalog_.upsertPlaylist(stored);
+    // A channel playing the playlist stays on its entry: the same clip nearest its old place,
+    // else the same place (or the last entry).
+    int const size = static_cast<int>(stored.entries.size());
+    for (auto& runtime : channels_)
+    {
+        if (runtime.playlistId != stored.id)
+        {
+            continue;
+        }
+        int best = -1;
+        for (int i = 0; i < size; ++i)
+        {
+            if (stored.entries[static_cast<std::size_t>(i)].clipId == runtime.clipId &&
+                (best < 0 || std::abs(i - runtime.playlistIndex) < std::abs(best - runtime.playlistIndex)))
+            {
+                best = i;
+            }
+        }
+        runtime.playlistIndex = best >= 0 ? best : std::min(runtime.playlistIndex, size - 1);
+        if (runtime.playlistIndex < 0)
+        {
+            runtime.playlistId.clear();
+        }
+    }
     return true;
 }
 
@@ -1623,6 +1677,11 @@ bool Engine::consolidate(std::string const& id, std::string& error)
     }
     std::lock_guard lock{mutex_};
     auto clip = catalog_.clip(id);
+    // Released once: a second consolidate would remove another clip's identical range.
+    if (clip.id.empty() || clip.library)
+    {
+        return true;
+    }
     clip.library = true;
     catalog_.upsertClip(clip);
     if (clip.camera >= 1 && clip.camera <= static_cast<int>(cameras_.size()))
@@ -1748,252 +1807,6 @@ void Engine::setRoute(int camera, int phase, bool video, Route route, bool persi
     }
 }
 
-namespace
-{
-std::string jsonObject(std::string const& body, std::string const& key)
-{
-    auto const needle = "\"" + key + "\"";
-    auto const pos = body.find(needle);
-    if (pos == std::string::npos)
-    {
-        return {};
-    }
-    auto const brace = body.find('{', pos + needle.size());
-    if (brace == std::string::npos || brace > pos + needle.size() + 8)
-    {
-        return {};
-    }
-    int depth = 0;
-    bool inString = false;
-    for (std::size_t i = brace; i < body.size(); ++i)
-    {
-        char const c = body[i];
-        if (inString)
-        {
-            if (c == '\\' && i + 1 < body.size())
-            {
-                ++i;
-                continue;
-            }
-            if (c == '"')
-            {
-                inString = false;
-            }
-            continue;
-        }
-        if (c == '"')
-        {
-            inString = true;
-        }
-        else if (c == '{')
-        {
-            ++depth;
-        }
-        else if (c == '}')
-        {
-            --depth;
-            if (depth == 0)
-            {
-                return body.substr(brace, i - brace + 1);
-            }
-        }
-    }
-    return {};
-}
-
-std::string jsonArray(std::string const& body, std::string const& key)
-{
-    auto const needle = "\"" + key + "\"";
-    auto const pos = body.find(needle);
-    if (pos == std::string::npos)
-    {
-        return {};
-    }
-    auto const brace = body.find('[', pos + needle.size());
-    if (brace == std::string::npos || brace > pos + needle.size() + 8)
-    {
-        return {};
-    }
-    int depth = 0;
-    bool inString = false;
-    for (std::size_t i = brace; i < body.size(); ++i)
-    {
-        char const c = body[i];
-        if (inString)
-        {
-            if (c == '\\' && i + 1 < body.size())
-            {
-                ++i;
-                continue;
-            }
-            if (c == '"')
-            {
-                inString = false;
-            }
-            continue;
-        }
-        if (c == '"')
-        {
-            inString = true;
-        }
-        else if (c == '[')
-        {
-            ++depth;
-        }
-        else if (c == ']')
-        {
-            --depth;
-            if (depth == 0)
-            {
-                return body.substr(brace, i - brace + 1);
-            }
-        }
-    }
-    return {};
-}
-
-std::map<std::string, std::string> parseStringObject(std::string const& object)
-{
-    std::map<std::string, std::string> values;
-    std::size_t i = 0;
-    while (i < object.size())
-    {
-        auto const keyStart = object.find('"', i);
-        if (keyStart == std::string::npos)
-        {
-            break;
-        }
-        auto const keyEnd = object.find('"', keyStart + 1);
-        if (keyEnd == std::string::npos)
-        {
-            break;
-        }
-        auto const key = object.substr(keyStart + 1, keyEnd - keyStart - 1);
-        auto const colon = object.find(':', keyEnd);
-        if (colon == std::string::npos)
-        {
-            break;
-        }
-        auto const valueStart = object.find('"', colon + 1);
-        if (valueStart == std::string::npos)
-        {
-            throw ConfigError("imported settings must be strings");
-        }
-        std::string value;
-        for (std::size_t j = valueStart + 1; j < object.size(); ++j)
-        {
-            if (object[j] == '\\' && j + 1 < object.size())
-            {
-                char const next = object[j + 1];
-                if (next == 'n')
-                {
-                    value.push_back('\n');
-                }
-                else if (next == 'r')
-                {
-                    value.push_back('\r');
-                }
-                else if (next == 't')
-                {
-                    value.push_back('\t');
-                }
-                else
-                {
-                    value.push_back(next);
-                }
-                ++j;
-                continue;
-            }
-            if (object[j] == '"')
-            {
-                i = j + 1;
-                break;
-            }
-            value.push_back(object[j]);
-        }
-        values[key] = value;
-    }
-    return values;
-}
-
-std::string fieldOf(std::string const& item, char const* key)
-{
-    auto const needle = std::string("\"") + key + "\"";
-    auto const pos = item.find(needle);
-    if (pos == std::string::npos)
-    {
-        return {};
-    }
-    auto const colon = item.find(':', pos + needle.size());
-    if (colon == std::string::npos)
-    {
-        return {};
-    }
-    auto i = colon + 1;
-    while (i < item.size() && item[i] == ' ')
-    {
-        ++i;
-    }
-    if (i < item.size() && item[i] == '"')
-    {
-        auto const stop = item.find('"', i + 1);
-        return stop == std::string::npos ? std::string{} : item.substr(i + 1, stop - i - 1);
-    }
-    auto stop = i;
-    while (stop < item.size() && item[stop] != ',' && item[stop] != '}' && item[stop] != ']')
-    {
-        ++stop;
-    }
-    return item.substr(i, stop - i);
-}
-
-std::vector<std::string> objectsIn(std::string const& array)
-{
-    std::vector<std::string> objects;
-    int depth = 0;
-    bool inString = false;
-    std::size_t start = std::string::npos;
-    for (std::size_t i = 0; i < array.size(); ++i)
-    {
-        char const c = array[i];
-        if (inString)
-        {
-            if (c == '\\' && i + 1 < array.size())
-            {
-                ++i;
-                continue;
-            }
-            if (c == '"')
-            {
-                inString = false;
-            }
-            continue;
-        }
-        if (c == '"')
-        {
-            inString = true;
-        }
-        else if (c == '{')
-        {
-            if (depth == 0)
-            {
-                start = i;
-            }
-            ++depth;
-        }
-        else if (c == '}')
-        {
-            --depth;
-            if (depth == 0 && start != std::string::npos)
-            {
-                objects.push_back(array.substr(start, i - start + 1));
-                start = std::string::npos;
-            }
-        }
-    }
-    return objects;
-}
-} // namespace
 
 std::string Engine::exportConfigJson() const
 {
@@ -2054,29 +1867,31 @@ std::string Engine::exportConfigJson() const
 Engine::ImportResult Engine::importConfigJson(std::string const& body)
 {
     ImportResult result;
+    Json doc;
+    if (!parseJson(body, doc) || doc.kind != Json::Kind::Object)
+    {
+        result.error = "the document must be a JSON object";
+        return result;
+    }
     try
     {
-        auto const settingsObject = jsonObject(body, "settings");
-        if (settingsObject.empty() && body.find("\"settings\"") != std::string::npos)
-        {
-            result.error = "settings must be an object of strings";
-            return result;
-        }
+        // An exported document, or a flat object of settings.
+        auto const* settings = doc.get("settings");
+        bool const flat = settings == nullptr && doc.get("clips") == nullptr && doc.get("playlists") == nullptr;
         auto merged = settings_;
-        if (!settingsObject.empty())
+        if (settings != nullptr || flat)
         {
-            auto const imported = parseStringObject(settingsObject);
-            for (auto const& [key, value] : imported)
+            auto const& object = settings != nullptr ? *settings : doc;
+            bool const strings = object.kind == Json::Kind::Object &&
+                                 std::all_of(object.members.begin(), object.members.end(), [](auto const& member) { return member.second.kind == Json::Kind::String; });
+            if (!strings)
             {
-                merged[key] = value;
+                result.error = "settings must be an object of strings";
+                return result;
             }
-        }
-        else if (!body.empty() && body.find('{') != std::string::npos && body.find("\"clips\"") == std::string::npos)
-        {
-            auto const imported = parseStringObject(body);
-            for (auto const& [key, value] : imported)
+            for (auto const& [key, value] : object.members)
             {
-                merged[key] = value;
+                merged[key] = value.text;
             }
         }
         auto const loaded = loadConfig({}, {}, merged);
@@ -2131,54 +1946,79 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             out << "  \"" << jsonEscape(key) << "\": \"" << jsonEscape(value) << '"';
         }
         out << "\n}\n";
-        for (auto const& item : objectsIn(jsonArray(body, "clips")))
+        auto const text = [](Json const& item, char const* key) {
+            auto const* field = item.get(key);
+            return field != nullptr ? jsonText(*field).value_or(std::string{}) : std::string{};
+        };
+        auto const* clips = doc.get("clips");
+        for (auto const& item : clips != nullptr ? clips->items : std::vector<Json>{})
         {
             ClipRef clip;
-            clip.id = fieldOf(item, "id");
-            clip.name = fieldOf(item, "name");
+            clip.id = text(item, "id");
             if (clip.id.empty())
             {
                 continue;
             }
-            clip.camera = std::atoi(fieldOf(item, "camera").c_str());
-            clip.inNs = static_cast<std::uint64_t>(std::strtoull(fieldOf(item, "in_ns").c_str(), nullptr, 10));
-            clip.outNs = static_cast<std::uint64_t>(std::strtoull(fieldOf(item, "out_ns").c_str(), nullptr, 10));
-            clip.speed = std::strtod(fieldOf(item, "speed").c_str(), nullptr);
-            clip.motion = fieldOf(item, "motion");
-            clip.audio = fieldOf(item, "audio");
-            clip.colour = fieldOf(item, "colour");
-            clip.tags = fieldOf(item, "tags");
+            clip.name = text(item, "name");
+            auto const* field = item.get("camera");
+            clip.camera = static_cast<int>(field != nullptr ? jsonInt(*field).value_or(clip.camera) : clip.camera);
+            field = item.get("in_ns");
+            clip.inNs = field != nullptr ? jsonUnsigned(*field).value_or(0) : 0;
+            field = item.get("out_ns");
+            clip.outNs = field != nullptr ? jsonUnsigned(*field).value_or(clip.inNs) : clip.inNs;
+            field = item.get("speed");
+            clip.speed = field != nullptr ? jsonDouble(*field).value_or(clip.speed) : clip.speed;
+            clip.motion = text(item, "motion");
+            clip.audio = text(item, "audio");
+            clip.colour = text(item, "colour");
+            clip.tags = text(item, "tags");
             bool endOk = false;
-            clip.end = parseEndAction(fieldOf(item, "end"), &endOk);
+            clip.end = parseEndAction(text(item, "end"), &endOk);
             if (!endOk)
             {
                 clip.end = EndAction::Freeze;
             }
-            clip.library = fieldOf(item, "library") == "true";
-            clip.groupId = fieldOf(item, "group");
+            field = item.get("library");
+            clip.library = field != nullptr && jsonBool(*field).value_or(false);
+            clip.groupId = text(item, "group");
+            // The imported range is protected now, not at the next start; a clip it replaces
+            // releases its own (after: frames both ranges share stay protected).
+            auto const previous = catalog_.clip(clip.id);
             catalog_.upsertClip(clip);
+            if (auto* ring = holdsRange(clip) ? ringOf(clip.camera) : nullptr)
+            {
+                ring->protect(clip.inNs, clip.outNs);
+            }
+            if (auto* ring = !previous.id.empty() && holdsRange(previous) ? ringOf(previous.camera) : nullptr)
+            {
+                ring->unprotect(previous.inNs, previous.outNs);
+            }
         }
-        for (auto const& item : objectsIn(jsonArray(body, "playlists")))
+        auto const* playlists = doc.get("playlists");
+        for (auto const& item : playlists != nullptr ? playlists->items : std::vector<Json>{})
         {
             Catalog::Playlist playlist;
-            playlist.id = fieldOf(item, "id");
-            playlist.name = fieldOf(item, "name");
+            playlist.id = text(item, "id");
+            playlist.name = text(item, "name");
             if (playlist.id.empty())
             {
                 continue;
             }
-            for (auto const& entryText : objectsIn(jsonArray(item, "entries")))
+            auto const* entries = item.get("entries");
+            for (auto const& entryItem : entries != nullptr ? entries->items : std::vector<Json>{})
             {
                 PlaylistEntry entry;
-                entry.clipId = fieldOf(entryText, "clip_id");
-                entry.speed = std::strtod(fieldOf(entryText, "speed").c_str(), nullptr);
+                entry.clipId = text(entryItem, "clip_id");
+                auto const* field = entryItem.get("speed");
+                entry.speed = field != nullptr ? jsonDouble(*field).value_or(entry.speed) : entry.speed;
                 bool endOk = false;
-                entry.end = parseEndAction(fieldOf(entryText, "end"), &endOk);
+                entry.end = parseEndAction(text(entryItem, "end"), &endOk);
                 if (!endOk)
                 {
                     entry.end = EndAction::Next;
                 }
-                entry.autoAdvance = fieldOf(entryText, "auto_advance") != "false";
+                field = entryItem.get("auto_advance");
+                entry.autoAdvance = field == nullptr || jsonBool(*field).value_or(true);
                 playlist.entries.push_back(entry);
             }
             catalog_.upsertPlaylist(playlist);
@@ -2210,8 +2050,35 @@ Route Engine::route(int camera, int phase, bool video) const
     return it->second;
 }
 
+std::vector<std::uint8_t> Engine::recentPreview(std::string const& key, std::chrono::milliseconds maxAge) const
+{
+    std::lock_guard lock{previewMutex_};
+    auto const it = previews_.find(key);
+    if (it == previews_.end() || (maxAge.count() > 0 && std::chrono::steady_clock::now() - it->second.made > maxAge))
+    {
+        return {};
+    }
+    return it->second.jpeg;
+}
+
+void Engine::keepPreview(std::string const& key, std::vector<std::uint8_t> const& jpeg) const
+{
+    std::lock_guard lock{previewMutex_};
+    // Thumbnails of old IN points pile up: start over now and then.
+    if (previews_.size() > 512)
+    {
+        previews_.clear();
+    }
+    previews_[key] = Preview{std::chrono::steady_clock::now(), jpeg};
+}
+
 std::vector<std::uint8_t> Engine::previewJpeg(int channel) const
 {
+    auto const key = "channel:" + std::to_string(channel);
+    if (auto cached = recentPreview(key, std::chrono::milliseconds(150)); !cached.empty())
+    {
+        return cached;
+    }
     Frame10 small;
     {
         // Sampling 640 pixels across is cheap; the encode runs without the lock.
@@ -2227,28 +2094,27 @@ std::vector<std::uint8_t> Engine::previewJpeg(int channel) const
         }
         small = sampleV210(v210.data(), config_.format.width, config_.format.height, 640);
     }
-    return encodeJpeg422(small, kPreviewQuality);
+    auto jpeg = encodeJpeg422(small, kPreviewQuality);
+    keepPreview(key, jpeg);
+    return jpeg;
 }
 
-std::vector<std::uint8_t> Engine::storedPreview(int camera, std::uint64_t taiNs, int width) const
+std::vector<std::uint8_t> Engine::storedPreview(int camera, std::uint64_t taiNs) const
 {
     FrameRing const* ring = nullptr;
     {
         std::lock_guard lock{mutex_};
         ring = ringOf(camera);
     }
-    // The ring has its own lock; the read and the decode run without the engine lock.
+    // The ring has its own lock; the read and the decode run without the engine lock. The
+    // decode is DCT-scaled (a quarter of 1080p), not a full-size decode.
     auto const stored = ring != nullptr ? ring->findNearest(taiNs) : std::nullopt;
-    if (!stored || stored->jpeg.empty())
+    Frame10 small;
+    if (!stored || stored->jpeg.empty() || !decodeJpegPreview(stored->jpeg.data(), stored->jpeg.size(), 384, small))
     {
         return {};
     }
-    std::vector<std::uint8_t> v210(v210Size(config_.format.width, config_.format.height));
-    if (!decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, v210.data()))
-    {
-        return {};
-    }
-    return encodeJpeg422(sampleV210(v210.data(), config_.format.width, config_.format.height, width), kPreviewQuality);
+    return encodeJpeg422(small, kPreviewQuality);
 }
 
 std::vector<std::uint8_t> Engine::cameraPreviewJpeg(int camera) const
@@ -2257,19 +2123,53 @@ std::vector<std::uint8_t> Engine::cameraPreviewJpeg(int camera) const
     {
         return {};
     }
+    auto const key = "camera:" + std::to_string(camera);
+    if (auto cached = recentPreview(key, std::chrono::seconds(1)); !cached.empty())
+    {
+        return cached;
+    }
     std::uint64_t newest = 0;
     {
         std::lock_guard lock{mutex_};
         auto const* ring = ringOf(camera);
         newest = ring != nullptr ? ring->newestNs() : 0;
     }
-    return newest == 0 ? std::vector<std::uint8_t>{} : storedPreview(camera, newest, 384);
+    auto jpeg = newest == 0 ? std::vector<std::uint8_t>{} : storedPreview(camera, newest);
+    if (!jpeg.empty())
+    {
+        keepPreview(key, jpeg);
+    }
+    return jpeg;
 }
 
 std::vector<std::uint8_t> Engine::clipThumbnailJpeg(std::string const& id) const
 {
-    auto const clip = this->clip(id);
-    return clip.id.empty() ? std::vector<std::uint8_t>{} : storedPreview(clip.camera, clip.inNs, 384);
+    std::uint64_t frame = 0;
+    int camera = 0;
+    {
+        // The IN frame itself, or one within a frame period; not a distant one when IN is gone.
+        std::lock_guard lock{mutex_};
+        auto const clip = catalog_.clip(id);
+        auto const* ring = clip.id.empty() ? nullptr : ringOf(clip.camera);
+        auto const nearest = ring != nullptr ? ring->nearestNs(clip.inNs) : 0;
+        if (nearest == 0 || (nearest > clip.inNs ? nearest - clip.inNs : clip.inNs - nearest) > sourcePeriod(clip.camera))
+        {
+            return {};
+        }
+        frame = nearest;
+        camera = clip.camera;
+    }
+    auto const key = "clip:" + id + ":" + std::to_string(camera) + ":" + std::to_string(frame);
+    if (auto cached = recentPreview(key, std::chrono::milliseconds(0)); !cached.empty())
+    {
+        return cached;
+    }
+    auto jpeg = storedPreview(camera, frame);
+    if (!jpeg.empty())
+    {
+        keepPreview(key, jpeg);
+    }
+    return jpeg;
 }
 
 bool Engine::gpuInterpolate() const

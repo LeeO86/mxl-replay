@@ -150,7 +150,7 @@ function upload() {
       </thead>
       <tbody>
         <tr v-for="clip in rows" :key="clip.id">
-          <td class="thumb-cell"><img :src="`/api/v1/clips/${encodeURIComponent(clip.id)}/thumbnail.jpg?in=${clip.in_ns}`" alt="" loading="lazy" /></td>
+          <td class="thumb-cell"><img :src="`/api/v1/clips/${encodeURIComponent(clip.id)}/thumbnail.jpg?in=${clip.in_ns}`" alt="" loading="lazy" @error="$event.target.style.visibility = 'hidden'" /></td>
           <td>
             <span class="swatch" :style="{ background: clip.colour }"></span> <strong>{{ clip.name }}</strong>
             <div class="muted small">{{ clip.id }}<span v-if="clip.group"> · {{ clip.group }}</span></div>

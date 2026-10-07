@@ -85,6 +85,7 @@ struct HttpServer::Impl
         int fd = -1;
         bool websocket = false;
         std::string buffer;
+        bool closing = false; // shut down by broadcast; the loop closes it
     };
     std::mutex connMu;
     std::vector<Conn> conns;
@@ -111,8 +112,11 @@ struct HttpServer::Impl
                 int const fd = ::accept(listenFd, nullptr, nullptr);
                 if (fd >= 0)
                 {
+                    // A client that stops reading cannot hold the loop for long.
+                    timeval timeout{2, 0};
+                    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
                     std::lock_guard lock{connMu};
-                    conns.push_back(Conn{fd, false, {}});
+                    conns.push_back(Conn{fd, false, {}, false});
                 }
             }
             struct Job
@@ -415,19 +419,45 @@ void HttpServer::broadcast(std::string const& text)
     {
         frame.push_back(static_cast<std::uint8_t>(text.size()));
     }
-    else
+    else if (text.size() < 65536)
     {
         frame.push_back(126);
         frame.push_back(static_cast<std::uint8_t>((text.size() >> 8) & 0xff));
         frame.push_back(static_cast<std::uint8_t>(text.size() & 0xff));
     }
+    else
+    {
+        frame.push_back(127);
+        for (int shift = 56; shift >= 0; shift -= 8)
+        {
+            frame.push_back(static_cast<std::uint8_t>((static_cast<std::uint64_t>(text.size()) >> shift) & 0xff));
+        }
+    }
     frame.insert(frame.end(), text.begin(), text.end());
     std::lock_guard lock{impl_->connMu};
     for (auto& conn : impl_->conns)
     {
-        if (conn.websocket)
+        if (!conn.websocket || conn.closing)
         {
-            sendAll(conn.fd, reinterpret_cast<char const*>(frame.data()), frame.size());
+            continue;
+        }
+        // Never wait for a client: one that cannot take the whole message now (asleep, on a slow
+        // link) is shut down, the loop closes it, and its UI reconnects. A message cut in half
+        // would break the stream anyway.
+        std::size_t sent = 0;
+        while (sent < frame.size())
+        {
+            auto const n = ::send(conn.fd, frame.data() + sent, frame.size() - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (n <= 0)
+            {
+                break;
+            }
+            sent += static_cast<std::size_t>(n);
+        }
+        if (sent < frame.size())
+        {
+            conn.closing = true;
+            ::shutdown(conn.fd, SHUT_RDWR);
         }
     }
 }

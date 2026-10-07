@@ -3,348 +3,19 @@
 #include "config/config.hpp"
 #include "media/timebase.hpp"
 #include "ops/httpserver.hpp"
+#include "util/json.hpp"
 #include "util/logging.hpp"
 #include "version.hpp"
 
 #include <algorithm>
 #include <cctype>
-#include <cerrno>
 #include <cmath>
-#include <cstdlib>
-#include <optional>
 #include <sstream>
-#include <string_view>
 
 namespace replay
 {
 namespace
 {
-// A parsed request body. A number keeps its literal: TAI nanoseconds do not fit a double.
-struct Json
-{
-    enum class Kind
-    {
-        Null,
-        Bool,
-        Number,
-        String,
-        Array,
-        Object
-    };
-    Kind kind = Kind::Null;
-    bool boolean = false;
-    std::string text; // a string's value, or a number's literal
-    std::vector<Json> items;
-    std::vector<std::pair<std::string, Json>> members;
-
-    [[nodiscard]] Json const* get(std::string const& key) const
-    {
-        for (auto const& member : members)
-        {
-            if (member.first == key)
-            {
-                return &member.second;
-            }
-        }
-        return nullptr;
-    }
-};
-
-class JsonReader
-{
-public:
-    explicit JsonReader(std::string const& text)
-        : text_(text)
-    {
-    }
-
-    bool parse(Json& out)
-    {
-        if (!value(out, 0))
-        {
-            return false;
-        }
-        skipSpace();
-        return pos_ == text_.size();
-    }
-
-private:
-    void skipSpace()
-    {
-        while (pos_ < text_.size() && (text_[pos_] == ' ' || text_[pos_] == '\t' || text_[pos_] == '\n' || text_[pos_] == '\r'))
-        {
-            ++pos_;
-        }
-    }
-
-    bool consume(char c)
-    {
-        skipSpace();
-        if (pos_ < text_.size() && text_[pos_] == c)
-        {
-            ++pos_;
-            return true;
-        }
-        return false;
-    }
-
-    bool word(std::string_view literal)
-    {
-        if (text_.compare(pos_, literal.size(), literal) != 0)
-        {
-            return false;
-        }
-        pos_ += literal.size();
-        return true;
-    }
-
-    bool value(Json& out, int depth)
-    {
-        skipSpace();
-        if (pos_ >= text_.size() || depth > 32)
-        {
-            return false;
-        }
-        char const c = text_[pos_];
-        if (c == '{')
-        {
-            ++pos_;
-            out.kind = Json::Kind::Object;
-            if (consume('}'))
-            {
-                return true;
-            }
-            do
-            {
-                skipSpace();
-                std::string key;
-                Json member;
-                if (!string(key) || !consume(':') || !value(member, depth + 1))
-                {
-                    return false;
-                }
-                out.members.emplace_back(std::move(key), std::move(member));
-            } while (consume(','));
-            return consume('}');
-        }
-        if (c == '[')
-        {
-            ++pos_;
-            out.kind = Json::Kind::Array;
-            if (consume(']'))
-            {
-                return true;
-            }
-            do
-            {
-                Json item;
-                if (!value(item, depth + 1))
-                {
-                    return false;
-                }
-                out.items.push_back(std::move(item));
-            } while (consume(','));
-            return consume(']');
-        }
-        if (c == '"')
-        {
-            out.kind = Json::Kind::String;
-            return string(out.text);
-        }
-        if (c == 't' || c == 'f')
-        {
-            out.kind = Json::Kind::Bool;
-            out.boolean = c == 't';
-            return word(out.boolean ? "true" : "false");
-        }
-        if (c == 'n')
-        {
-            return word("null");
-        }
-        return number(out);
-    }
-
-    bool hex4(unsigned& code)
-    {
-        if (pos_ + 4 > text_.size())
-        {
-            return false;
-        }
-        code = 0;
-        for (int i = 0; i < 4; ++i)
-        {
-            char const h = text_[pos_++];
-            code <<= 4;
-            if (h >= '0' && h <= '9')
-            {
-                code |= static_cast<unsigned>(h - '0');
-            }
-            else if (h >= 'a' && h <= 'f')
-            {
-                code |= static_cast<unsigned>(h - 'a' + 10);
-            }
-            else if (h >= 'A' && h <= 'F')
-            {
-                code |= static_cast<unsigned>(h - 'A' + 10);
-            }
-            else
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    static void utf8(unsigned code, std::string& out)
-    {
-        if (code < 0x80)
-        {
-            out.push_back(static_cast<char>(code));
-        }
-        else if (code < 0x800)
-        {
-            out.push_back(static_cast<char>(0xc0 | (code >> 6)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3f)));
-        }
-        else if (code < 0x10000)
-        {
-            out.push_back(static_cast<char>(0xe0 | (code >> 12)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3f)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3f)));
-        }
-        else
-        {
-            out.push_back(static_cast<char>(0xf0 | (code >> 18)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3f)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3f)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3f)));
-        }
-    }
-
-    bool string(std::string& out)
-    {
-        if (pos_ >= text_.size() || text_[pos_] != '"')
-        {
-            return false;
-        }
-        ++pos_;
-        while (pos_ < text_.size())
-        {
-            char const c = text_[pos_++];
-            if (c == '"')
-            {
-                return true;
-            }
-            if (static_cast<unsigned char>(c) < 0x20)
-            {
-                return false;
-            }
-            if (c != '\\')
-            {
-                out.push_back(c);
-                continue;
-            }
-            if (pos_ >= text_.size())
-            {
-                return false;
-            }
-            char const escaped = text_[pos_++];
-            switch (escaped)
-            {
-            case '"':
-            case '\\':
-            case '/':
-                out.push_back(escaped);
-                break;
-            case 'b':
-                out.push_back('\b');
-                break;
-            case 'f':
-                out.push_back('\f');
-                break;
-            case 'n':
-                out.push_back('\n');
-                break;
-            case 'r':
-                out.push_back('\r');
-                break;
-            case 't':
-                out.push_back('\t');
-                break;
-            case 'u':
-            {
-                unsigned code = 0;
-                if (!hex4(code))
-                {
-                    return false;
-                }
-                if (code >= 0xd800 && code < 0xdc00)
-                {
-                    unsigned low = 0;
-                    if (!word("\\u") || !hex4(low) || low < 0xdc00 || low >= 0xe000)
-                    {
-                        return false;
-                    }
-                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
-                }
-                utf8(code, out);
-                break;
-            }
-            default:
-                return false;
-            }
-        }
-        return false;
-    }
-
-    bool number(Json& out)
-    {
-        auto const start = pos_;
-        auto const digits = [&] {
-            auto const from = pos_;
-            while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_])) != 0)
-            {
-                ++pos_;
-            }
-            return pos_ > from;
-        };
-        if (pos_ < text_.size() && text_[pos_] == '-')
-        {
-            ++pos_;
-        }
-        if (!digits())
-        {
-            return false;
-        }
-        if (pos_ < text_.size() && text_[pos_] == '.')
-        {
-            ++pos_;
-            if (!digits())
-            {
-                return false;
-            }
-        }
-        if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E'))
-        {
-            ++pos_;
-            if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-'))
-            {
-                ++pos_;
-            }
-            if (!digits())
-            {
-                return false;
-            }
-        }
-        out.kind = Json::Kind::Number;
-        out.text = text_.substr(start, pos_ - start);
-        return true;
-    }
-
-    std::string const& text_;
-    std::size_t pos_ = 0;
-};
-
 // The request body as a JSON object; an empty body is an empty object.
 bool parseBody(std::string const& text, Json& body)
 {
@@ -353,83 +24,7 @@ bool parseBody(std::string const& text, Json& body)
         body.kind = Json::Kind::Object;
         return true;
     }
-    JsonReader reader(text);
-    return reader.parse(body) && body.kind == Json::Kind::Object;
-}
-
-// Numbers may also come as strings ("0.5"), as earlier clients sent them.
-std::optional<double> toDouble(Json const& value)
-{
-    if ((value.kind != Json::Kind::Number && value.kind != Json::Kind::String) || value.text.empty())
-    {
-        return std::nullopt;
-    }
-    char* end = nullptr;
-    errno = 0;
-    double const result = std::strtod(value.text.c_str(), &end);
-    if (errno != 0 || end != value.text.c_str() + value.text.size() || !std::isfinite(result))
-    {
-        return std::nullopt;
-    }
-    return result;
-}
-
-std::optional<std::int64_t> toInt(Json const& value)
-{
-    if ((value.kind != Json::Kind::Number && value.kind != Json::Kind::String) || value.text.empty())
-    {
-        return std::nullopt;
-    }
-    char* end = nullptr;
-    errno = 0;
-    long long const result = std::strtoll(value.text.c_str(), &end, 10);
-    if (errno != 0 || end != value.text.c_str() + value.text.size())
-    {
-        return std::nullopt;
-    }
-    return static_cast<std::int64_t>(result);
-}
-
-std::optional<std::uint64_t> toUnsigned(Json const& value)
-{
-    if ((value.kind != Json::Kind::Number && value.kind != Json::Kind::String) || value.text.empty() || value.text.front() == '-')
-    {
-        return std::nullopt;
-    }
-    char* end = nullptr;
-    errno = 0;
-    unsigned long long const result = std::strtoull(value.text.c_str(), &end, 10);
-    if (errno != 0 || end != value.text.c_str() + value.text.size())
-    {
-        return std::nullopt;
-    }
-    return static_cast<std::uint64_t>(result);
-}
-
-std::optional<bool> toBool(Json const& value)
-{
-    if (value.kind == Json::Kind::Bool)
-    {
-        return value.boolean;
-    }
-    if (value.text == "true" || value.text == "1")
-    {
-        return true;
-    }
-    if (value.text == "false" || value.text == "0")
-    {
-        return false;
-    }
-    return std::nullopt;
-}
-
-std::optional<std::string> toString(Json const& value)
-{
-    if (value.kind != Json::Kind::String)
-    {
-        return std::nullopt;
-    }
-    return value.text;
+    return parseJson(text, body) && body.kind == Json::Kind::Object;
 }
 
 // Reads the fields of a request body. Each read returns false when the field is absent;
@@ -443,11 +38,11 @@ public:
     }
 
     [[nodiscard]] bool has(char const* key) const { return body_.get(key) != nullptr; }
-    bool number(char const* key, double& value) { return read(key, value, toDouble, "a number"); }
-    bool integer(char const* key, std::int64_t& value) { return read(key, value, toInt, "an integer"); }
-    bool unsignedInt(char const* key, std::uint64_t& value) { return read(key, value, toUnsigned, "a non-negative integer"); }
-    bool boolean(char const* key, bool& value) { return read(key, value, toBool, "true or false"); }
-    bool string(char const* key, std::string& value) { return read(key, value, toString, "a string"); }
+    bool number(char const* key, double& value) { return read(key, value, jsonDouble, "a number"); }
+    bool integer(char const* key, std::int64_t& value) { return read(key, value, jsonInt, "an integer"); }
+    bool unsignedInt(char const* key, std::uint64_t& value) { return read(key, value, jsonUnsigned, "a non-negative integer"); }
+    bool boolean(char const* key, bool& value) { return read(key, value, jsonBool, "true or false"); }
+    bool string(char const* key, std::string& value) { return read(key, value, jsonText, "a string"); }
     void invalid(char const* key, std::string const& expected)
     {
         if (error_.empty())
@@ -610,7 +205,7 @@ std::string playlistJson(Catalog::Playlist const& playlist, std::vector<ClipRef>
             if (clip.id == entry.clipId)
             {
                 double const speed = std::fabs(entry.speed);
-                duration += static_cast<double>(clip.outNs - clip.inNs) / (speed > 0.001 ? speed : 1.0);
+                duration += static_cast<double>(clip.outNs > clip.inNs ? clip.outNs - clip.inNs : 0) / (speed > 0.001 ? speed : 1.0);
             }
         }
     }
@@ -671,9 +266,9 @@ bool readEntries(Json const& body, std::vector<PlaylistEntry>& entries, std::str
                 problem = fields.error();
                 return false;
             }
-            if (entry.speed < -1.0 || entry.speed > 2.0)
+            if (entry.speed < kMinClipSpeed || entry.speed > kMaxClipSpeed)
             {
-                problem = "speed must be between -1 and 2";
+                problem = "an entry's speed must be between 0.01 and 2";
                 return false;
             }
             entries.push_back(entry);
@@ -726,8 +321,9 @@ bool readEntries(Json const& body, std::vector<PlaylistEntry>& entries, std::str
     return true;
 }
 
-// Every clip an entry names must exist.
-std::string unknownClip(std::vector<PlaylistEntry> const& entries, std::vector<ClipRef> const& clips)
+// Every clip an entry names must exist, except clips already in the playlist (`kept`): a deleted
+// clip stays as an entry that is skipped, and the playlist can still be renamed or reordered.
+std::string unknownClip(std::vector<PlaylistEntry> const& entries, std::vector<ClipRef> const& clips, std::vector<PlaylistEntry> const& kept = {})
 {
     for (auto const& entry : entries)
     {
@@ -735,6 +331,10 @@ std::string unknownClip(std::vector<PlaylistEntry> const& entries, std::vector<C
         for (auto const& clip : clips)
         {
             found = found || clip.id == entry.clipId;
+        }
+        for (auto const& old : kept)
+        {
+            found = found || old.clipId == entry.clipId;
         }
         if (!found)
         {
@@ -959,6 +559,8 @@ HttpResponse patchClip(Engine& engine, std::string const& id, Json const& body)
     fields.number("speed", clip.speed);
     fields.string("colour", clip.colour);
     fields.string("tags", clip.tags);
+    bool force = false; // a longer range at the protection cap
+    fields.boolean("force", force);
     std::string text;
     bool ok = true;
     if (fields.string("motion", text))
@@ -1001,15 +603,26 @@ HttpResponse patchClip(Engine& engine, std::string const& id, Json const& body)
     {
         return error(400, "out_ns must not be before in_ns");
     }
-    if (clip.speed < -1.0 || clip.speed > 2.0)
+    // A clip plays forward: at 0 % or backwards it never reaches OUT.
+    if (clip.speed < kMinClipSpeed || clip.speed > kMaxClipSpeed)
     {
-        return error(400, "speed must be between -1 and 2");
+        return error(400, "speed must be between 0.01 and 2");
     }
-    if (!engine.updateClip(clip))
+    switch (engine.updateClip(clip, force))
     {
+    case ClipEdit::Ok:
+        return json(200, clipJson(engine.clip(id), engine.config()));
+    case ClipEdit::Unknown:
         return error(404, "unknown clip");
+    case ClipEdit::NoFrame:
+        return error(400, "no recorded frame at the new IN or OUT");
+    case ClipEdit::OutBeforeIn:
+        return error(400, "OUT is before IN once both are on recorded frames");
+    case ClipEdit::OverCap:
+        return error(409, "protected ranges exceed " + std::to_string(engine.config().protectMaxPct) +
+                              "% of storage; a longer clip needs force, or export or delete clips");
     }
-    return json(200, clipJson(engine.clip(id), engine.config()));
+    return error(500, "unexpected clip edit result");
 }
 } // namespace
 
@@ -1293,7 +906,7 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
                 return error(400, fields.error().empty() ? problem : fields.error());
             }
             auto const clips = engine.clips();
-            if (auto const unknown = unknownClip(entries, clips); !unknown.empty())
+            if (auto const unknown = unknownClip(entries, clips, playlist.entries); !unknown.empty())
             {
                 return error(400, "unknown clip " + unknown);
             }

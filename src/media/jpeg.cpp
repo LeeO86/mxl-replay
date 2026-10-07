@@ -334,6 +334,65 @@ bool decodeJpeg422(std::uint8_t const* data, std::size_t size, Frame10& frame)
     return true;
 }
 
+bool decodeJpegPreview(std::uint8_t const* data, std::size_t size, int minWidth, Frame10& frame)
+{
+    if (data == nullptr || size == 0)
+    {
+        return false;
+    }
+    jpeg_decompress_struct cinfo{};
+    jpeg_error_mgr jerr{};
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, data, static_cast<unsigned long>(size));
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK)
+    {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    unsigned denom = 8;
+    while (denom > 1 && cinfo.image_width / denom < static_cast<unsigned>(std::max(1, minWidth)))
+    {
+        denom /= 2;
+    }
+    cinfo.scale_num = 1;
+    cinfo.scale_denom = denom;
+    cinfo.out_color_space = JCS_YCbCr;
+    jpeg_start_decompress(&cinfo);
+    int const width = static_cast<int>(cinfo.output_width) & ~1;
+    int const height = static_cast<int>(cinfo.output_height);
+    if (width < 2 || height < 1 || cinfo.output_components != 3)
+    {
+        jpeg_abort_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    frame.allocate(width, height);
+    int const cw = width / 2;
+    std::vector<JSAMPLE> line(static_cast<std::size_t>(cinfo.output_width) * 3u);
+    while (cinfo.output_scanline < cinfo.output_height)
+    {
+        auto const row = static_cast<std::size_t>(cinfo.output_scanline);
+        JSAMPROW rows[1] = {line.data()};
+        jpeg_read_scanlines(&cinfo, rows, 1);
+        for (int x = 0; x < width; ++x)
+        {
+            frame.y[row * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] = to10(line[static_cast<std::size_t>(x) * 3u]);
+        }
+        // 4:4:4 output: one chroma pair per two pixels, averaged.
+        for (int x = 0; x < cw; ++x)
+        {
+            auto const a = static_cast<std::size_t>(2 * x) * 3u;
+            auto const b = a + 3u;
+            frame.cb[row * static_cast<std::size_t>(cw) + static_cast<std::size_t>(x)] = static_cast<std::uint16_t>((to10(line[a + 1]) + to10(line[b + 1])) / 2);
+            frame.cr[row * static_cast<std::size_t>(cw) + static_cast<std::size_t>(x)] = static_cast<std::uint16_t>((to10(line[a + 2]) + to10(line[b + 2])) / 2);
+        }
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+}
+
 std::vector<std::uint8_t> encodeJpegV210(std::uint8_t const* v210, int width, int height, int rowBytes, int quality)
 {
     if (width < 2 || height < 1 || (width % 2) != 0)

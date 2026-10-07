@@ -12,6 +12,7 @@ const emit = defineEmits(["close"]);
 
 const dialog = ref(null);
 const message = ref("");
+const conflict = ref(""); // 409: a longer clip at the protection cap
 const busy = ref(false);
 const draft = reactive({ name: "", inFrames: 0, outFrames: 0, speed: 100, motion: "", audio: "", end: "", colour: "", tags: "" });
 
@@ -35,6 +36,7 @@ watch(
       tags: c.tags,
     });
     message.value = "";
+    conflict.value = "";
     dialog.value.showModal();
   },
 );
@@ -45,6 +47,8 @@ const newIn = computed(() => props.clip.in_ns + draft.inFrames * period.value);
 const newOut = computed(() => props.clip.out_ns + draft.outFrames * period.value);
 const length = computed(() => newOut.value - newIn.value);
 const signed = (n) => (n > 0 ? `+${n}` : String(n));
+// A clip plays forward at 1–200 % (0 % would never reach OUT).
+const speedOk = computed(() => typeof draft.speed === "number" && draft.speed >= 1 && draft.speed <= 200);
 const presets = SPEED_PRESETS.map((s) => ({ value: Math.round(s * 100), label: fmtSpeed(s) }));
 const canTakeMarks = computed(() => active.value?.has_in && active.value?.has_out && active.value.out_ns > active.value.in_ns);
 
@@ -57,9 +61,9 @@ function takeMarks() {
   draft.outFrames = Math.round((active.value.out_ns - props.clip.out_ns) / period.value);
 }
 
-async function save() {
+async function save(force = false) {
   const c = props.clip;
-  const body = {};
+  const body = force ? { force: true } : {};
   if (draft.name.trim() && draft.name.trim() !== c.name) body.name = draft.name.trim();
   if (draft.inFrames) body.in_ns = Math.round(newIn.value);
   if (draft.outFrames) body.out_ns = Math.round(newOut.value);
@@ -68,18 +72,21 @@ async function save() {
   // "Camera colour" stores the camera's colour itself.
   const colour = draft.colour || cameraColour(c.camera);
   if (colour !== c.colour) body.colour = colour;
-  if (!Object.keys(body).length) {
+  if (!Object.keys(body).filter((k) => k !== "force").length) {
     emit("close");
     return;
   }
   busy.value = true;
+  message.value = "";
+  conflict.value = "";
   try {
     await api.patch(`/api/v1/clips/${encodeURIComponent(c.id)}`, body);
     state.notice = `Saved ${draft.name.trim() || c.name}.`;
     await refreshLists();
     emit("close");
   } catch (e) {
-    message.value = e.message;
+    if (e.status === 409) conflict.value = e.message;
+    else message.value = e.message;
   } finally {
     busy.value = false;
   }
@@ -109,7 +116,7 @@ async function save() {
         </div>
       </div>
       <div class="row" style="align-items: center; margin-top: 0.5rem">
-        <span class="small">Length {{ fmtNs(length) }} · plays {{ fmtNs(length / Math.max(0.01, draft.speed / 100)) }}</span>
+        <span class="small">Length {{ fmtNs(length) }}<template v-if="speedOk"> · plays {{ fmtNs(length / (draft.speed / 100)) }}</template></span>
         <button type="button" class="btn small secondary" style="flex: none" :disabled="!canTakeMarks" @click="takeMarks">
           Take IN/OUT from {{ active?.label }}
         </button>
@@ -118,7 +125,7 @@ async function save() {
 
       <label>Speed {{ draft.speed }}%</label>
       <div class="row" style="align-items: center">
-        <input v-model.number="draft.speed" type="number" min="0" max="200" step="1" style="flex: 0 0 6rem" aria-label="Speed in percent" />
+        <input v-model.number="draft.speed" type="number" min="1" max="200" step="1" style="flex: 0 0 6rem" :class="{ invalid: !speedOk }" aria-label="Speed in percent" />
         <Segmented v-model="draft.speed" :options="presets" label="Speed preset" />
       </div>
       <div class="grid" style="grid-template-columns: 1fr 1fr 1fr; margin-top: 0.2rem">
@@ -139,10 +146,15 @@ async function save() {
       <ColourPicker v-model="draft.colour" :camera-colour="cameraColour(clip.camera)" />
       <label for="insp-tags">Tags</label>
       <input id="insp-tags" v-model="draft.tags" placeholder="comma separated" />
+      <div v-if="!speedOk" class="msg err">The speed is 1 to 200 %.</div>
+      <div v-if="conflict" class="warnbox">
+        <span>{{ conflict }}</span>
+        <button type="button" class="btn small danger" :disabled="busy" @click="save(true)">Save anyway</button>
+      </div>
       <div v-if="message" class="msg err">{{ message }}</div>
       <div class="actions">
         <button type="button" class="btn secondary" @click="emit('close')">Cancel</button>
-        <button type="submit" class="btn" :disabled="busy || length < 0 || draft.speed < 0 || draft.speed > 200">Save</button>
+        <button type="submit" class="btn" :disabled="busy || length < 0 || !speedOk">Save</button>
       </div>
     </form>
   </dialog>

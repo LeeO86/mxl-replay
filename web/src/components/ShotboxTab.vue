@@ -135,7 +135,7 @@ onUnmounted(() => observer?.disconnect());
         @click="selected = i; shot(item)"
       >
         <div class="thumb">
-          <img v-if="item.kind === 'clip'" :src="`/api/v1/clips/${encodeURIComponent(item.id)}/thumbnail.jpg?in=${item.clip.in_ns}`" alt="" loading="lazy" />
+          <img v-if="item.kind === 'clip'" :src="`/api/v1/clips/${encodeURIComponent(item.id)}/thumbnail.jpg?in=${item.clip.in_ns}`" alt="" loading="lazy" @error="$event.target.style.visibility = 'hidden'" />
           <div v-else class="playlist-mark">PLAYLIST</div>
           <span class="key">{{ i < 10 ? (i + 1) % 10 : "" }}</span>
           <span v-if="STATE_TEXT[shotState(item)]" class="badge-state state-tag" :class="shotState(item)">{{ STATE_TEXT[shotState(item)] }}</span>
