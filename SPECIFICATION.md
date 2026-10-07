@@ -332,6 +332,10 @@ REST under `/api/v1/…` (cameras, channels: transport/position/speed/angle, cli
 playlists, library, uploads, exports, config) and WebSocket `/api/v1/events`
 (positions, states, thumbnails at low rate, alarms) so several UIs stay in sync and
 other systems (e.g. a control surface or a vision mixer macro) can drive the replay.
+Clips are edited with `PATCH /api/v1/clips/{id}` and playlists read, replaced and
+deleted at `/api/v1/playlists/{id}`. Low-rate JPEG previews are served per channel,
+per camera and per clip (`…/preview.jpg`, `/api/v1/clips/{id}/thumbnail.jpg`); the
+status carries the timecodes the UI shows (§5.5), formatted by the server.
 `/livez`, `/readyz`, `/statusz`, `/metrics` on `WEB_PORT`. HTTP starts before the
 retained segments are indexed: `/livez` answers at once, while `/readyz` and the API stay
 503 until the index is built and, when a registry address is set, until the node is

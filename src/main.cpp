@@ -155,6 +155,9 @@ int main(int argc, char** argv)
             });
         }
         auto next = std::chrono::steady_clock::now();
+        // The status goes to the UIs ten times a second; every frame was 50 messages a second
+        // per browser for a UI that draws at 10 Hz.
+        auto nextPush = next;
         std::uint64_t synthetic = 0;
         while (!gStop.load())
         {
@@ -170,9 +173,10 @@ int main(int argc, char** argv)
                 }
                 ++synthetic;
             }
-            if (engine.config().webEnable)
+            if (engine.config().webEnable && std::chrono::steady_clock::now() >= nextPush)
             {
                 server.broadcast(engine.statusJson());
+                nextPush = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
             }
             next += period;
             std::this_thread::sleep_until(next);

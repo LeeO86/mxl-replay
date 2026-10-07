@@ -17,6 +17,10 @@ namespace replay
 
 std::vector<std::uint8_t> encodeJpeg422(Frame10 const& frame, int quality);
 bool decodeJpeg422(std::uint8_t const* data, std::size_t size, Frame10& frame);
+// A small picture for the UI: the JPEG decoded at 1/2, 1/4 or 1/8 of its size with libjpeg's DCT
+// scaling (the smallest of them that is still `minWidth` wide or more), into a 4:2:2 frame.
+// A 1080p frame at 1/4 is 480 × 270 and costs a fraction of a full decode.
+bool decodeJpegPreview(std::uint8_t const* data, std::size_t size, int minWidth, Frame10& frame);
 
 // The same JPEG as encodeJpeg422(unpackV210(v210)), straight from packed v210 (`rowBytes`
 // per line, 0 = v210RowBytes): no 16-bit frame, and the codec and its buffers are kept per

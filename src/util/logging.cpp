@@ -73,7 +73,18 @@ std::string jsonEscape(std::string const& text)
             out += "\\n";
             break;
         default:
-            out.push_back(c);
+            if (static_cast<unsigned char>(c) < 0x20)
+            {
+                // Other control characters (tab, CR …) are not allowed raw in a JSON string.
+                static char const hex[] = "0123456789abcdef";
+                out += "\\u00";
+                out.push_back(hex[(c >> 4) & 0xf]);
+                out.push_back(hex[c & 0xf]);
+            }
+            else
+            {
+                out.push_back(c);
+            }
             break;
         }
     }

@@ -1,6 +1,7 @@
 #include "ops/httpserver.hpp"
 
 #include "config/config.hpp"
+#include "util/logging.hpp"
 #include "util/sha1.hpp"
 
 #include <arpa/inet.h>
@@ -62,6 +63,8 @@ std::string statusText(int status)
         return "Not Found";
     case 409:
         return "Conflict";
+    case 500:
+        return "Internal Server Error";
     case 503:
         return "Service Unavailable";
     default:
@@ -82,6 +85,7 @@ struct HttpServer::Impl
         int fd = -1;
         bool websocket = false;
         std::string buffer;
+        bool closing = false; // shut down by broadcast; the loop closes it
     };
     std::mutex connMu;
     std::vector<Conn> conns;
@@ -108,8 +112,11 @@ struct HttpServer::Impl
                 int const fd = ::accept(listenFd, nullptr, nullptr);
                 if (fd >= 0)
                 {
+                    // A client that stops reading cannot hold the loop for long.
+                    timeval timeout{2, 0};
+                    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
                     std::lock_guard lock{connMu};
-                    conns.push_back(Conn{fd, false, {}});
+                    conns.push_back(Conn{fd, false, {}, false});
                 }
             }
             struct Job
@@ -209,7 +216,19 @@ struct HttpServer::Impl
             std::vector<int> upgraded;
             for (auto const& job : jobs)
             {
-                HttpResponse response = handler ? handler(job.request) : HttpResponse{};
+                HttpResponse response;
+                // A handler that throws answers 500; it must not end the process.
+                try
+                {
+                    response = handler ? handler(job.request) : HttpResponse{};
+                }
+                catch (std::exception const& ex)
+                {
+                    response = HttpResponse{};
+                    response.status = 500;
+                    response.contentType = "application/json";
+                    response.body = "{\"error\":\"" + jsonEscape(ex.what()) + "\"}";
+                }
                 if (response.websocket)
                 {
                     auto const keyIt = job.request.headers.find("sec-websocket-key");
@@ -229,8 +248,9 @@ struct HttpServer::Impl
                     continue;
                 }
                 std::string message = "HTTP/1.1 " + std::to_string(response.status) + " " + statusText(response.status) + "\r\nContent-Type: " +
-                                      response.contentType + "\r\nContent-Length: " + std::to_string(response.body.size()) + "\r\nConnection: close\r\n\r\n" +
-                                      response.body;
+                                      response.contentType + "\r\nContent-Length: " + std::to_string(response.body.size()) +
+                                      (response.cacheControl.empty() ? std::string{} : "\r\nCache-Control: " + response.cacheControl) +
+                                      "\r\nConnection: close\r\n\r\n" + response.body;
                 sendAll(job.fd, message.data(), message.size());
                 drop.push_back(job.fd);
             }
@@ -399,19 +419,45 @@ void HttpServer::broadcast(std::string const& text)
     {
         frame.push_back(static_cast<std::uint8_t>(text.size()));
     }
-    else
+    else if (text.size() < 65536)
     {
         frame.push_back(126);
         frame.push_back(static_cast<std::uint8_t>((text.size() >> 8) & 0xff));
         frame.push_back(static_cast<std::uint8_t>(text.size() & 0xff));
     }
+    else
+    {
+        frame.push_back(127);
+        for (int shift = 56; shift >= 0; shift -= 8)
+        {
+            frame.push_back(static_cast<std::uint8_t>((static_cast<std::uint64_t>(text.size()) >> shift) & 0xff));
+        }
+    }
     frame.insert(frame.end(), text.begin(), text.end());
     std::lock_guard lock{impl_->connMu};
     for (auto& conn : impl_->conns)
     {
-        if (conn.websocket)
+        if (!conn.websocket || conn.closing)
         {
-            sendAll(conn.fd, reinterpret_cast<char const*>(frame.data()), frame.size());
+            continue;
+        }
+        // Never wait for a client: one that cannot take the whole message now (asleep, on a slow
+        // link) is shut down, the loop closes it, and its UI reconnects. A message cut in half
+        // would break the stream anyway.
+        std::size_t sent = 0;
+        while (sent < frame.size())
+        {
+            auto const n = ::send(conn.fd, frame.data() + sent, frame.size() - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (n <= 0)
+            {
+                break;
+            }
+            sent += static_cast<std::size_t>(n);
+        }
+        if (sent < frame.size())
+        {
+            conn.closing = true;
+            ::shutdown(conn.fd, SHUT_RDWR);
         }
     }
 }
