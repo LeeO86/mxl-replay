@@ -113,18 +113,32 @@ Per-camera keys are `CAM1_LABEL`, `CAM1_COLOUR` (alias `CAM1_COLOR`), `CAM1_RECO
 
 ## Operation
 
-The UI is served on `/`. The shotbox is the main page: one click cues a clip, the next plays it, another pauses. Space is play/pause, number keys pick buttons, arrows scrub.
+The UI is served on `/`. The pages are tabs with their own address (`/#shotbox`, `#lsm`, `#library`, `#playlists`, `#cameras`, `#nmos`, `#settings`):
+
+- **Shotbox**: one button per clip and playlist. One click cues it (yellow), the next plays it (green, with progress), the next pauses, the next resumes; an ended shot is grey. *Back to live*, speed presets, and the target channel at the top. Keys: 1–9 and 0 select a button of the bank, Enter cues/plays it, Space is play/pause, PgUp/PgDn change the bank.
+- **LSM**: the channel monitor (a JPEG preview five times a second; full motion is the WebRTC monitor on the channel output), the cameras (click or 1–9 switches the angle), IN/OUT, Go IN/OUT, frame and second steps, Play/Pause/Live, the speed fader with presets and reverse, motion, audio and timecode mode, lock to the first channel, and the buffer timeline (drag to scrub, wheel ±1 frame, Shift ±1 s). *Create clip* asks for name, all angles, colour and tags.
+- **Library**: search, the clip inspector (IN/OUT frame by frame, speed, modes, end action, name, colour, tags), export, consolidate, delete, upload.
+- **Playlists**: entries with their own speed, end action and auto-advance; play on the selected channel. When an entry ends with *next*, auto-advance plays the next clip at once, otherwise it is cued and waits for Play.
+- **Cameras**, **NMOS**, **Settings** (configuration export and import, the keyboard map, a WebHID jog/shuttle).
+
+The default keys are Space play/pause, I/O mark IN/OUT, Shift+I/O go to IN/OUT, ←/→ one frame, Shift+←/→ one second, ↑/↓ speed ±5 %, L live, C create clip; the Settings page changes them (kept in the browser). WebHID works with a Contour ShuttleXpress, ShuttlePRO or ShuttlePRO v2 in Chrome or Edge, on a secure page (https or localhost): the ring sets the speed and plays, the jog wheel steps frames.
 
 HTTP on `WEB_PORT`:
 
 | Method | Path |
 | --- | --- |
 | GET | `/livez`, `/readyz`, `/statusz`, `/metrics`, `/` |
-| GET | `/api/v1/status`, `/api/v1/config`, `/api/v1/config/export`, `/api/v1/nmos`, `/api/v1/clips`, `/api/v1/playlists` |
-| POST | `/api/v1/config/import`, `/api/v1/clips`, `/api/v1/playlists`, `/api/v1/uploads`, `/api/v1/control` |
-| POST | `/api/v1/channels/{n}/transport`, `/api/v1/shotbox/{id}`, `/api/v1/clips/{id}/export`, `/api/v1/clips/{id}/consolidate` |
-| DELETE | `/api/v1/clips/{id}` |
-| WebSocket | `/api/v1/events` |
+| GET | `/api/v1/status`, `/api/v1/config`, `/api/v1/config/export`, `/api/v1/nmos`, `/api/v1/clips`, `/api/v1/playlists`, `/api/v1/playlists/{id}` |
+| GET | `/api/v1/channels/{n}/preview.jpg`, `/api/v1/cameras/{n}/preview.jpg`, `/api/v1/clips/{id}/thumbnail.jpg` |
+| POST | `/api/v1/channels/{n}/transport` (`command`: `play`, `pause`, `live`), `/speed` (`speed`, −1…2), `/position` (`frames`, `seconds` or `tai_ns`), `/marks` (`which`: `in`, `out`, `goto-in`, `goto-out`), `/angle` (`camera`), `/mode` (`motion`, `audio`, `timecode`: `source` or `output`), `/lock` (`enable`) |
+| POST | `/api/v1/clips` (`channel`, `name`, `all_angles`, `force`, `colour`, `tags`), `/api/v1/clips/{id}/export`, `/api/v1/clips/{id}/consolidate`, `/api/v1/shotbox/{id}` (a clip or playlist; `channel`) |
+| POST | `/api/v1/playlists` (`name`, `clips` or `entries`), `/api/v1/playlists/{id}/play` (`channel`), `/api/v1/uploads?name=…` (the file is the body), `/api/v1/config/import`, `/api/v1/control` |
+| PATCH | `/api/v1/clips/{id}` (`name`, `in_ns`, `out_ns`, `speed`, `motion`, `audio`, `end`, `colour`, `tags`) |
+| PUT | `/api/v1/playlists/{id}` (`name`, `entries`: `clip_id`, `speed`, `end`, `auto_advance`) |
+| DELETE | `/api/v1/clips/{id}`, `/api/v1/playlists/{id}` |
+| WebSocket | `/api/v1/events` (the status, every frame) |
+
+Request bodies are JSON objects. A missing or invalid value answers 400 with `{"error": …}`, an unknown channel, camera, clip or playlist 404, and `POST /api/v1/clips` answers 409 when clips already keep `REPLAY_PROTECT_MAX_PCT` of the storage (send `force: true` to create it anyway). Channel commands answer with the status. The status has each channel's timecode as the output carries it (`timecode`) and the source timecode of its position, IN and OUT (`position_tc`, `in_tc`, `out_tc`), all at the house rate, non-drop-frame, from the TAI time of day, and `target_speed`, the speed set on the channel (`speed` ramps to it while playing; a new clip takes `target_speed`). A new IN or OUT sent with `PATCH` lands on the nearest recorded frame. Previews are made on request: 640 pixels wide for a channel (its last output grain), 384 for a camera (its newest frame) and a clip (its IN frame).
 
 `/livez` is 200 as soon as HTTP listens. `/readyz` and the API are 503 (`{"status":"indexing"}`) until the buffer is indexed, then `/readyz` is 200 when the process is serving. If `NMOS_REGISTRY_ADDRESS` is set and NMOS is enabled, it is 200 only after the Query API at `NMOS_QUERY_ADDRESS:NMOS_QUERY_PORT` lists this node. `/metrics` is Prometheus text with the prefix `mxl_replay_`.
 
@@ -165,7 +179,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.2.5
+  ghcr.io/leeo86/mxl-replay:1.3.0
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.

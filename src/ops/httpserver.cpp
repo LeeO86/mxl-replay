@@ -1,6 +1,7 @@
 #include "ops/httpserver.hpp"
 
 #include "config/config.hpp"
+#include "util/logging.hpp"
 #include "util/sha1.hpp"
 
 #include <arpa/inet.h>
@@ -62,6 +63,8 @@ std::string statusText(int status)
         return "Not Found";
     case 409:
         return "Conflict";
+    case 500:
+        return "Internal Server Error";
     case 503:
         return "Service Unavailable";
     default:
@@ -209,7 +212,19 @@ struct HttpServer::Impl
             std::vector<int> upgraded;
             for (auto const& job : jobs)
             {
-                HttpResponse response = handler ? handler(job.request) : HttpResponse{};
+                HttpResponse response;
+                // A handler that throws answers 500; it must not end the process.
+                try
+                {
+                    response = handler ? handler(job.request) : HttpResponse{};
+                }
+                catch (std::exception const& ex)
+                {
+                    response = HttpResponse{};
+                    response.status = 500;
+                    response.contentType = "application/json";
+                    response.body = "{\"error\":\"" + jsonEscape(ex.what()) + "\"}";
+                }
                 if (response.websocket)
                 {
                     auto const keyIt = job.request.headers.find("sec-websocket-key");
@@ -229,8 +244,9 @@ struct HttpServer::Impl
                     continue;
                 }
                 std::string message = "HTTP/1.1 " + std::to_string(response.status) + " " + statusText(response.status) + "\r\nContent-Type: " +
-                                      response.contentType + "\r\nContent-Length: " + std::to_string(response.body.size()) + "\r\nConnection: close\r\n\r\n" +
-                                      response.body;
+                                      response.contentType + "\r\nContent-Length: " + std::to_string(response.body.size()) +
+                                      (response.cacheControl.empty() ? std::string{} : "\r\nCache-Control: " + response.cacheControl) +
+                                      "\r\nConnection: close\r\n\r\n" + response.body;
                 sendAll(job.fd, message.data(), message.size());
                 drop.push_back(job.fd);
             }

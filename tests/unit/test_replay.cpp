@@ -19,6 +19,7 @@
 #include "playout/shotbox.hpp"
 #include "record/hfr.hpp"
 #include "record/ring.hpp"
+#include "util/logging.hpp"
 #include "util/uuid.hpp"
 
 #include <algorithm>
@@ -26,6 +27,8 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <thread>
 
 using namespace replay;
@@ -859,4 +862,261 @@ TEST_CASE("query api readiness uses the node id")
     CHECK(httpGetStatus("127.0.0.1", query.port(), "/x-nmos/query/v1.3/nodes/" + nodeId, 500) == 200);
     CHECK(httpGetStatus("127.0.0.1", query.port(), "/x-nmos/query/v1.3/nodes/missing", 500) == 404);
     query.stop();
+}
+
+TEST_CASE("disk ring keeps a range that a second clip still protects")
+{
+    auto const dir = freshDir("mxl-replay-ring-twice");
+    FrameRing ring(dir.string(), 3600 * kSecond, 1);
+    CHECK(ring.push(frameAt(kSecond, 1)));
+    CHECK(ring.push(frameAt(2 * kSecond, 2)));
+    ring.protect(kSecond, 2 * kSecond);
+    ring.protect(kSecond, 2 * kSecond);
+    ring.unprotect(kSecond, 2 * kSecond);
+    CHECK(ring.isProtected(kSecond));
+    ring.unprotect(2 * kSecond, kSecond);
+    CHECK_FALSE(ring.isProtected(kSecond));
+    CHECK(ring.oldestNs() == kSecond);
+    CHECK(ring.nearestNs(kSecond + kSecond / 3) == kSecond);
+    CHECK(ring.nearestNs(2 * kSecond - kSecond / 3) == 2 * kSecond);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("json strings escape control characters")
+{
+    CHECK(jsonEscape("a\tb\"c") == "a\\u0009b\\\"c");
+}
+
+namespace
+{
+HttpResponse call(Engine& engine, std::string method, std::string path, std::string body = {}, std::string query = {})
+{
+    HttpRequest request;
+    request.method = std::move(method);
+    request.path = std::move(path);
+    request.body = std::move(body);
+    request.query = std::move(query);
+    return handleApi(engine, request, "");
+}
+
+std::string idOf(std::string const& body)
+{
+    auto const start = body.find("\"id\":\"") + 6;
+    return body.substr(start, body.find('"', start) - start);
+}
+
+// One camera with frames 0 … count-1 on the 50p grid (TAI 1000 s onward), one channel.
+std::unique_ptr<Engine> recordedEngine(std::filesystem::path const& dir, int count)
+{
+    auto const loaded = loadConfig(
+        {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+            {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+            {"REPLAY_PROTECT_MAX_PCT", "100"}, {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    auto engine = std::make_unique<Engine>(loaded.config, loaded.flat);
+    engine->openBuffer();
+    for (int i = 0; i < count; ++i)
+    {
+        Frame10 frame;
+        frame.allocate(64, 32);
+        frame.fill(static_cast<std::uint16_t>(100 + i * 20), 512, 512);
+        engine->ingestVideo(1, 1, 1000 * kSecond + static_cast<std::uint64_t>(i) * 20000000ull, std::move(frame));
+    }
+    return engine;
+}
+
+std::uint64_t frameTime(int i)
+{
+    return 1000 * kSecond + static_cast<std::uint64_t>(i) * 20000000ull;
+}
+} // namespace
+
+TEST_CASE("api checks request bodies instead of failing on them")
+{
+    auto const dir = freshDir("mxl-replay-api-checks");
+    auto engine = recordedEngine(dir, 4);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/speed", "{}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/speed", "{\"speed\":\"fast\"}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/speed", "{\"speed\":3}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/speed", "{\"speed\":\"0.5\"}").status == 200);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/speed", "{\"speed\":0.5").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/2/transport", "{\"command\":\"play\"}").status == 404);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/transport", "{\"command\":\"rewind\"}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/marks", "{\"which\":\"middle\"}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/position", "{\"frames\":\"x\"}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/position", "{}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/angle", "{\"camera\":2}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/mode", "{\"motion\":\"warp\",\"audio\":\"stretch\"}").status == 400);
+    CHECK(engine->config().channelList[0].audio == AudioMode::Mute);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/mode", "{\"audio\":\"stretch\",\"timecode\":\"output\"}").status == 200);
+    CHECK(engine->config().channelList[0].audio == AudioMode::Stretch);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/lock", "{}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/control", "{\"channel\":1,\"action\":\"jump\"}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/control", "{\"channel\":\"one\",\"action\":\"play\"}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/clips", "{\"channel\":1}").status == 400); // no marks yet
+    CHECK(call(*engine, "POST", "/api/v1/shotbox/nothing", "{}").status == 404);
+    CHECK(call(*engine, "POST", "/api/v1/uploads", "").status == 400);
+    CHECK(call(*engine, "GET", "/api/v1/cameras/2/preview.jpg").status == 404);
+
+    // A handler that throws answers 500 and the server keeps running.
+    HttpServer server;
+    server.start(0, [](HttpRequest const& request) -> HttpResponse {
+        if (request.path == "/boom")
+        {
+            throw std::runtime_error("boom");
+        }
+        return HttpResponse{};
+    });
+    CHECK(httpGetStatus("127.0.0.1", server.port(), "/boom", 1000) == 500);
+    CHECK(httpGetStatus("127.0.0.1", server.port(), "/", 1000) == 200);
+    server.stop();
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("api edits clips and playlists and serves previews")
+{
+    auto const dir = freshDir("mxl-replay-api-edit");
+    auto engine = recordedEngine(dir, 12);
+    engine->setPosition(1, frameTime(2));
+    engine->markIn(1);
+    engine->setPosition(1, frameTime(6));
+    engine->markOut(1);
+    // Set while paused: the clip keeps the speed that was set, not the one the ramp reached.
+    engine->setSpeed(1, 0.5);
+    auto const created = call(*engine, "POST", "/api/v1/clips", R"({"channel":1,"name":"say \"hi\"\tnow","colour":"#123456","tags":"goal"})");
+    REQUIRE(created.status == 201);
+    auto const id = idOf(created.body);
+    auto clip = engine->clip(id);
+    CHECK(clip.name == "say \"hi\"\tnow");
+    CHECK(clip.colour == "#123456");
+    CHECK(clip.tags == "goal");
+    CHECK(clip.speed == doctest::Approx(0.5));
+    CHECK(engine->statusJson().find("\"target_speed\":0.5") != std::string::npos);
+    auto const list = call(*engine, "GET", "/api/v1/clips").body;
+    CHECK(list.find(R"(say \"hi\"\u0009now)") != std::string::npos);
+    CHECK(list.find("\"in_tc\":\"") != std::string::npos);
+
+    // IN lands on the nearest recorded frame; the other fields change as given.
+    auto const patched = call(*engine, "PATCH", "/api/v1/clips/" + id,
+        "{\"name\":\"goal\",\"in_ns\":" + std::to_string(frameTime(3) + 4000000) + ",\"speed\":0.5,\"end\":\"loop\",\"motion\":\"blend\"}");
+    CHECK(patched.status == 200);
+    clip = engine->clip(id);
+    CHECK(clip.name == "goal");
+    CHECK(clip.inNs == frameTime(3));
+    CHECK(clip.outNs == frameTime(6));
+    CHECK(clip.speed == doctest::Approx(0.5));
+    CHECK(clip.end == EndAction::Loop);
+    CHECK(clip.motion == "blend");
+    CHECK(call(*engine, "PATCH", "/api/v1/clips/" + id, "{\"end\":\"sideways\"}").status == 400);
+    CHECK(call(*engine, "PATCH", "/api/v1/clips/" + id, "{\"out_ns\":" + std::to_string(frameTime(1)) + "}").status == 400);
+    CHECK(call(*engine, "PATCH", "/api/v1/clips/clip-999", "{\"name\":\"x\"}").status == 404);
+
+    // Previews: the channel output, the camera's newest frame, the clip's IN frame.
+    (void)engine->render(1, frameTime(12));
+    auto const preview = call(*engine, "GET", "/api/v1/channels/1/preview.jpg");
+    CHECK(preview.status == 200);
+    CHECK(preview.contentType == "image/jpeg");
+    CHECK(preview.body.rfind("\xff\xd8", 0) == 0);
+    CHECK(call(*engine, "GET", "/api/v1/cameras/1/preview.jpg").body.rfind("\xff\xd8", 0) == 0);
+    auto const thumbnail = call(*engine, "GET", "/api/v1/clips/" + id + "/thumbnail.jpg");
+    CHECK(thumbnail.status == 200);
+    CHECK(thumbnail.cacheControl == "max-age=3600");
+
+    // Playlists: clips as an array, the entries, a replacement, delete.
+    auto const playlist = call(*engine, "POST", "/api/v1/playlists", "{\"name\":\"best\",\"clips\":[\"" + id + "\"]}");
+    REQUIRE(playlist.status == 201);
+    auto const pid = idOf(playlist.body);
+    CHECK(call(*engine, "GET", "/api/v1/playlists/" + pid).body.find("\"clip_id\":\"" + id + "\"") != std::string::npos);
+    CHECK(call(*engine, "GET", "/api/v1/playlists").body.find("\"entries\":1") != std::string::npos);
+    CHECK(call(*engine, "POST", "/api/v1/playlists", "{\"clips\":[\"clip-999\"]}").status == 400);
+    auto const replaced = call(*engine, "PUT", "/api/v1/playlists/" + pid,
+        "{\"name\":\"better\",\"entries\":[{\"clip_id\":\"" + id + "\",\"speed\":0.25,\"end\":\"freeze\",\"auto_advance\":false}]}");
+    CHECK(replaced.status == 200);
+    auto const stored = engine->playlist(pid);
+    CHECK(stored.name == "better");
+    REQUIRE(stored.entries.size() == 1);
+    CHECK(stored.entries[0].speed == doctest::Approx(0.25));
+    CHECK(stored.entries[0].end == EndAction::Freeze);
+    CHECK_FALSE(stored.entries[0].autoAdvance);
+    CHECK(call(*engine, "POST", "/api/v1/playlists/" + pid + "/play", "{\"channel\":1}").status == 200);
+    CHECK(call(*engine, "DELETE", "/api/v1/playlists/" + pid).status == 200);
+    CHECK(call(*engine, "DELETE", "/api/v1/playlists/" + pid).status == 404);
+
+    // An upload takes its name from the query.
+    Frame10 still;
+    still.allocate(64, 32);
+    still.fill(700, 512, 512);
+    auto const jpeg = encodeJpeg422(still, 90);
+    auto const uploaded = call(*engine, "POST", "/api/v1/uploads", std::string(jpeg.begin(), jpeg.end()), "name=My%20still");
+    REQUIRE(uploaded.status == 201);
+    CHECK(engine->clip(idOf(uploaded.body)).name == "My still");
+    // Live after an upload follows a camera again.
+    engine->playClip(1, idOf(uploaded.body));
+    CHECK(engine->render(1, frameTime(13)).camera == kLibraryCamera);
+    engine->live(1);
+    CHECK(engine->render(1, frameTime(14)).camera == 1);
+    CHECK(call(*engine, "DELETE", "/api/v1/clips/" + id).status == 200);
+    CHECK(call(*engine, "DELETE", "/api/v1/clips/" + id).status == 404);
+
+    auto const status = engine->statusJson();
+    CHECK(status.find("\"newest_ns\":" + std::to_string(frameTime(11))) != std::string::npos);
+    CHECK(status.find("\"in_tc\":\"") != std::string::npos);
+    CHECK(status.find("\"tc_mode\":\"source\"") != std::string::npos);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("playlist entries bring their speed, end action and auto-advance; a paused shot resumes")
+{
+    auto const dir = freshDir("mxl-replay-playlist-play");
+    auto engine = recordedEngine(dir, 20);
+    auto const clipFrom = [&](int in, int out) {
+        engine->setPosition(1, frameTime(in));
+        engine->markIn(1);
+        engine->setPosition(1, frameTime(out));
+        engine->markOut(1);
+        std::string error;
+        return engine->createClip(1, "", false, false, error);
+    };
+    auto const first = clipFrom(0, 4);
+    auto const second = clipFrom(10, 14);
+    auto const id = engine->createPlaylist("two", {PlaylistEntry{first, 0.5, EndAction::Next, false}, PlaylistEntry{second, 1.0, EndAction::Freeze, true}});
+    engine->playPlaylist(1, id);
+    CHECK(engine->render(1, 0).speed == doctest::Approx(0.5));
+    // Four frames at half speed are eight output frames; then the second entry is cued, not played.
+    for (int i = 0; i < 10; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    auto status = engine->statusJson();
+    CHECK(status.find("\"shot\":\"cued\"") != std::string::npos);
+    CHECK(status.find("\"clip\":\"" + second + "\"") != std::string::npos);
+    CHECK(status.find("\"playing\":false") != std::string::npos);
+    CHECK(engine->render(1, 0).positionNs == frameTime(10));
+    engine->play(1);
+    for (int i = 0; i < 8; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    status = engine->statusJson();
+    CHECK(status.find("\"shot\":\"ended\"") != std::string::npos);
+    CHECK(status.find("\"playing\":false") != std::string::npos);
+
+    // Shotbox: cue, play, pause, and the next click resumes where it paused.
+    CHECK(engine->shotClick(1, first) == ShotState::Cued);
+    CHECK(engine->render(1, 0).positionNs == frameTime(0));
+    CHECK(engine->shotClick(1, first) == ShotState::Playing);
+    (void)engine->render(1, 0);
+    (void)engine->render(1, 0);
+    CHECK(engine->shotClick(1, first) == ShotState::Paused);
+    auto const paused = engine->render(1, 0).positionNs;
+    CHECK(paused > frameTime(0));
+    CHECK(engine->shotClick(1, first) == ShotState::Playing);
+    CHECK(engine->render(1, 0).positionNs > paused);
+    // A playlist is a shotbox button too.
+    CHECK(engine->shotClick(1, id) == ShotState::Cued);
+    CHECK(engine->statusJson().find("\"playlist\":\"" + id + "\"") != std::string::npos);
+    engine.reset();
+    std::filesystem::remove_all(dir);
 }

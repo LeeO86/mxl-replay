@@ -20,6 +20,8 @@ struct HttpResponse
     int status = 200;
     std::string contentType = "text/plain; charset=utf-8";
     std::string body;
+    // Sent as Cache-Control when not empty.
+    std::string cacheControl;
     bool websocket = false;
 };
 

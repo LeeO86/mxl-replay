@@ -60,6 +60,10 @@ public:
     [[nodiscard]] std::size_t size() const;
     // TAI of the newest frame; 0 when the ring is empty.
     [[nodiscard]] std::uint64_t newestNs() const;
+    // TAI of the oldest frame (a clip can keep it far behind the rest); 0 when the ring is empty.
+    [[nodiscard]] std::uint64_t oldestNs() const;
+    // TAI of the frame nearest `taiNs` from the index alone (no read); 0 when the ring is empty.
+    [[nodiscard]] std::uint64_t nearestNs(std::uint64_t taiNs) const;
     [[nodiscard]] std::size_t protectedCount() const;
     [[nodiscard]] std::uint64_t payloadBytes() const;
     // Bytes of the segments that protected ranges keep: a clip keeps whole segments.

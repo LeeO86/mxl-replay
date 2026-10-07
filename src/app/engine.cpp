@@ -85,19 +85,12 @@ void blendInto(Frame10& a, Frame10 const& b, double phase)
     blend(a.cr, b.cr);
 }
 
-std::vector<std::uint8_t> tinyPreview(Frame10 const& frame)
+// A UI preview `previewWidth` pixels wide, point-sampled from a v210 grain (no full-size 16-bit frame).
+Frame10 sampleV210(std::uint8_t const* v210, int width, int height, int previewWidth)
 {
     Frame10 small;
-    small.allocate(32, 16);
-    scaleFrame(frame, small, ScaleFilter::Bilinear);
-    return encodeJpeg422(small, 70);
-}
-
-// The same 32×16 thumbnail, point-sampled from a v210 grain (no full-size 16-bit frame).
-std::vector<std::uint8_t> tinyPreviewV210(std::uint8_t const* v210, int width, int height)
-{
-    Frame10 small;
-    small.allocate(32, 16);
+    int const outWidth = std::max(2, std::min(previewWidth, width) & ~1);
+    small.allocate(outWidth, std::max(1, height * outWidth / width));
     auto const rowBytes = v210RowBytes(width);
     for (int oy = 0; oy < small.height; ++oy)
     {
@@ -121,22 +114,41 @@ std::vector<std::uint8_t> tinyPreviewV210(std::uint8_t const* v210, int width, i
             }
         }
     }
-    return encodeJpeg422(small, 70);
+    return small;
 }
+
+constexpr int kPreviewQuality = 80;
 
 std::string jsonString(std::string const& text)
 {
-    std::string out = "\"";
-    for (char c : text)
+    return "\"" + jsonEscape(text) + "\"";
+}
+
+// Empty id when there is no playlist `id`.
+Catalog::Playlist findPlaylist(Catalog const& catalog, std::string const& id)
+{
+    for (auto& playlist : catalog.playlists())
     {
-        if (c == '"' || c == '\\')
+        if (playlist.id == id)
         {
-            out.push_back('\\');
+            return playlist;
         }
-        out.push_back(c);
     }
-    out.push_back('"');
-    return out;
+    return {};
+}
+
+// The first entry of the playlist whose clip still exists; -1 when there is none.
+int firstPlayable(Catalog const& catalog, Catalog::Playlist const& playlist, ClipRef& clip)
+{
+    for (std::size_t i = 0; i < playlist.entries.size(); ++i)
+    {
+        clip = catalog.clip(playlist.entries[i].clipId);
+        if (!clip.id.empty())
+        {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
 }
 } // namespace
 
@@ -217,7 +229,6 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
     black.fill(64, 512, 512);
     blackV210_.resize(v210Size(black.width, black.height));
     packV210(black, blackV210_.data(), 0);
-    blackPreview_ = tinyPreview(black);
     for (auto const& channel : config_.channelList)
     {
         ChannelRuntime runtime;
@@ -227,7 +238,6 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         runtime.shot.playOnFirstClick = config_.playOnFirstClick;
         runtime.last = black;
         runtime.lastV210 = blackV210_;
-        runtime.preview = blackPreview_;
         (void)channel;
         channels_.push_back(std::move(runtime));
     }
@@ -407,7 +417,6 @@ void Engine::storeFrame(CameraRuntime& camera, std::uint64_t taiNs, Frame10 cons
     }
     stored.audio = audio;
     pending.push_back(std::move(stored));
-    camera.preview = tinyPreview(frame);
 }
 
 void Engine::pushFrames(CameraRuntime& camera, std::vector<StoredFrame> frames)
@@ -729,7 +738,6 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         if (onGpu)
         {
             rendered.v210 = std::move(gpuPicture.v210);
-            runtime.preview = std::move(gpuPicture.preview);
             runtime.lastV210 = rendered.v210;
             renderedOnGpu = true;
             if (motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate)
@@ -837,29 +845,18 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     {
         rendered.v210 = blackV210_;
         runtime.lastV210 = blackV210_;
-        runtime.preview = blackPreview_;
     }
     else if (directV210)
     {
         runtime.lastV210 = rendered.v210;
-        // The thumbnail is for the UI: every 10th frame is enough.
-        if (runtime.frames % 10 == 0 || runtime.preview.empty())
-        {
-            runtime.preview = tinyPreviewV210(rendered.v210.data(), config_.format.width, config_.format.height);
-        }
     }
     else if (!renderedOnGpu)
     {
         rendered.v210.resize(v210Size(picture.width, picture.height));
         packV210(picture, rendered.v210.data(), 0);
         runtime.lastV210 = rendered.v210;
-        if (runtime.frames % 10 == 0 || runtime.preview.empty())
-        {
-            runtime.preview = tinyPreview(picture);
-        }
         runtime.last = std::move(picture);
     }
-    ++runtime.frames;
     rendered.positionNs = position;
     rendered.speed = runtime.scheduler.speed;
     rendered.motion = motionName(exact && motion == MotionMode::Interpolate ? MotionMode::Repeat : motion);
@@ -868,6 +865,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     auto const tcTai = cfg.timecode == TcMode::Source ? position : outputTaiNs;
     auto const tc = timecodeFromTai(tcTai, config_.format.rateNum, config_.format.rateDen, false);
     rendered.timecode = tc.format();
+    runtime.timecode = rendered.timecode;
     AncPacket packet;
     packet.tc = tc;
     packet.sequence = static_cast<std::uint16_t>(runtime.ancSequence++);
@@ -931,7 +929,14 @@ void Engine::finishClip(int channel)
 {
     auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
     auto clip = catalog_.clip(runtime.clipId);
-    auto const action = clip.id.empty() ? runtime.shot.end : clip.end;
+    // A playlist entry has its own end action and auto-advance.
+    auto const list = runtime.playlistId.empty() ? Catalog::Playlist{} : findPlaylist(catalog_, runtime.playlistId);
+    PlaylistEntry const* entry = nullptr;
+    if (runtime.playlistIndex >= 0 && runtime.playlistIndex < static_cast<int>(list.entries.size()))
+    {
+        entry = &list.entries[static_cast<std::size_t>(runtime.playlistIndex)];
+    }
+    auto const action = entry != nullptr ? entry->end : clip.id.empty() ? runtime.shot.end : clip.end;
     runtime.shot.end = action;
     runtime.shot.finished();
     if (action == EndAction::Loop)
@@ -951,27 +956,30 @@ void Engine::finishClip(int channel)
         runtime.scheduler.playing = false;
         runtime.black = false;
         runtime.clipId.clear();
+        runtime.playlistId.clear();
+        runtime.playlistIndex = -1;
     }
-    else if (action == EndAction::Next && !runtime.playlistId.empty())
+    else if (action == EndAction::Next && entry != nullptr)
     {
-        auto const lists = catalog_.playlists();
-        for (auto const& list : lists)
+        // The next entry whose clip still exists; auto-advance plays it, otherwise it is cued.
+        bool const autoAdvance = entry->autoAdvance;
+        int next = playlistNext(list.entries, runtime.playlistIndex);
+        ClipRef nextClip;
+        while (next >= 0 && (nextClip = catalog_.clip(list.entries[static_cast<std::size_t>(next)].clipId)).id.empty())
         {
-            if (list.id != runtime.playlistId)
-            {
-                continue;
-            }
-            int const next = playlistNext(list.entries, runtime.playlistIndex);
-            if (next < 0)
-            {
-                runtime.scheduler.playing = false;
-                runtime.scheduler.positionNs = static_cast<std::int64_t>(runtime.outNs);
-            }
-            else
-            {
-                runtime.playlistIndex = next;
-                playClip(channel, list.entries[static_cast<std::size_t>(next)].clipId);
-            }
+            next = playlistNext(list.entries, next);
+        }
+        if (next < 0)
+        {
+            runtime.scheduler.playing = false;
+            runtime.scheduler.positionNs = static_cast<std::int64_t>(runtime.outNs);
+        }
+        else
+        {
+            runtime.playlistIndex = next;
+            cueClip(channel, nextClip, &list.entries[static_cast<std::size_t>(next)]);
+            runtime.scheduler.playing = autoAdvance;
+            runtime.shot.state = autoAdvance ? ShotState::Playing : ShotState::Cued;
         }
     }
     else
@@ -1019,7 +1027,14 @@ void Engine::live(int channel)
     runtime.liveMode = true;
     runtime.black = false;
     runtime.scheduler.playing = false;
+    // Uploads have no live picture: after one, live follows the first camera.
+    if (runtime.scheduler.camera == kLibraryCamera)
+    {
+        runtime.scheduler.camera = 1;
+    }
     runtime.clipId.clear();
+    runtime.playlistId.clear();
+    runtime.playlistIndex = -1;
     runtime.shot.state = ShotState::Idle;
 }
 
@@ -1181,7 +1196,8 @@ void Engine::setLock(int channel, bool enabled)
     config_.channelList[static_cast<std::size_t>(channel - 1)].lockToFirst = enabled;
 }
 
-std::string Engine::createClip(int channel, std::string const& name, bool allAngles, bool force, std::string& error)
+std::string Engine::createClip(int channel, std::string const& name, bool allAngles, bool force, std::string& error, std::string const& colour,
+    std::string const& tags)
 {
     std::lock_guard lock{mutex_};
     error.clear();
@@ -1228,13 +1244,19 @@ std::string Engine::createClip(int channel, std::string const& name, bool allAng
         clip.camera = camera;
         clip.inNs = runtime.inNs;
         clip.outNs = runtime.outNs;
-        clip.speed = runtime.scheduler.speed;
+        // The speed the operator set (a ramp only runs while playing).
+        clip.speed = runtime.scheduler.targetSpeed;
         clip.motion = motionName(config_.channelList[static_cast<std::size_t>(channel - 1)].motion);
         clip.audio = audioModeName(config_.channelList[static_cast<std::size_t>(channel - 1)].audio);
-        if (cameraCfg != nullptr)
+        if (!colour.empty())
+        {
+            clip.colour = colour;
+        }
+        else if (cameraCfg != nullptr)
         {
             clip.colour = cameraCfg->colour;
         }
+        clip.tags = tags;
         clip.end = EndAction::Freeze;
         clip.groupId = allAngles ? group : "";
         catalog_.upsertClip(clip);
@@ -1250,37 +1272,57 @@ std::string Engine::createClip(int channel, std::string const& name, bool allAng
     return first;
 }
 
-void Engine::updateClip(ClipRef clip)
+bool Engine::updateClip(ClipRef clip)
 {
     std::lock_guard lock{mutex_};
-    if (clip.id.empty())
-    {
-        return;
-    }
-    auto existing = catalog_.clip(clip.id);
+    auto const existing = clip.id.empty() ? ClipRef{} : catalog_.clip(clip.id);
     if (existing.id.empty())
     {
-        return;
+        return false;
     }
     if (clip.name.empty())
     {
         clip.name = existing.name;
     }
-    catalog_.upsertClip(clip);
-    if (auto* ring = ringOf(clip.camera))
+    // A new IN or OUT lands on the nearest recorded frame (an index lookup, no read).
+    if (auto const* ring = ringOf(clip.camera))
     {
-        ring->protect(clip.inNs, clip.outNs);
+        auto const period = sourcePeriod(clip.camera);
+        auto const snap = [&](std::uint64_t ns) {
+            auto const nearest = ring->nearestNs(ns);
+            return nearest != 0 && (nearest > ns ? nearest - ns : ns - nearest) <= period ? nearest : ns;
+        };
+        clip.inNs = clip.inNs == existing.inNs ? clip.inNs : snap(clip.inNs);
+        clip.outNs = clip.outNs == existing.outNs ? clip.outNs : snap(clip.outNs);
     }
+    catalog_.upsertClip(clip);
+    // The protected range moves with IN and OUT.
+    if (existing.camera != clip.camera || existing.inNs != clip.inNs || existing.outNs != clip.outNs)
+    {
+        if (auto* ring = ringOf(existing.camera))
+        {
+            ring->unprotect(existing.inNs, existing.outNs);
+        }
+        if (auto* ring = ringOf(clip.camera))
+        {
+            ring->protect(clip.inNs, clip.outNs);
+        }
+    }
+    return true;
 }
 
-void Engine::deleteClip(std::string const& id)
+bool Engine::deleteClip(std::string const& id)
 {
     FrameRing* ring = nullptr;
     {
         std::lock_guard lock{mutex_};
         auto clip = catalog_.clip(id);
+        if (clip.id.empty())
+        {
+            return false;
+        }
         catalog_.deleteClip(id);
-        ring = clip.id.empty() ? nullptr : ringOf(clip.camera);
+        ring = ringOf(clip.camera);
         if (ring != nullptr)
         {
             ring->unprotect(clip.inNs, clip.outNs);
@@ -1291,12 +1333,40 @@ void Engine::deleteClip(std::string const& id)
     {
         ring->enforceRetention();
     }
+    return true;
 }
 
 std::vector<ClipRef> Engine::clips() const
 {
     std::lock_guard lock{mutex_};
     return catalog_.clips();
+}
+
+ClipRef Engine::clip(std::string const& id) const
+{
+    std::lock_guard lock{mutex_};
+    return catalog_.clip(id);
+}
+
+void Engine::cueClip(int channel, ClipRef const& clip, PlaylistEntry const* entry)
+{
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    runtime.liveMode = false;
+    runtime.black = false;
+    runtime.clipId = clip.id;
+    runtime.hasIn = true;
+    runtime.hasOut = true;
+    runtime.inNs = clip.inNs;
+    runtime.outNs = clip.outNs;
+    runtime.scheduler.camera = clip.camera;
+    runtime.scheduler.positionNs = static_cast<std::int64_t>(clip.inNs);
+    runtime.scheduler.setTargetSpeed(entry != nullptr ? entry->speed : clip.speed, 0);
+    runtime.scheduler.playing = false;
+    runtime.shot.end = entry != nullptr ? entry->end : clip.end;
+    runtime.fadeFramesLeft = 0;
+    bool ok = false;
+    config_.channelList[static_cast<std::size_t>(channel - 1)].motion = parseMotion(clip.motion, &ok);
+    config_.channelList[static_cast<std::size_t>(channel - 1)].audio = parseAudioMode(clip.audio, &ok);
 }
 
 void Engine::playClip(int channel, std::string const& clipId)
@@ -1311,27 +1381,15 @@ void Engine::playClip(int channel, std::string const& clipId)
         return;
     }
     auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
-    runtime.liveMode = false;
-    runtime.black = false;
-    runtime.clipId = clip.id;
-    runtime.hasIn = true;
-    runtime.hasOut = true;
-    runtime.inNs = clip.inNs;
-    runtime.outNs = clip.outNs;
-    runtime.scheduler.camera = clip.camera;
-    runtime.scheduler.positionNs = static_cast<std::int64_t>(clip.inNs);
-    runtime.scheduler.setTargetSpeed(clip.speed, 0);
+    runtime.playlistId.clear();
+    runtime.playlistIndex = -1;
+    cueClip(channel, clip, nullptr);
     runtime.scheduler.playing = true;
     runtime.shot.clipId = clip.id;
-    runtime.shot.end = clip.end;
     runtime.shot.state = ShotState::Playing;
-    runtime.fadeFramesLeft = 0;
-    bool ok = false;
-    config_.channelList[static_cast<std::size_t>(channel - 1)].motion = parseMotion(clip.motion, &ok);
-    config_.channelList[static_cast<std::size_t>(channel - 1)].audio = parseAudioMode(clip.audio, &ok);
 }
 
-ShotState Engine::shotClick(int channel, std::string const& clipId)
+ShotState Engine::shotClick(int channel, std::string const& id)
 {
     std::lock_guard lock{mutex_};
     if (channel < 1 || channel > static_cast<int>(channels_.size()))
@@ -1339,35 +1397,40 @@ ShotState Engine::shotClick(int channel, std::string const& clipId)
         return ShotState::Idle;
     }
     auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
-    if (runtime.clipId != clipId)
+    // A clip, or a playlist that starts with its first clip that still exists.
+    auto clip = catalog_.clip(id);
+    auto const list = clip.id.empty() ? findPlaylist(catalog_, id) : Catalog::Playlist{};
+    int const first = clip.id.empty() ? firstPlayable(catalog_, list, clip) : -1;
+    if (clip.id.empty())
+    {
+        return runtime.shot.state;
+    }
+    if (runtime.shot.clipId != id)
     {
         runtime.shot.state = ShotState::Idle;
-        runtime.shot.clipId = clipId;
+        runtime.shot.clipId = id;
     }
     runtime.shot.playOnFirstClick = config_.playOnFirstClick;
+    auto const before = runtime.shot.state;
     auto const state = runtime.shot.click();
-    if (state == ShotState::Cued)
-    {
-        auto clip = catalog_.clip(clipId);
-        if (!clip.id.empty())
-        {
-            runtime.scheduler.positionNs = static_cast<std::int64_t>(clip.inNs);
-            runtime.scheduler.playing = false;
-            runtime.liveMode = false;
-            runtime.clipId = clipId;
-            runtime.inNs = clip.inNs;
-            runtime.outNs = clip.outNs;
-            runtime.hasIn = true;
-            runtime.hasOut = true;
-        }
-    }
-    else if (state == ShotState::Playing)
-    {
-        playClip(channel, clipId);
-    }
-    else if (state == ShotState::Paused)
+    if (state == ShotState::Paused)
     {
         runtime.scheduler.playing = false;
+    }
+    else if (state == ShotState::Playing && (before == ShotState::Paused || before == ShotState::Cued))
+    {
+        // Resume where it stands (the cue put it on IN).
+        runtime.liveMode = false;
+        runtime.black = false;
+        runtime.scheduler.playing = true;
+    }
+    else
+    {
+        // Cue, or play from the start (play on first click, or after the clip ended).
+        runtime.playlistId = first >= 0 ? id : std::string{};
+        runtime.playlistIndex = first;
+        cueClip(channel, clip, first >= 0 ? &list.entries[static_cast<std::size_t>(first)] : nullptr);
+        runtime.scheduler.playing = state == ShotState::Playing;
     }
     return runtime.shot.state;
 }
@@ -1383,10 +1446,31 @@ std::string Engine::createPlaylist(std::string const& name, std::vector<Playlist
     return playlist.id;
 }
 
-void Engine::deletePlaylist(std::string const& id)
+bool Engine::updatePlaylist(Catalog::Playlist const& playlist)
 {
     std::lock_guard lock{mutex_};
+    if (findPlaylist(catalog_, playlist.id).id.empty())
+    {
+        return false;
+    }
+    auto stored = playlist;
+    if (stored.name.empty())
+    {
+        stored.name = stored.id;
+    }
+    catalog_.upsertPlaylist(stored);
+    return true;
+}
+
+bool Engine::deletePlaylist(std::string const& id)
+{
+    std::lock_guard lock{mutex_};
+    if (findPlaylist(catalog_, id).id.empty())
+    {
+        return false;
+    }
     catalog_.deletePlaylist(id);
+    return true;
 }
 
 std::vector<Catalog::Playlist> Engine::playlists() const
@@ -1395,18 +1479,33 @@ std::vector<Catalog::Playlist> Engine::playlists() const
     return catalog_.playlists();
 }
 
+Catalog::Playlist Engine::playlist(std::string const& id) const
+{
+    std::lock_guard lock{mutex_};
+    return findPlaylist(catalog_, id);
+}
+
 void Engine::playPlaylist(int channel, std::string const& id)
 {
     std::lock_guard lock{mutex_};
-    for (auto const& playlist : catalog_.playlists())
+    if (channel < 1 || channel > static_cast<int>(channels_.size()))
     {
-        if (playlist.id == id && !playlist.entries.empty())
-        {
-            channels_[static_cast<std::size_t>(channel - 1)].playlistId = id;
-            channels_[static_cast<std::size_t>(channel - 1)].playlistIndex = 0;
-            playClip(channel, playlist.entries[0].clipId);
-        }
+        return;
     }
+    auto const list = findPlaylist(catalog_, id);
+    ClipRef clip;
+    int const first = firstPlayable(catalog_, list, clip);
+    if (first < 0)
+    {
+        return;
+    }
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    runtime.playlistId = id;
+    runtime.playlistIndex = first;
+    cueClip(channel, clip, &list.entries[static_cast<std::size_t>(first)]);
+    runtime.scheduler.playing = true;
+    runtime.shot.clipId = id;
+    runtime.shot.state = ShotState::Playing;
 }
 
 std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::string const& name, std::string& error)
@@ -2113,12 +2212,64 @@ Route Engine::route(int camera, int phase, bool video) const
 
 std::vector<std::uint8_t> Engine::previewJpeg(int channel) const
 {
-    std::lock_guard lock{mutex_};
-    if (channel < 1 || channel > static_cast<int>(channels_.size()))
+    Frame10 small;
+    {
+        // Sampling 640 pixels across is cheap; the encode runs without the lock.
+        std::lock_guard lock{mutex_};
+        if (channel < 1 || channel > static_cast<int>(channels_.size()))
+        {
+            return {};
+        }
+        auto const& v210 = channels_[static_cast<std::size_t>(channel - 1)].lastV210;
+        if (v210.size() < v210Size(config_.format.width, config_.format.height))
+        {
+            return {};
+        }
+        small = sampleV210(v210.data(), config_.format.width, config_.format.height, 640);
+    }
+    return encodeJpeg422(small, kPreviewQuality);
+}
+
+std::vector<std::uint8_t> Engine::storedPreview(int camera, std::uint64_t taiNs, int width) const
+{
+    FrameRing const* ring = nullptr;
+    {
+        std::lock_guard lock{mutex_};
+        ring = ringOf(camera);
+    }
+    // The ring has its own lock; the read and the decode run without the engine lock.
+    auto const stored = ring != nullptr ? ring->findNearest(taiNs) : std::nullopt;
+    if (!stored || stored->jpeg.empty())
     {
         return {};
     }
-    return channels_[static_cast<std::size_t>(channel - 1)].preview;
+    std::vector<std::uint8_t> v210(v210Size(config_.format.width, config_.format.height));
+    if (!decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, v210.data()))
+    {
+        return {};
+    }
+    return encodeJpeg422(sampleV210(v210.data(), config_.format.width, config_.format.height, width), kPreviewQuality);
+}
+
+std::vector<std::uint8_t> Engine::cameraPreviewJpeg(int camera) const
+{
+    if (camera < 1)
+    {
+        return {};
+    }
+    std::uint64_t newest = 0;
+    {
+        std::lock_guard lock{mutex_};
+        auto const* ring = ringOf(camera);
+        newest = ring != nullptr ? ring->newestNs() : 0;
+    }
+    return newest == 0 ? std::vector<std::uint8_t>{} : storedPreview(camera, newest, 384);
+}
+
+std::vector<std::uint8_t> Engine::clipThumbnailJpeg(std::string const& id) const
+{
+    auto const clip = this->clip(id);
+    return clip.id.empty() ? std::vector<std::uint8_t>{} : storedPreview(clip.camera, clip.inNs, 384);
 }
 
 bool Engine::gpuInterpolate() const
@@ -2162,7 +2313,18 @@ std::string Engine::statusJson() const
 {
     std::lock_guard lock{mutex_};
     std::ostringstream out;
-    out << "{\"version\":\"" << REPLAY_VERSION << "\",\"format\":" << jsonString(config_.format.token()) << ",\"gpu\":" << (gpuInterpolate() ? "true" : "false")
+    auto const period = framePeriodNs(config_.format.rateNum, config_.format.rateDen);
+    auto const now = taiNowNs();
+    auto const tc = [&](std::int64_t ns) {
+        return jsonString(formatTimecode(static_cast<std::uint64_t>(std::max<std::int64_t>(0, ns)), config_.format.rateNum, config_.format.rateDen));
+    };
+    auto const routeState = [&](int camera, int phase, bool video) {
+        auto const it = routes_.find(std::to_string(camera) + (video ? "v" : "a") + std::to_string(phase));
+        return jsonString(it == routes_.end() ? std::string{} : it->second.state);
+    };
+    out << "{\"version\":\"" << REPLAY_VERSION << "\",\"mxl\":\"" << REPLAY_MXL_REVISION << "\",\"nmos_cpp\":\"" << REPLAY_NMOS_CPP_REVISION
+        << "\",\"label\":" << jsonString(deviceLabel(config_)) << ",\"tai_ns\":" << now << ",\"frame_ns\":" << period
+        << ",\"format\":" << jsonString(config_.format.token()) << ",\"gpu\":" << (gpuInterpolate() ? "true" : "false")
         << ",\"flow\":" << jsonString(flowModuleName(config_.flowModule)) << ",\"preset\":" << jsonString(presetName(config_.preset))
         << ",\"storage_bps\":" << storageBps_ << ",\"free_bytes\":" << freeBytes() << ",\"jpeg\":\"" << jpegRuntimeBackend()
         << "\",\"jpeg_bit_depth\":" << jpegStorageBitDepth()
@@ -2179,7 +2341,17 @@ std::string Engine::statusJson() const
             << ",\"record\":" << (cfg.record ? "true" : "false") << ",\"phases\":" << cfg.phases << ",\"hfr_factor\":" << hfrFactor(cfg.index)
             << ",\"frames\":" << camera.ring.size() << ",\"dropped\":" << camera.dropped << ",\"phase_missing\":" << camera.phaseMissing
             << ",\"scaled\":" << (camera.scaled ? "true" : "false") << ",\"protected_bytes\":" << camera.ring.protectedBytes()
-            << ",\"disk_bytes\":" << camera.ring.diskBytes() << ",\"segments\":" << camera.ring.segmentCount() << '}';
+            << ",\"disk_bytes\":" << camera.ring.diskBytes() << ",\"segments\":" << camera.ring.segmentCount();
+        // The buffer on the timeline; recording: a frame within the last second.
+        auto const newest = camera.ring.newestNs();
+        out << ",\"oldest_ns\":" << camera.ring.oldestNs() << ",\"newest_ns\":" << newest << ",\"buffer_hours\":" << cfg.bufferHours
+            << ",\"recording\":" << (cfg.record && newest != 0 && newest + 1000000000ull >= now ? "true" : "false")
+            << ",\"audio_record\":" << (cfg.audio ? "true" : "false") << ",\"video_states\":[";
+        for (int phase = 1; phase <= cfg.phases; ++phase)
+        {
+            out << (phase > 1 ? "," : "") << routeState(cfg.index, phase, true);
+        }
+        out << "],\"audio_state\":" << routeState(cfg.index, 1, false) << '}';
     }
     out << "],\"channels\":[";
     for (std::size_t i = 0; i < channels_.size(); ++i)
@@ -2192,10 +2364,17 @@ std::string Engine::statusJson() const
         auto const& cfg = config_.channelList[i];
         out << "{\"index\":" << cfg.index << ",\"label\":" << jsonString(cfg.label) << ",\"live\":" << (channel.liveMode ? "true" : "false")
             << ",\"playing\":" << (channel.scheduler.playing ? "true" : "false") << ",\"speed\":" << channel.scheduler.speed
+            << ",\"target_speed\":" << channel.scheduler.targetSpeed
             << ",\"position_ns\":" << channel.scheduler.positionNs << ",\"camera\":" << channel.scheduler.camera
             << ",\"motion\":" << jsonString(motionName(cfg.motion)) << ",\"audio\":" << jsonString(audioModeName(cfg.audio))
             << ",\"shot\":" << jsonString(shotStateName(channel.shot.state)) << ",\"clip\":" << jsonString(channel.clipId)
-            << ",\"in_ns\":" << channel.inNs << ",\"out_ns\":" << channel.outNs << ",\"lock\":" << (cfg.lockToFirst ? "true" : "false") << '}';
+            << ",\"in_ns\":" << channel.inNs << ",\"out_ns\":" << channel.outNs << ",\"lock\":" << (cfg.lockToFirst ? "true" : "false")
+            << ",\"has_in\":" << (channel.hasIn ? "true" : "false") << ",\"has_out\":" << (channel.hasOut ? "true" : "false")
+            << ",\"black\":" << (channel.black ? "true" : "false") << ",\"timecode\":" << jsonString(channel.timecode)
+            << ",\"tc_mode\":" << jsonString(tcModeName(cfg.timecode)) << ",\"position_tc\":" << tc(channel.scheduler.positionNs)
+            << ",\"in_tc\":" << tc(static_cast<std::int64_t>(channel.inNs)) << ",\"out_tc\":" << tc(static_cast<std::int64_t>(channel.outNs))
+            << ",\"shot_id\":" << jsonString(channel.shot.clipId) << ",\"playlist\":" << jsonString(channel.playlistId)
+            << ",\"playlist_index\":" << channel.playlistIndex << '}';
     }
     out << "]}";
     return out.str();

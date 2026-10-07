@@ -87,17 +87,29 @@ public:
     void setTimecodeMode(int channel, TcMode mode);
     void setLock(int channel, bool enabled);
 
-    // Empty id and a message in error when protection would exceed the cap.
-    std::string createClip(int channel, std::string const& name, bool allAngles, bool force, std::string& error);
-    void updateClip(ClipRef clip);
-    void deleteClip(std::string const& id);
+    // Empty id and a message in error when protection would exceed the cap. An empty colour
+    // keeps the camera's colour.
+    std::string createClip(int channel, std::string const& name, bool allAngles, bool force, std::string& error, std::string const& colour = {},
+        std::string const& tags = {});
+    // Stores the clip's fields and moves its protected range. False when the id is unknown.
+    bool updateClip(ClipRef clip);
+    // False when the id is unknown.
+    bool deleteClip(std::string const& id);
     [[nodiscard]] std::vector<ClipRef> clips() const;
-    ShotState shotClick(int channel, std::string const& clipId);
+    // Empty id when unknown.
+    [[nodiscard]] ClipRef clip(std::string const& id) const;
+    // A shotbox button: a clip id or a playlist id. One click cues, the next plays, the next
+    // pauses, the next resumes (REPLAY_PLAY_ON_FIRST_CLICK: play, pause, resume).
+    ShotState shotClick(int channel, std::string const& id);
     void playClip(int channel, std::string const& clipId);
 
     std::string createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries);
-    void deletePlaylist(std::string const& id);
+    // False when the id is unknown.
+    bool updatePlaylist(Catalog::Playlist const& playlist);
+    bool deletePlaylist(std::string const& id);
     [[nodiscard]] std::vector<Catalog::Playlist> playlists() const;
+    // Empty id when unknown.
+    [[nodiscard]] Catalog::Playlist playlist(std::string const& id) const;
     void playPlaylist(int channel, std::string const& id);
 
     std::string upload(std::uint8_t const* data, std::size_t size, std::string const& name, std::string& error);
@@ -117,7 +129,12 @@ public:
     ImportResult importConfigJson(std::string const& body);
 
     [[nodiscard]] std::string statusJson() const;
+    // UI previews, made on request (nothing is spent while no UI asks): the channel's last
+    // output grain, 640 pixels wide; the camera's newest recorded frame and a clip's IN frame,
+    // 384 pixels wide. Empty when there is no such channel, camera, clip or frame.
     [[nodiscard]] std::vector<std::uint8_t> previewJpeg(int channel) const;
+    [[nodiscard]] std::vector<std::uint8_t> cameraPreviewJpeg(int camera) const;
+    [[nodiscard]] std::vector<std::uint8_t> clipThumbnailJpeg(std::string const& id) const;
     [[nodiscard]] bool gpuInterpolate() const;
     void setGpuPresent(bool present);
 
@@ -145,7 +162,6 @@ private:
         std::uint64_t dropped = 0;
         std::uint64_t phaseMissing = 0;
         bool scaled = false;
-        std::vector<std::uint8_t> preview;
         CameraRuntime(std::string directory, std::uint64_t retentionNs, int segmentSeconds);
     };
     struct ChannelRuntime
@@ -164,10 +180,9 @@ private:
         int fadeFramesLeft = 0;
         Frame10 last;
         std::vector<std::uint8_t> lastV210;
-        std::vector<std::uint8_t> preview;
+        std::string timecode; // of the last output grain (its ANC)
         std::uint64_t late = 0;
         std::uint64_t ancSequence = 0;
-        std::uint64_t frames = 0; // rendered, for the thumbnail rate of the CPU path
     };
 
     // Encode into `pending`; pushFrames() writes them after the engine lock is released.
@@ -184,6 +199,11 @@ private:
     // whether a frame exists; false with found set means it is not in the house format.
     bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found) const;
     void finishClip(int channel);
+    // Puts the channel on the clip's IN (camera, marks, speed, modes); `entry` is the playlist
+    // entry being played, which brings its own speed and end action. Lock held.
+    void cueClip(int channel, ClipRef const& clip, PlaylistEntry const* entry);
+    // The stored frame nearest taiNs as a JPEG `width` pixels wide; empty when there is none.
+    [[nodiscard]] std::vector<std::uint8_t> storedPreview(int camera, std::uint64_t taiNs, int width) const;
     [[nodiscard]] std::uint64_t sourcePeriod(int camera) const;
     [[nodiscard]] double hfrFactor(int camera) const;
     void loadRoutes();
@@ -198,9 +218,8 @@ private:
     mutable std::recursive_mutex mutex_;
     std::vector<CameraRuntime> cameras_;
     std::unique_ptr<FrameRing> library_;
-    // One black grain and its thumbnail, made once (idle and black channels).
+    // One black grain, made once (idle and black channels).
     std::vector<std::uint8_t> blackV210_;
-    std::vector<std::uint8_t> blackPreview_;
     // One upload at a time: each starts after the library's newest frame.
     std::mutex uploadMutex_;
     std::atomic<bool> bufferReady_{false};

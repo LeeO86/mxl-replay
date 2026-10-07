@@ -690,10 +690,18 @@ void FrameRing::unprotect(std::uint64_t beginNs, std::uint64_t endNs)
 {
     auto& d = *impl_;
     std::lock_guard lock{d.mutex};
-    d.ranges.erase(std::remove_if(d.ranges.begin(), d.ranges.end(),
-                       [&](ProtectRange const& range) { return range.beginNs == beginNs && range.endNs == endNs; }),
-        d.ranges.end());
-    for (auto it = d.lower(std::min(beginNs, endNs)); it != d.index.end() && it->taiNs <= std::max(beginNs, endNs); ++it)
+    if (endNs < beginNs)
+    {
+        std::swap(beginNs, endNs);
+    }
+    // One range only: two clips can protect the same range, and deleting one keeps the other.
+    auto const match = std::find_if(
+        d.ranges.begin(), d.ranges.end(), [&](ProtectRange const& range) { return range.beginNs == beginNs && range.endNs == endNs; });
+    if (match != d.ranges.end())
+    {
+        d.ranges.erase(match);
+    }
+    for (auto it = d.lower(beginNs); it != d.index.end() && it->taiNs <= endNs; ++it)
     {
         d.setProtect(*it, covered(d.ranges, it->taiNs));
     }
@@ -782,6 +790,19 @@ std::uint64_t FrameRing::newestNs() const
 {
     std::lock_guard lock{impl_->mutex};
     return impl_->index.empty() ? 0 : impl_->index.back().taiNs;
+}
+
+std::uint64_t FrameRing::oldestNs() const
+{
+    std::lock_guard lock{impl_->mutex};
+    return impl_->index.empty() ? 0 : impl_->index.front().taiNs;
+}
+
+std::uint64_t FrameRing::nearestNs(std::uint64_t taiNs) const
+{
+    std::lock_guard lock{impl_->mutex};
+    auto const it = impl_->nearest(taiNs);
+    return it == impl_->index.end() ? 0 : it->taiNs;
 }
 
 std::size_t FrameRing::protectedCount() const

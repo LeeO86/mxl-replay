@@ -112,7 +112,6 @@ struct Nv
     // Which source frame slots[0] and slots[1] hold: consecutive output frames reuse
     // the same pair (slow motion) or one of it, so it is not decoded again.
     std::string slotKey[2];
-    DevPlanes preview;
     Buffer packed;
     Buffer pinned;
     std::map<std::string, DevFlow> flows;
@@ -137,7 +136,6 @@ struct Nv
         {
             releasePlanes(slot);
         }
-        releasePlanes(preview);
         nvjpegEncoderParamsDestroy(params);
         nvjpegEncoderStateDestroy(encoder);
         nvjpegJpegStateDestroy(decoder);
@@ -776,23 +774,6 @@ __global__ void blendKernel(std::uint8_t const* ay, std::uint8_t const* acb, std
     }
 }
 
-__global__ void copyPlanesKernel(std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int inPitchY, int inPitchC, int width, int height,
-    std::uint8_t* oy, std::uint8_t* ocb, std::uint8_t* ocr, int outPitchY, int outPitchC)
-{
-    int const x = blockIdx.x * blockDim.x + threadIdx.x;
-    int const row = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || row >= height)
-    {
-        return;
-    }
-    oy[row * outPitchY + x] = y[row * inPitchY + x];
-    if ((x & 1) == 0 && x / 2 < width / 2)
-    {
-        ocb[row * outPitchC + x / 2] = cb[row * inPitchC + x / 2];
-        ocr[row * outPitchC + x / 2] = cr[row * inPitchC + x / 2];
-    }
-}
-
 // v210 kernels: one thread per 6-pixel group (launch with v210Grid). One thread per
 // row, as before, kept the GPU nearly idle and took milliseconds per frame.
 dim3 v210Grid(int width, int height)
@@ -993,21 +974,6 @@ std::vector<std::uint8_t> downloadV210(DevPlanes const& planes)
     return std::vector<std::uint8_t>(pinned, pinned + bytes);
 }
 
-std::vector<std::uint8_t> previewOf(DevPlanes const& planes)
-{
-    auto& small = nv().preview;
-    if (!ensureSlot(small, 32, 16))
-    {
-        return {};
-    }
-    // Nearest sample into the preview slot, then a tiny nvJPEG download.
-    copyPlanesKernel<<<grid2(std::min(planes.width, 32), std::min(planes.height, 16)), block2(), 0, nv().stream>>>(planes.y, planes.cb, planes.cr, planes.pitchY,
-        planes.pitchC, std::min(planes.width, 32), std::min(planes.height, 16), small.y, small.cb, small.cr, small.pitchY, small.pitchC);
-    std::vector<std::uint8_t> bytes;
-    encodePlanes(small, 70, bytes);
-    return bytes;
-}
-
 DevFlow cachedFlow(std::string const& key, DevPlanes const& a, DevPlanes const& b, OperatingPoint const& op)
 {
     auto& state = nv();
@@ -1127,7 +1093,6 @@ bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string
         return false;
     }
     out.v210 = downloadV210(*source);
-    out.preview = previewOf(*source);
     return !out.v210.empty();
 }
 

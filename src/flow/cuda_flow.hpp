@@ -25,11 +25,10 @@ namespace replay
 struct GpuPicture
 {
     std::vector<std::uint8_t> v210;
-    std::vector<std::uint8_t> preview;
 };
 
 // Decode JPEG bitstreams on the device, run blend or DIS interpolation there,
-// pack v210 there, and download only the packed grain plus a small preview.
+// pack v210 there, and download only the packed grain (UI previews are made from it on request).
 // Returns false when there is no device or nvJPEG rejects the bitstream; the
 // caller then uses the CPU path.
 // keyA and keyB name the source frames (camera and time): a frame still decoded on the
