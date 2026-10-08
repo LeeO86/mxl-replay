@@ -11,6 +11,7 @@
 #include "media/jpeg.hpp"
 #include "media/timebase.hpp"
 #include "media/v210.hpp"
+#include "mxl/io.hpp"
 #include "nmos/ids.hpp"
 #include "ops/httpserver.hpp"
 #include "ops/api.hpp"
@@ -125,6 +126,26 @@ TEST_CASE("phased HFR repeats a missing phase")
     CHECK(sawRepeat);
     CHECK(result.frames[0].timeNs <= result.frames[1].timeNs);
     CHECK(result.frames[1].timeNs <= result.frames[2].timeNs);
+}
+
+TEST_CASE("a grain the writer never wrote is not a drop, a grain the reader missed is")
+{
+    std::uint64_t const start = 1000000000000ull;
+    std::uint64_t const history = 49 * 20000000ull; // 50 grains at 50p
+    ReaderWait wait;
+    // Following the writer: a grain that left the history was missed (the encode stalled).
+    CHECK(wait.lateIsDrop(start, history));
+    // The writer had not written the reader's grain; 5 ms later it is gone: the writer
+    // started after it (a player that opens its flows before it writes).
+    wait.wait(start);
+    CHECK_FALSE(wait.lateIsDrop(start + 5000000, history));
+    // Longer than the history between two looks: the writer may have written it meanwhile.
+    CHECK(wait.lateIsDrop(start + history, history));
+    // Unknown history: every late grain counts, as before.
+    CHECK(wait.lateIsDrop(start + 5000000, 0));
+    // A grain read ends the wait.
+    wait.read();
+    CHECK(wait.lateIsDrop(start + 5000000, history));
 }
 
 namespace

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.1
+
+- Grains a source never wrote no longer count as dropped. A camera that connects before its writer writes (the test player creates its flows first, then starts its outputs; a source that restarts) waits at its first grain. 1.3.0 then counted every grain up to the writer's first one, one by one as each never-written slot left the flow's one-second history, and started recording a second late from the oldest grain, where the first encodes cost a few real grains. That was the "dropped 50 at start" on the platform. Now an unwritten grain behind the writer's head is skipped at once, and a grain that left the history while the reader waited for it is not counted. A source that stops for more than a second no longer counts either. A recorder that falls behind its source still counts every grain it missed. Lab, 2 cameras on a test player, per camera: player started after the replay 3–15 → 0 drops (5 starts), player restarted 2–10 → 0, player frozen 3 s 106–107 → 0, replay frozen 2 s 57–65 → 55–64 (real, still counted). No settings change.
+
 ## 1.3.0
 
 - New web UI in the look of the other LeeO86 media functions (header with recording, storage, GPU and connection pills, banners for errors, indexing and lost updates, tabs with `#hash` routing). Every API function has a control:
