@@ -249,6 +249,9 @@ void MxlBridge::readInput(int camera, int phase)
         mxlInstance instance = nullptr;
         mxlFlowReader reader = nullptr;
         std::uint64_t next = 0;
+        // Video only: how long the flow keeps a grain, and whether the reader waits for its writer.
+        std::uint64_t historyNs = 0;
+        ReaderWait wait;
     };
     Input input;
     auto close = [](Input& open, bool pinned) {
@@ -379,6 +382,16 @@ void MxlBridge::readInput(int camera, int phase)
             engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
             return false;
         }
+        if (input.historyNs == 0)
+        {
+            // A grain is readable while the writer writes the next grainCount - 1 grains.
+            mxlFlowConfigInfo info{};
+            if (mxlFlowReaderGetConfigInfo(input.reader, &info) == MXL_STATUS_OK && info.common.grainRate.numerator > 0 && info.discrete.grainCount > 1)
+            {
+                auto const period = framePeriodNs(static_cast<int>(info.common.grainRate.numerator), static_cast<int>(info.common.grainRate.denominator));
+                input.historyNs = (info.discrete.grainCount - 1) * static_cast<std::uint64_t>(period);
+            }
+        }
         // Stay two grains behind the current index, as before, and read every grain since the last one.
         auto const now = mxlTimestampToIndex(&rate, mxlGetTime());
         auto const last = now > 2 ? now - 2 : now;
@@ -394,11 +407,26 @@ void MxlBridge::readInput(int camera, int phase)
             auto const status = mxlFlowReaderGetGrainNonBlocking(input.reader, input.next, &info, &payload);
             if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
             {
-                engine_.countDropped(camera, 1);
+                // Gone from the history. Not a drop when the reader was waiting for it: the
+                // writer started (or resumed) after it, so it was never written.
+                if (input.wait.lateIsDrop(mxlGetTime(), input.historyNs))
+                {
+                    engine_.countDropped(camera, 1);
+                }
                 continue;
             }
             if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
             {
+                // Still incomplete although the writer's head is past it: a writer that started
+                // or resumed after this grain never writes it (one that moves on marks a grain
+                // it gave up as invalid). Skip it instead of waiting until the history drops it.
+                mxlFlowRuntimeInfo runtime{};
+                if (mxlFlowReaderGetRuntimeInfo(input.reader, &runtime) == MXL_STATUS_OK && runtime.headIndex > input.next &&
+                    mxlFlowReaderGetGrainNonBlocking(input.reader, input.next, &info, &payload) == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
+                {
+                    continue;
+                }
+                input.wait.wait(mxlGetTime());
                 break;
             }
             if (status != MXL_STATUS_OK)
@@ -407,6 +435,7 @@ void MxlBridge::readInput(int camera, int phase)
                 engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
                 break;
             }
+            input.wait.read();
             if (payload != nullptr && (info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
             {
                 if (withAudio)

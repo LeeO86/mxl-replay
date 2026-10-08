@@ -386,7 +386,9 @@ document. There are no secret settings.
 | `NMOS_DNS_SD`, `NMOS_PORT`, `NMOS_SEED`, `NMOS_LABEL`, `NMOS_TAGS`, `NMOS_HOST_ADDRESS` | false, 3302, `HOST_ID-replay`, unset, `{}`, first non-loopback IPv4 |
 | `WEB_PORT` / `SHUTDOWN_TIMEOUT_S` | 8150 / 10 |
 
-Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`,
+Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`
+(grains the source wrote that were not recorded; grains it never wrote, before it
+started or while it stopped, do not count),
 `storage_write_failed_total` (frames lost to a full disk or an I/O error),
 `phase_missing_total`, `buffer_seconds`, `jpeg_encode_seconds`; per channel
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,
