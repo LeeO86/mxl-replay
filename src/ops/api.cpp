@@ -663,7 +663,7 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
         engine.updateMetrics();
         auto& metrics = engine.metrics();
         metrics.set("free_bytes", {}, static_cast<double>(engine.freeBytes()));
-        metrics.set("write_bytes_per_second", {}, engine.storageBytesPerSecond());
+        metrics.set("storage_measured_bytes_per_second", {}, engine.storageBytesPerSecond());
         response.body = metrics.render();
         return response;
     }

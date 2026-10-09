@@ -94,6 +94,8 @@ struct Config
     double hfrSnap = 0.1;
     int segmentSeconds = 10;
     int liveDelayFrames = 2;
+    // A connected camera input that records nothing for this long logs recording_stopped.
+    double inputStallS = 2;
     bool playOnFirstClick = false;
     bool allowCpuInterp = false;
     double storageMinMbps = 100;

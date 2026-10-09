@@ -80,6 +80,7 @@ Process state (the SQLite catalog, imported settings, and IS-05 routes) lives in
 | `REPLAY_HFR_SNAP` | 0.1 |
 | `REPLAY_SEGMENT_SECONDS` | 10 |
 | `REPLAY_LIVE_DELAY_FRAMES` | 2 |
+| `REPLAY_INPUT_STALL_S` | 2. A connected camera input that records nothing for this many seconds logs `recording_stopped` (0.1–3600) |
 | `REPLAY_PLAY_ON_FIRST_CLICK` | false |
 | `REPLAY_ALLOW_CPU_INTERP` | false |
 | `REPLAY_STORAGE_MIN_MBPS` | 100 |
@@ -144,13 +145,13 @@ Request bodies are JSON objects. A missing or invalid value answers 400 with `{"
 
 On SIGTERM the process stops playout, releases MXL readers and writers, removes its NMOS resources so the registry receives DELETEs, and, when `MXL_CLEANUP_ON_EXIT=true`, deletes only its own output domain. It then exits 143. Work still running after `SHUTDOWN_TIMEOUT_S` is abandoned.
 
-Playout channels are NMOS senders (video `video/v210`, audio `audio/float32`, data `video/smpte291`) in the replay's own domain, labelled `<channel label> Video`, `Audio` and `Data`. Inputs are receivers, labelled `<camera label> Video` and `Audio` the same way. A receiver accepts activation before the flow exists and stays `waiting` until the grain can be read. Camera audio (`CAM<n>_AUDIO`, default on) is stored with each video frame: the frame's samples of a 48 kHz `audio/float32` flow, first two channels, mono doubled. Another sample rate leaves the audio receiver `unsupported`. An HFR camera takes its audio with phase 1. The process does not write into a mirror domain.
+Playout channels are NMOS senders (video `video/v210`, audio `audio/float32`, data `video/smpte291`) in the replay's own domain, labelled `<channel label> Video`, `Audio` and `Data`. Inputs are receivers, labelled `<camera label> Video` and `Audio` the same way. A receiver accepts activation before the flow exists and stays `waiting` until the grain can be read. A connected camera input that records nothing for `REPLAY_INPUT_STALL_S` (its writer stopped or restarted, the flow was removed, a fabrics mirror lost its link) logs `recording_stopped` once, with `camera`, `phase` and `reason` (`no_grains`; `invalid_grains`: grains arrive but are invalid or incomplete; `flow_missing`: the flow cannot be opened). Recording resumes by itself when grains come back, also on a flow that was removed and created again, and logs `recording_resumed` with the `gap_ms`. Nothing is stored for the gap. Camera audio (`CAM<n>_AUDIO`, default on) is stored with each video frame: the frame's samples of a 48 kHz `audio/float32` flow, first two channels, mono doubled. Another sample rate leaves the audio receiver `unsupported`. An HFR camera takes its audio with phase 1. The process does not write into a mirror domain.
 
 `REPLAY_SYNTHETIC=true` feeds a moving test raster into the recorder so the UI and the integration test can run without other MXL flows.
 
 ## Metrics
 
-Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, and `disk_bytes`. Channels report state, speed, and late grains. `frame_gpu_seconds` is a histogram labelled by stage. Storage reports write rate, free bytes, and protected bytes. A Grafana dashboard is in `deploy/grafana/`.
+Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, `disk_bytes`, and `record_last_frame_age_seconds`: seconds since the camera's newest recorded frame, counted from the process start at most. It stays below 0.1 s while the camera records and grows when it does not (also when it is not connected or `CAM<n>_RECORD` is off); the status has it per camera as `last_frame_age_s`. Channels report state, speed, and late grains. `frame_gpu_seconds` is a histogram labelled by stage. Storage reports `write_bytes_per_second` (what the recorder wrote since the previous scrape, over at least a second: 0 when nothing records), `storage_measured_bytes_per_second` (the write test at start, `storage_bps` in the status), free bytes, and protected bytes. A Grafana dashboard is in `deploy/grafana/`.
 
 ## Deploy
 
@@ -179,7 +180,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.3.1
+  ghcr.io/leeo86/mxl-replay:1.3.2
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.

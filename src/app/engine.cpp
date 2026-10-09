@@ -151,6 +151,14 @@ int firstPlayable(Catalog const& catalog, Catalog::Playlist const& playlist, Cli
     }
     return -1;
 }
+
+// Seconds from a camera's newest recorded frame to `nowNs`, counted from the start at most (a
+// camera that has recorded nothing since the start, or nothing at all).
+double lastFrameAge(std::uint64_t newestNs, std::uint64_t startedNs, std::uint64_t nowNs)
+{
+    auto const last = std::max(newestNs, startedNs);
+    return nowNs > last ? static_cast<double>(nowNs - last) / 1e9 : 0.0;
+}
 } // namespace
 
 Engine::CameraRuntime::CameraRuntime(std::string directory, std::uint64_t retentionNs, int segmentSeconds)
@@ -162,6 +170,7 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
     : config_(std::move(config))
     , settings_(std::move(settings))
     , ids_(makeNmosIds(config_.nmosSeed))
+    , startedNs_(taiNowNs())
 {
     std::error_code ec;
     std::filesystem::create_directories(config_.stateDir, ec);
@@ -426,13 +435,20 @@ void Engine::pushFrames(CameraRuntime& camera, std::vector<StoredFrame> frames)
 {
     // The ring has its own lock: a slow disk stalls this camera only, not the channels.
     std::uint64_t recorded = 0;
+    std::uint64_t bytes = 0;
     for (auto& frame : frames)
     {
-        recorded += camera.ring.push(std::move(frame)) ? 1 : 0;
+        auto const size = frame.jpeg.size() + frame.audio.size() * sizeof(float);
+        if (camera.ring.push(std::move(frame)))
+        {
+            ++recorded;
+            bytes += size;
+        }
     }
     std::lock_guard lock{mutex_};
     camera.recorded += recorded;
     camera.dropped += frames.size() - recorded;
+    writtenBytes_ += bytes;
 }
 
 void Engine::flushHouse(CameraRuntime& camera, CameraConfig const& cfg, std::vector<StoredFrame>& pending)
@@ -2182,14 +2198,23 @@ void Engine::setGpuPresent(bool present)
     gpu_ = present || cudaFlowAvailable();
 }
 
-void Engine::updateMetrics()
+void Engine::updateMetrics(std::chrono::steady_clock::time_point now)
 {
     std::lock_guard lock{mutex_};
+    if (auto const elapsed = std::chrono::duration<double>(now - rateAt_).count(); elapsed >= 1)
+    {
+        writeBps_ = static_cast<double>(writtenBytes_ - rateBytes_) / elapsed;
+        rateBytes_ = writtenBytes_;
+        rateAt_ = now;
+    }
+    metrics_.set("write_bytes_per_second", {}, writeBps_);
+    auto const tai = taiNowNs();
     for (std::size_t i = 0; i < cameras_.size(); ++i)
     {
         auto const& camera = cameras_[i];
         Labels const labels{{"camera", std::to_string(config_.cameras[i].index)}};
         metrics_.set("record_frames_total", labels, static_cast<double>(camera.recorded));
+        metrics_.set("record_last_frame_age_seconds", labels, lastFrameAge(camera.ring.newestNs(), startedNs_, tai));
         metrics_.set("record_dropped_total", labels, static_cast<double>(camera.dropped));
         metrics_.set("phase_missing_total", labels, static_cast<double>(camera.phaseMissing));
         // Frames lost to a full disk or an I/O error (also part of record_dropped_total).
@@ -2246,6 +2271,7 @@ std::string Engine::statusJson() const
         auto const newest = camera.ring.newestNs();
         out << ",\"oldest_ns\":" << camera.ring.oldestNs() << ",\"newest_ns\":" << newest << ",\"buffer_hours\":" << cfg.bufferHours
             << ",\"recording\":" << (cfg.record && newest != 0 && newest + 1000000000ull >= now ? "true" : "false")
+            << ",\"last_frame_age_s\":" << lastFrameAge(newest, startedNs_, now)
             << ",\"audio_record\":" << (cfg.audio ? "true" : "false") << ",\"video_states\":[";
         for (int phase = 1; phase <= cfg.phases; ++phase)
         {
