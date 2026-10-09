@@ -155,10 +155,12 @@ public:
     [[nodiscard]] bool gpuInterpolate() const;
     void setGpuPresent(bool present);
 
+    // The write throughput measured at start.
     [[nodiscard]] double storageBytesPerSecond() const { return storageBps_; }
     [[nodiscard]] std::uint64_t freeBytes() const;
-    // Sets the per-camera recorder and storage metrics (called by /metrics).
-    void updateMetrics();
+    // Sets the per-camera recorder and storage metrics (called by /metrics). The recorder's write
+    // rate is taken over the time since the last call, at least a second.
+    void updateMetrics(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
 private:
     struct PhaseSlot
@@ -261,6 +263,13 @@ private:
     std::map<std::string, FlowPair> flowCache_;
     bool gpu_ = false;
     double storageBps_ = 0;
+    // Bytes the recorder wrote, and the write rate made from them by updateMetrics.
+    std::uint64_t writtenBytes_ = 0;
+    std::uint64_t rateBytes_ = 0;
+    std::chrono::steady_clock::time_point rateAt_ = std::chrono::steady_clock::now();
+    double writeBps_ = 0;
+    // TAI at construction: a camera's last-frame age counts from here at most.
+    std::uint64_t startedNs_ = 0;
     std::uint64_t clipSerial_ = 1;
     std::string libraryDir_;
 };

@@ -148,6 +148,43 @@ TEST_CASE("a grain the writer never wrote is not a drop, a grain the reader miss
     CHECK(wait.lateIsDrop(start + 5000000, history));
 }
 
+TEST_CASE("an input without new grains stops once and resumes with its gap")
+{
+    std::uint64_t const start = 1000000000000ull;
+    std::uint64_t const second = 1000000000ull;
+    InputWatch watch{2 * second};
+    // Not connected yet: nothing to watch.
+    CHECK_FALSE(watch.idle(start + 10 * second));
+    watch.connect(start);
+    watch.recorded(start + second);
+    // Grains every 20 ms, then the writer goes away: nothing until the timeout after the last one.
+    CHECK_FALSE(watch.idle(start + 2 * second));
+    CHECK_FALSE(watch.idle(start + 3 * second - 1));
+    CHECK(watch.idle(start + 3 * second));
+    CHECK(watch.reason(true) == std::string("no_grains"));
+    CHECK(watch.reason(false) == std::string("flow_missing"));
+    // Logged once, not on every step while it stays stopped.
+    CHECK_FALSE(watch.idle(start + 4 * second));
+    CHECK_FALSE(watch.idle(start + 60 * second));
+    // The flow is back: the gap is the time since the last recorded grain.
+    CHECK(watch.recorded(start + 8 * second) == 7 * second);
+    CHECK_FALSE(watch.stopped);
+    // A grain while running reports no gap; grains that arrive but cannot be recorded do not count.
+    CHECK(watch.recorded(start + 8 * second + 20000000) == 0);
+    watch.skipped = 3;
+    CHECK(watch.idle(start + 11 * second));
+    CHECK(watch.reason(true) == std::string("invalid_grains"));
+    // A camera connected while its flow is missing stops after the timeout as well.
+    InputWatch missing{2 * second};
+    missing.connect(start);
+    CHECK_FALSE(missing.idle(start + second));
+    CHECK(missing.idle(start + 2 * second));
+    // A clock that steps back does not stop an input.
+    InputWatch back{2 * second};
+    back.connect(start);
+    CHECK_FALSE(back.idle(start - 10 * second));
+}
+
 namespace
 {
 constexpr std::uint64_t kSecond = 1000000000ull;
@@ -759,6 +796,41 @@ TEST_CASE("metrics render the replay prefix")
     CHECK(text.find("mxl_replay_frame_gpu_seconds_bucket") != std::string::npos);
 }
 
+TEST_CASE("last-frame age and write rate follow the recorder, and the rate drops to 0 when idle")
+{
+    auto const dir = freshDir("mxl-replay-stall");
+    std::map<std::string, std::string> env{{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "2"}, {"REPLAY_CHANNELS", "1"},
+        {"REPLAY_BUFFER_HOURS", "0.01"}, {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()},
+        {"REPLAY_STORAGE_MIN_MBPS", "0"}, {"NMOS_HOST_ADDRESS", "10.1.2.3"}, {"HOST_ID", "test-host"}};
+    Engine engine(loadConfig(env, {}).config);
+    engine.openBuffer();
+    auto const value = [&](std::string const& series) {
+        auto const text = engine.metrics().render();
+        auto const at = text.find("mxl_replay_" + series + " ");
+        REQUIRE(at != std::string::npos);
+        return std::stod(text.substr(at + series.size() + 12));
+    };
+    auto const start = std::chrono::steady_clock::now();
+    auto const now = taiNowNs();
+    for (std::uint64_t i = 0; i < 5; ++i)
+    {
+        Frame10 frame;
+        frame.allocate(64, 32);
+        frame.fill(300, 512, 512);
+        engine.ingestVideo(1, 1, now - (4 - i) * 20000000ull, std::move(frame));
+    }
+    engine.updateMetrics(start + std::chrono::seconds(1));
+    CHECK(value("write_bytes_per_second") > 0);
+    CHECK(value("record_last_frame_age_seconds{camera=\"1\"}") < 1);
+    // Camera 2 has recorded nothing: its age counts from the start.
+    CHECK(value("record_last_frame_age_seconds{camera=\"2\"}") >= 0);
+    CHECK(engine.statusJson().find("\"last_frame_age_s\":") != std::string::npos);
+    // Nothing written for another second: the rate is 0, not the last value.
+    engine.updateMetrics(start + std::chrono::milliseconds(2001));
+    CHECK(value("write_bytes_per_second") == 0);
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("platform settings keep aliases and reject bad values")
 {
     std::map<std::string, std::string> env{{"NMOS_HOST_ADDRESS", "10.8.0.4"}, {"NMOS_REGISTRY_PORT", "4000"}, {"HOST_ID", "pod"}};
@@ -771,6 +843,7 @@ TEST_CASE("platform settings keep aliases and reject bad values")
     CHECK(loaded.config.cleanupOnExit == false);
     CHECK(loaded.config.shutdownTimeoutS == 10);
     CHECK(loaded.config.historyDurationNs == 2000000000ull);
+    CHECK(loaded.config.inputStallS == 2);
     CHECK(nodeLabel(loaded.config) == "pod");
     CHECK(deviceLabel(loaded.config) == "MXL Replay");
     CHECK(loaded.config.outputDomainId == makeNmosIds(loaded.config.nmosSeed).domain);
@@ -801,6 +874,8 @@ TEST_CASE("platform settings keep aliases and reject bad values")
     CHECK_THROWS_AS(loadConfig({{"NMOS_HOST_ADDRESS", "127.0.0.1"}}, {}), ConfigError);
     CHECK_THROWS_AS(loadConfig({{"NMOS_TAGS", "[]"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
     CHECK_THROWS_AS(loadConfig({{"WEB_PORT", "nope"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
+    CHECK(loadConfig({{"REPLAY_INPUT_STALL_S", "0.5"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}).config.inputStallS == 0.5);
+    CHECK_THROWS_AS(loadConfig({{"REPLAY_INPUT_STALL_S", "0"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
 }
 
 TEST_CASE("output domain is created once and only removed when the id matches")

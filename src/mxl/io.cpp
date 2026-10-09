@@ -349,6 +349,11 @@ void MxlBridge::readInput(int camera, int phase)
         if (status != MXL_STATUS_OK || slices.count == 0)
         {
             ++audioMisses;
+            if (status == MXL_ERR_FLOW_INVALID)
+            {
+                // Removed or created again (its writer restarted): open it again with the next frame.
+                close(audio, false);
+            }
             return {};
         }
         audioMisses = 0;
@@ -369,17 +374,31 @@ void MxlBridge::readInput(int camera, int phase)
         audioRoute(route, "running");
         return pcm;
     };
+    // Logs once when the camera input stops (InputWatch) and again when it resumes.
+    InputWatch watch{static_cast<std::uint64_t>(cfg.inputStallS * 1e9)};
+    LogFields const where{{"camera", std::to_string(camera)}, {"phase", std::to_string(phase)}};
+    auto stalled = [&](bool open) {
+        if (watch.idle(mxlGetTime()))
+        {
+            auto fields = where;
+            fields.emplace_back("reason", watch.reason(open));
+            logWarn("recording_stopped", fields);
+        }
+    };
     // Reads (and encodes) every grain due since the last call; false when nothing was read.
     auto step = [&]() -> bool {
         auto const route = engine_.route(camera, phase, true);
         if (!route.active || route.flowId.empty() || route.domainId.empty())
         {
             close(input, true);
+            watch = InputWatch{watch.timeoutNs};
             return false;
         }
+        watch.connect(mxlGetTime());
         if (!attach(input, route, true))
         {
             engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
+            stalled(false);
             return false;
         }
         if (input.historyNs == 0)
@@ -424,6 +443,7 @@ void MxlBridge::readInput(int camera, int phase)
                 if (mxlFlowReaderGetRuntimeInfo(input.reader, &runtime) == MXL_STATUS_OK && runtime.headIndex > input.next &&
                     mxlFlowReaderGetGrainNonBlocking(input.reader, input.next, &info, &payload) == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
                 {
+                    ++watch.skipped;
                     continue;
                 }
                 input.wait.wait(mxlGetTime());
@@ -446,7 +466,21 @@ void MxlBridge::readInput(int camera, int phase)
                 engine_.ingestV210(camera, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
                 engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});
                 read = true;
+                if (auto const gap = watch.recorded(mxlGetTime()); gap != 0)
+                {
+                    auto fields = where;
+                    fields.emplace_back("gap_ms", std::to_string(gap / 1000000));
+                    logInfo("recording_resumed", fields);
+                }
             }
+            else
+            {
+                ++watch.skipped;
+            }
+        }
+        if (!read)
+        {
+            stalled(input.reader != nullptr);
         }
         return read;
     };

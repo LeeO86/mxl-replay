@@ -92,6 +92,13 @@ of sequences beyond playlists, compressed outputs, HDR.
 - Receiver behaviour as all media functions: activation accepted before the flow
   exists (`waiting`, retry), IS-04 `subscription` updated, domain scan of the MXL
   root including mirror domains.
+- A connected input that records nothing for `REPLAY_INPUT_STALL_S` (its writer
+  stopped, the flow was removed, a fabrics mirror lost its link) logs
+  `recording_stopped` once (camera, phase, reason). Recording resumes by itself when
+  grains come back, also on a flow that was removed and created again (a writer or
+  fabrics agent restart, new inode), and logs `recording_resumed` with the gap.
+  Nothing is stored for a gap: a position inside it shows the nearest recorded
+  frame, and its grains are not dropped ones (§10).
 - All cameras are recorded against the **TAI timeline**: the stored timestamp of a
   frame is its TAI grain time. Positions in the UI are TAI times (shown as timecode),
   so all angles of a moment share the same position.
@@ -379,6 +386,7 @@ document. There are no secret settings.
 | `REPLAY_FLOW_MODULE` | `dis-cuda` (`ofa` optional) |
 | `REPLAY_INTERP_PRESET` | `balanced` |
 | `REPLAY_SLOWMO_AUDIO` | `mute` |
+| `REPLAY_INPUT_STALL_S` | 2 (seconds without a recorded grain before `recording_stopped`) |
 | `REPLAY_STATE_DIR` | `/config` (catalog, imported settings, IS-05 routes) |
 | `MXL_DOMAIN_SCAN_PATH` / `MXL_OUTPUT_DOMAIN_DIR` / `MXL_OUTPUT_DOMAIN_ID` | `/Volumes/mxl` / `/Volumes/mxl/replay-<seed-short>` / UUIDv5 from `NMOS_SEED` |
 | `MXL_HISTORY_DURATION` / `MXL_CLEANUP_ON_EXIT` | 2000000000 ns / false |
@@ -390,11 +398,14 @@ Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`
 (grains the source wrote that were not recorded; grains it never wrote, before it
 started or while it stopped, do not count),
 `storage_write_failed_total` (frames lost to a full disk or an I/O error),
-`phase_missing_total`, `buffer_seconds`, `jpeg_encode_seconds`; per channel
+`phase_missing_total`, `buffer_seconds`, `jpeg_encode_seconds`,
+`record_last_frame_age_seconds` (since the newest recorded frame, counted from the
+process start at most; also `last_frame_age_s` per camera in the status); per channel
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,
 `frame_gpu_seconds` (histogram by stage: decode, flow, interpolate, pack),
-`flow_cache_hits_total`; storage `write_bytes_per_second`,
-`read_bytes_per_second`, `free_bytes`, `protected_bytes`; GPU SM/memory/OFA
+`flow_cache_hits_total`; storage `write_bytes_per_second` (what the recorder writes,
+0 when nothing records), `storage_measured_bytes_per_second` (the write test at
+start), `read_bytes_per_second`, `free_bytes`, `protected_bytes`; GPU SM/memory/OFA
 utilisation. Grafana dashboard in `deploy/grafana/`.
 
 Deployment:

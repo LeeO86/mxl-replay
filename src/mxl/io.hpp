@@ -31,6 +31,52 @@ struct ReaderWait
     [[nodiscard]] bool lateIsDrop(std::uint64_t nowNs, std::uint64_t historyNs) const { return !waiting || nowNs - sinceNs >= historyNs; }
 };
 
+// Stall detection for one connected camera input (a video phase). A writer that stopped, a flow
+// that was removed, and a fabrics mirror whose link is down all look the same to the reader: no
+// new grain. When nothing was recorded for `timeoutNs` (REPLAY_INPUT_STALL_S) the input has
+// stopped; the next recorded grain resumes it.
+struct InputWatch
+{
+    std::uint64_t timeoutNs = 0;
+    std::uint64_t lastNs = 0;  // the last recorded grain, or the connection
+    std::uint64_t skipped = 0; // grains read but not recordable (invalid or incomplete) since lastNs
+    bool stopped = false;
+
+    explicit InputWatch(std::uint64_t timeout = 0)
+        : timeoutNs(timeout)
+    {
+    }
+    // The input is connected at `nowNs`: starts the clock once.
+    void connect(std::uint64_t nowNs)
+    {
+        if (lastNs == 0)
+        {
+            lastNs = nowNs;
+        }
+    }
+    // A grain was recorded at `nowNs`. Returns the gap when this resumes a stopped input, else 0.
+    std::uint64_t recorded(std::uint64_t nowNs)
+    {
+        auto const gap = stopped && nowNs > lastNs ? nowNs - lastNs : 0;
+        stopped = false;
+        skipped = 0;
+        lastNs = nowNs;
+        return gap;
+    }
+    // Nothing was recorded at `nowNs`. True once, when the input stops.
+    bool idle(std::uint64_t nowNs)
+    {
+        if (stopped || lastNs == 0 || nowNs < lastNs + timeoutNs)
+        {
+            return false;
+        }
+        stopped = true;
+        return true;
+    }
+    // Why it stopped: the flow could not be opened, its grains could not be recorded, or none came.
+    [[nodiscard]] char const* reason(bool open) const { return !open ? "flow_missing" : skipped != 0 ? "invalid_grains" : "no_grains"; }
+};
+
 class MxlBridge
 {
 public:
