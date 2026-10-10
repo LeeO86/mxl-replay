@@ -13,6 +13,7 @@
 
 #include <nvjpeg.h>
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -112,6 +113,9 @@ struct Nv
     // Which source frame slots[0] and slots[1] hold: consecutive output frames reuse
     // the same pair (slow motion) or one of it, so it is not decoded again.
     std::string slotKey[2];
+    // The picture this thread last unpacked, decoded or rendered (one of slots): the preview mosaic
+    // draws its tile from it.
+    DevPlanes const* last = nullptr;
     Buffer packed;
     Buffer pinned;
     std::map<std::string, DevFlow> flows;
@@ -273,13 +277,10 @@ bool ensureSlot(DevPlanes& planes, int width, int height)
     return true;
 }
 
-bool prepareNv()
+// The device flags apply only when set before the primary context exists: every first CUDA use of a
+// thread goes through here.
+bool primeDevice()
 {
-    auto& state = nv();
-    if (state.ready)
-    {
-        return true;
-    }
     if (cudaFlowDeviceCount() <= 0)
     {
         return false;
@@ -295,6 +296,20 @@ bool prepareNv()
         return cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess && cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep) == cudaSuccess;
     }();
     (void)poolKept;
+    return true;
+}
+
+bool prepareNv()
+{
+    auto& state = nv();
+    if (state.ready)
+    {
+        return true;
+    }
+    if (!primeDevice())
+    {
+        return false;
+    }
     if (nvjpegCreateSimple(&state.handle) != NVJPEG_STATUS_SUCCESS)
     {
         return false;
@@ -879,6 +894,78 @@ __global__ void planes10Kernel(std::uint16_t const* y, std::uint16_t const* cb, 
     }
 }
 
+// Mean of up to 8×8 samples spread over the source rectangle [x0, x1) × [y0, y1).
+__device__ float boxMean(std::uint8_t const* plane, int pitch, int x0, int x1, int y0, int y1)
+{
+    int const stepX = max(1, (x1 - x0 + 7) / 8);
+    int const stepY = max(1, (y1 - y0 + 7) / 8);
+    float sum = 0.f;
+    int count = 0;
+    for (int y = y0; y < y1; y += stepY)
+    {
+        for (int x = x0; x < x1; x += stepX)
+        {
+            sum += plane[y * pitch + x];
+            ++count;
+        }
+    }
+    return count > 0 ? sum / static_cast<float>(count) : 0.f;
+}
+
+// One preview mosaic tile from 8-bit 4:2:2 planes: one thread per 2×2 output pixels (one NV12 CbCr pair).
+__global__ void mosaicTileKernel(std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitchY, int pitchC, int srcW, int srcH,
+    std::uint8_t* canvas, int pitch, int canvasH, int tx, int ty, int tw, int th)
+{
+    int const bx = blockIdx.x * blockDim.x + threadIdx.x;
+    int const by = blockIdx.y * blockDim.y + threadIdx.y;
+    if (2 * bx >= tw || 2 * by >= th)
+    {
+        return;
+    }
+    for (int dy = 0; dy < 2; ++dy)
+    {
+        int const py = 2 * by + dy;
+        int const y0 = py * srcH / th;
+        int const y1 = max(y0 + 1, (py + 1) * srcH / th);
+        for (int dx = 0; dx < 2; ++dx)
+        {
+            int const px = 2 * bx + dx;
+            int const x0 = px * srcW / tw;
+            int const x1 = max(x0 + 1, (px + 1) * srcW / tw);
+            canvas[(ty + py) * pitch + tx + px] = static_cast<std::uint8_t>(boxMean(y, pitchY, x0, x1, y0, y1) + 0.5f);
+        }
+    }
+    int const cx0 = 2 * bx * srcW / tw / 2;
+    int const cx1 = max(cx0 + 1, (2 * bx + 2) * srcW / tw / 2);
+    int const cy0 = 2 * by * srcH / th;
+    int const cy1 = max(cy0 + 1, (2 * by + 2) * srcH / th);
+    std::uint8_t* pair = canvas + (canvasH + ty / 2 + by) * pitch + tx + 2 * bx;
+    pair[0] = static_cast<std::uint8_t>(boxMean(cb, pitchC, cx0, cx1, cy0, cy1) + 0.5f);
+    pair[1] = static_cast<std::uint8_t>(boxMean(cr, pitchC, cx0, cx1, cy0, cy1) + 0.5f);
+}
+
+// The stream of this thread's canvas copies (the encoder thread has no nvJPEG state).
+cudaStream_t copyStream()
+{
+    struct Holder
+    {
+        cudaStream_t stream{};
+        ~Holder()
+        {
+            if (stream != nullptr)
+            {
+                cudaStreamDestroy(stream);
+            }
+        }
+    };
+    thread_local Holder holder;
+    if (holder.stream == nullptr && cudaStreamCreateWithFlags(&holder.stream, cudaStreamNonBlocking) != cudaSuccess)
+    {
+        holder.stream = nullptr;
+    }
+    return holder.stream;
+}
+
 nvjpegImage_t imageOf(DevPlanes const& planes)
 {
     nvjpegImage_t image{};
@@ -1093,7 +1180,12 @@ bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string
         return false;
     }
     out.v210 = downloadV210(*source);
-    return !out.v210.empty();
+    if (out.v210.empty())
+    {
+        return false;
+    }
+    state.last = source;
+    return true;
 }
 
 std::vector<std::uint8_t> gpuEncodeV210(std::uint8_t const* packed, int width, int height, int rowBytes, int quality)
@@ -1124,6 +1216,7 @@ std::vector<std::uint8_t> gpuEncodeV210(std::uint8_t const* packed, int width, i
     cudaMemcpyAsync(device, packed, bytes, cudaMemcpyHostToDevice, state.stream);
     unpackV210Kernel<<<v210Grid(width, height), 128, 0, state.stream>>>(device, rowBytes, width, height, state.slots[0].y, state.slots[0].cb, state.slots[0].cr,
         state.slots[0].pitchY, state.slots[0].pitchC);
+    state.last = &state.slots[0];
     std::vector<std::uint8_t> jpeg;
     if (!encodePlanes(state.slots[0], quality, jpeg))
     {
@@ -1164,6 +1257,7 @@ std::vector<std::uint8_t> gpuEncodeFrame10(Frame10 const& frame, int quality)
     devFree(y);
     devFree(cb);
     devFree(cr);
+    state.last = &state.slots[0];
     std::vector<std::uint8_t> jpeg;
     if (!encodePlanes(state.slots[0], quality, jpeg))
     {
@@ -1181,5 +1275,92 @@ void gpuReleaseHostMemory()
         cudaStreamSynchronize(state.stream);
     }
     hostMemory().release();
+}
+
+std::uint8_t* gpuCanvasCreate(int width, int height, int& pitch)
+{
+    if (width < 2 || height < 2 || !primeDevice())
+    {
+        return nullptr;
+    }
+    void* canvas = nullptr;
+    std::size_t bytes = 0;
+    if (cudaMallocPitch(&canvas, &bytes, static_cast<std::size_t>(width), static_cast<std::size_t>(height + height / 2)) != cudaSuccess)
+    {
+        cudaGetLastError();
+        return nullptr;
+    }
+    auto* rows = static_cast<std::uint8_t*>(canvas);
+    auto const stream = copyStream();
+    bool const black = stream != nullptr &&
+                       cudaMemset2DAsync(rows, bytes, 16, static_cast<std::size_t>(width), static_cast<std::size_t>(height), stream) == cudaSuccess &&
+                       cudaMemset2DAsync(rows + bytes * static_cast<std::size_t>(height), bytes, 128, static_cast<std::size_t>(width),
+                           static_cast<std::size_t>(height / 2), stream) == cudaSuccess &&
+                       cudaStreamSynchronize(stream) == cudaSuccess;
+    if (!black)
+    {
+        cudaFree(canvas);
+        return nullptr;
+    }
+    pitch = static_cast<int>(bytes);
+    return rows;
+}
+
+void gpuCanvasDestroy(std::uint8_t* canvas)
+{
+    if (canvas != nullptr)
+    {
+        cudaFree(canvas);
+    }
+}
+
+bool gpuCanvasDrawLast(std::uint8_t* canvas, int pitch, int height, int x, int y, int w, int h)
+{
+    auto& state = nv();
+    if (canvas == nullptr || !state.ready || state.last == nullptr || w < 2 || h < 2)
+    {
+        return false;
+    }
+    auto const& planes = *state.last;
+    dim3 const block(16, 8);
+    dim3 const grid((static_cast<unsigned>(w / 2) + 15) / 16, (static_cast<unsigned>(h / 2) + 7) / 8);
+    // Queued behind the thread's own work on its stream, which also orders the next use of the planes after it.
+    mosaicTileKernel<<<grid, block, 0, state.stream>>>(planes.y, planes.cb, planes.cr, planes.pitchY, planes.pitchC, planes.width, planes.height, canvas,
+        pitch, height, x, y, w, h);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool gpuCopyRows(void* dst, std::size_t dstPitch, void const* src, std::size_t srcPitch, std::size_t bytes, std::size_t rows)
+{
+    auto const stream = copyStream();
+    if (stream == nullptr || dst == nullptr || src == nullptr)
+    {
+        return false;
+    }
+    if (cudaMemcpy2DAsync(dst, dstPitch, src, srcPitch, bytes, rows, cudaMemcpyDefault, stream) != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess)
+    {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+void* gpuContext()
+{
+    if (!primeDevice())
+    {
+        return nullptr;
+    }
+    // Any runtime call makes the primary context current on this thread.
+    cudaFree(nullptr);
+    void* entry = nullptr;
+    cudaDriverEntryPointQueryResult found{};
+    if (cudaGetDriverEntryPointByVersion("cuCtxGetCurrent", &entry, 12000, cudaEnableDefault, &found) != cudaSuccess || entry == nullptr)
+    {
+        cudaGetLastError();
+        return nullptr;
+    }
+    CUcontext context = nullptr;
+    return reinterpret_cast<CUresult (*)(CUcontext*)>(entry)(&context) == CUDA_SUCCESS ? context : nullptr;
 }
 } // namespace replay

@@ -1,5 +1,5 @@
 #pragma once
 
-#define REPLAY_VERSION "1.3.2"
+#define REPLAY_VERSION "1.4.0"
 #define REPLAY_MXL_REVISION "218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7"
 #define REPLAY_NMOS_CPP_REVISION "fe303849527394b03bdedc8f161f377fe458bb62"

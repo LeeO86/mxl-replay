@@ -112,6 +112,35 @@ char const* motionName(MotionMode mode)
     return "interpolate";
 }
 
+std::uint64_t PlayoutGrid::take(std::uint64_t current, bool& resynced)
+{
+    resynced = next != 0 && (next + 2 < current || next > current + 1);
+    if (resynced)
+    {
+        lastJump = static_cast<std::int64_t>(current) - static_cast<std::int64_t>(next);
+        ++resyncs;
+        ++unlogged;
+    }
+    if (next == 0 || resynced)
+    {
+        next = current;
+    }
+    return next++;
+}
+
+std::uint64_t PlayoutGrid::toLog(std::uint64_t nowNs)
+{
+    constexpr std::uint64_t kInterval = 10'000'000'000ull;
+    if (unlogged == 0 || (loggedNs != 0 && nowNs < loggedNs + kInterval))
+    {
+        return 0;
+    }
+    loggedNs = nowNs;
+    auto const count = unlogged;
+    unlogged = 0;
+    return count;
+}
+
 MotionMode parseMotion(std::string const& text, bool* ok)
 {
     if (ok != nullptr)

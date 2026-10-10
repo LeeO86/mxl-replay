@@ -506,6 +506,12 @@ void Engine::ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t
     }
     auto const rowBytes = static_cast<int>(v210RowBytes(config_.format.width));
     auto jpeg = gpuEncodeV210(packed, config_.format.width, config_.format.height, rowBytes, config_.jpegQuality);
+    // The camera's preview tile (phase 1): from the grain on the GPU, or sampled on the CPU below.
+    bool const drawTile = mosaic_ != nullptr && phase <= 1 && camera >= 1 && mosaicDue(taiNs);
+    if (drawTile && !jpeg.empty())
+    {
+        mosaic_->drawGpuPicture(config_.channels + camera - 1);
+    }
     if (jpeg.empty())
     {
         // CPU: a camera with one phase encodes here, without the engine lock, like the GPU path
@@ -525,6 +531,10 @@ void Engine::ingestV210(int camera, int phase, std::uint64_t taiNs, std::uint8_t
             return;
         }
         jpeg = encodeJpegV210(packed, config_.format.width, config_.format.height, rowBytes, config_.jpegQuality);
+        if (drawTile)
+        {
+            mosaic_->drawV210(config_.channels + camera - 1, packed, config_.format.width, config_.format.height);
+        }
     }
     std::vector<StoredFrame> pending(1);
     pending[0].taiNs = taiNs;
@@ -558,6 +568,10 @@ void Engine::countDropped(int camera, std::uint64_t grains)
 
 void Engine::ingestVideo(int camera, int phase, std::uint64_t taiNs, Frame10 frame)
 {
+    if (mosaic_ != nullptr && phase <= 1 && camera >= 1 && mosaicDue(taiNs))
+    {
+        mosaic_->drawFrame(config_.channels + camera - 1, frame);
+    }
     std::vector<StoredFrame> pending;
     CameraRuntime* target = nullptr;
     {
@@ -732,6 +746,8 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     std::uint64_t const taiB = static_cast<std::uint64_t>(pick.frameB) * periodSrc;
     bool exact = pick.kind == SourcePick::Kind::Exact;
     bool renderedOnGpu = false;
+    // The output grain is this thread's last GPU picture (the preview tile is drawn from it there).
+    bool devicePicture = false;
     if (auto const* ring = ringOf(camera); !runtime.black && cudaFlowAvailable() && ring != nullptr)
     {
         // Read, decode, interpolate and download without the engine lock, so channels and
@@ -759,6 +775,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             rendered.v210 = std::move(gpuPicture.v210);
             runtime.lastV210 = rendered.v210;
             renderedOnGpu = true;
+            devicePicture = true;
             if (motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate)
             {
                 metrics_.inc("flow_cache_hits_total", {{"channel", std::to_string(channel)}});
@@ -941,6 +958,15 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     rendered.audio = std::move(pcm);
     metrics_.set("channel_speed", {{"channel", std::to_string(channel)}}, runtime.scheduler.speed);
     metrics_.set("channel_state", {{"channel", std::to_string(channel)}}, runtime.liveMode ? 0 : runtime.scheduler.playing ? 1 : 2);
+    if (mosaic_ != nullptr && mosaicDue(outputTaiNs) && rendered.v210.size() >= v210Size(config_.format.width, config_.format.height))
+    {
+        // The channel's preview tile, without the engine lock (the tile is this channel's alone).
+        lock.unlock();
+        if (!devicePicture || !mosaic_->drawGpuPicture(channel - 1))
+        {
+            mosaic_->drawV210(channel - 1, rendered.v210.data(), config_.format.width, config_.format.height);
+        }
+    }
     return rendered;
 }
 
@@ -1913,7 +1939,9 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
         auto const loaded = loadConfig({}, {}, merged);
         static char const* restartKeys[] = {"REPLAY_FORMAT", "REPLAY_INPUTS", "REPLAY_CHANNELS", "REPLAY_STORAGE_DIR", "REPLAY_STATE_DIR", "WEB_PORT",
             "NMOS_PORT", "NMOS_SEED", "NMOS_LABEL", "NMOS_HOST_ADDRESS", "MXL_OUTPUT_DOMAIN_DIR", "MXL_OUTPUT_DOMAIN_ID", "NMOS_REGISTRY_ADDRESS",
-            "NMOS_REGISTRY_PORT", "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT"};
+            "NMOS_REGISTRY_PORT", "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "REPLAY_PREVIEW_MODE", "PREVIEW_PUBLISH_URL", "PREVIEW_PATH_PREFIX",
+            "PREVIEW_WHEP_URL", "PREVIEW_HLS_URL", "MEDIAMTX_RTSP_PORT", "MEDIAMTX_WHEP_PORT", "MEDIAMTX_HLS_PORT", "MEDIAMTX_ICE_UDP_PORT",
+            "WIDGET_FRAME_ANCESTORS"};
         for (auto const* key : restartKeys)
         {
             auto const before = settings_.count(key) ? settings_.at(key) : std::string{};
@@ -2188,6 +2216,22 @@ std::vector<std::uint8_t> Engine::clipThumbnailJpeg(std::string const& id) const
     return jpeg;
 }
 
+void Engine::setPreviewMosaic(PreviewMosaic* mosaic)
+{
+    mosaic_ = mosaic;
+    mosaicStep_ = static_cast<std::uint64_t>(mosaicStep(config_));
+}
+
+void Engine::setPreviewStatus(std::function<PreviewStatus()> status)
+{
+    previewStatus_ = std::move(status);
+}
+
+bool Engine::mosaicDue(std::uint64_t taiNs) const
+{
+    return timestampToIndex(config_.format.rateNum, config_.format.rateDen, taiNs) % mosaicStep_ == 0;
+}
+
 bool Engine::gpuInterpolate() const
 {
     return gpu_ || config_.allowCpuInterp;
@@ -2221,6 +2265,29 @@ void Engine::updateMetrics(std::chrono::steady_clock::time_point now)
         metrics_.set("storage_write_failed_total", labels, static_cast<double>(camera.ring.writeFailures()));
         metrics_.set("protected_bytes", labels, static_cast<double>(camera.ring.protectedBytes()));
         metrics_.set("disk_bytes", labels, static_cast<double>(camera.ring.diskBytes()));
+    }
+    // The preview mode, and in WebRTC mode where and how the mosaic is published.
+    auto const plan = previewPlan(config_);
+    metrics_.set("preview_mode", {{"mode", "jpeg"}}, plan.webrtc ? 0 : 1);
+    metrics_.set("preview_mode", {{"mode", "webrtc"}}, plan.webrtc ? 1 : 0);
+    if (plan.webrtc)
+    {
+        auto const preview = previewStatus_ ? previewStatus_() : PreviewStatus{};
+        metrics_.set("preview_publish_mode", {{"mode", "own"}}, plan.ownMediamtx ? 1 : 0);
+        metrics_.set("preview_publish_mode", {{"mode", "shared"}}, plan.ownMediamtx ? 0 : 1);
+        for (char const* state : {"connecting", "publishing", "error"})
+        {
+            metrics_.set("preview_publish_state", {{"stream", plan.path}, {"state", state}}, preview.state == state ? 1 : 0);
+        }
+        for (char const* encoder : {"nvenc", "x264"})
+        {
+            metrics_.set("preview_encoder", {{"encoder", encoder}}, preview.encoder == encoder ? 1 : 0);
+        }
+        metrics_.set("preview_frames_total", {}, static_cast<double>(preview.frames));
+        if (plan.ownMediamtx)
+        {
+            metrics_.set("preview_mediamtx_restarts_total", {}, static_cast<double>(preview.mediamtxRestarts));
+        }
     }
 }
 
@@ -2302,7 +2369,7 @@ std::string Engine::statusJson() const
             << ",\"shot_id\":" << jsonString(channel.shot.clipId) << ",\"playlist\":" << jsonString(channel.playlistId)
             << ",\"playlist_index\":" << channel.playlistIndex << '}';
     }
-    out << "]}";
+    out << "],\"preview\":" << previewStatusJson(config_, previewStatus_ ? previewStatus_() : PreviewStatus{}) << '}';
     return out.str();
 }
 } // namespace replay

@@ -47,6 +47,30 @@ std::vector<std::uint8_t> gpuEncodeFrame10(Frame10 const&, int)
 void gpuReleaseHostMemory()
 {
 }
+
+std::uint8_t* gpuCanvasCreate(int, int, int&)
+{
+    return nullptr;
+}
+
+void gpuCanvasDestroy(std::uint8_t*)
+{
+}
+
+bool gpuCanvasDrawLast(std::uint8_t*, int, int, int, int, int, int)
+{
+    return false;
+}
+
+bool gpuCopyRows(void*, std::size_t, void const*, std::size_t, std::size_t, std::size_t)
+{
+    return false;
+}
+
+void* gpuContext()
+{
+    return nullptr;
+}
 #endif
 
 bool ofaAvailable()

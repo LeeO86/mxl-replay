@@ -97,7 +97,7 @@ onUnmounted(() => observer?.disconnect());
 
 <template>
   <div class="shot-top">
-    <LivePicture v-if="active" class="target" :src="`/api/v1/channels/${active.index}/preview.jpg`" :interval="500" :bump="state.previewBump" alt="target channel">
+    <LivePicture v-if="active" class="target" :src="`/api/v1/channels/${active.index}/preview.jpg`" :tile="`ch${active.index}`" :interval="500" :bump="state.previewBump" alt="target channel">
       <span class="ov tl"><span class="state-tag" :class="channelState(active)">{{ channelState(active).toUpperCase() }}</span></span>
       <span class="ov bl num">{{ active.timecode }}</span>
     </LivePicture>

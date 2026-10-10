@@ -1,11 +1,16 @@
 #include "app/engine.hpp"
 #include "config/config.hpp"
 #include "domain/scan.hpp"
+#include "flow/cuda_flow.hpp"
+#include "media/mosaic.hpp"
 #include "media/timebase.hpp"
 #include "mxl/io.hpp"
 #include "nmos/node.hpp"
 #include "ops/api.hpp"
+#include "ops/child.hpp"
 #include "ops/httpserver.hpp"
+#include "ops/preview.hpp"
+#include "ops/publisher.hpp"
 #include "util/logging.hpp"
 #include "version.hpp"
 
@@ -15,8 +20,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sys/resource.h>
 #include <thread>
 #include <vector>
@@ -101,7 +108,44 @@ int main(int argc, char** argv)
         replay::setLogLevel(replay::parseLogLevel(loaded.config.logLevel));
         replay::setLogFormatJson(loaded.config.logFormat != "text");
         auto const flat = loaded.flat;
+        // Previews (SPECIFICATION.md §8.6): JPEG on request, or one WebRTC mosaic. In own mode the image's
+        // MediaMTX runs as a supervised child, started while this process is still small (fork).
+        auto const preview = replay::previewPlan(loaded.config);
+        replay::ChildProcess mediamtx("mediamtx");
+        if (preview.ownMediamtx)
+        {
+            auto const path = loaded.config.stateDir + "/mediamtx.yml";
+            std::filesystem::create_directories(loaded.config.stateDir);
+            std::ofstream yml(path, std::ios::binary | std::ios::trunc);
+            yml << replay::renderMediamtxConfig(loaded.config);
+            if (!yml.flush())
+            {
+                replay::logError("mediamtx_config_failed", {{"path", path}});
+                return 75;
+            }
+            mediamtx.start({"mediamtx", path});
+        }
         replay::Engine engine(std::move(loaded.config), flat);
+        // The mosaic and its encoder outlive the reader and playout threads that draw into it.
+        std::unique_ptr<replay::PreviewMosaic> mosaic;
+        std::unique_ptr<replay::PreviewPublisher> publisher;
+        if (preview.webrtc)
+        {
+            auto const& cfg = engine.config();
+            mosaic = std::make_unique<replay::PreviewMosaic>(replay::mosaicLayout(cfg), replay::cudaFlowAvailable());
+            publisher = std::make_unique<replay::PreviewPublisher>(*mosaic, preview.publishUrl, cfg.format.rateNum, cfg.format.rateDen * replay::mosaicStep(cfg));
+            engine.setPreviewMosaic(mosaic.get());
+            publisher->start([&engine](double seconds) { engine.metrics().observe("preview_encode_seconds", {}, seconds); });
+            replay::logInfo("preview", {{"mode", "webrtc"}, {"publish", preview.ownMediamtx ? "own" : "shared"}, {"url", preview.publishUrl},
+                                           {"canvas", std::to_string(mosaic->layout().width) + "x" + std::to_string(mosaic->layout().height)},
+                                           {"composed_on", mosaic->onDevice() ? "gpu" : "cpu"}});
+        }
+        engine.setPreviewStatus([&publisher, &mediamtx] {
+            auto status = publisher ? publisher->status() : replay::PreviewStatus{};
+            status.mediamtxRunning = mediamtx.running();
+            status.mediamtxRestarts = mediamtx.restarts();
+            return status;
+        });
         replay::HttpServer server;
         std::string indexHtml;
 #ifdef REPLAY_HAS_UI
@@ -133,20 +177,27 @@ int main(int argc, char** argv)
                 // (interpolated, or flipping between them) and could write a grain index twice.
                 auto const num = engine.config().format.rateNum;
                 auto const den = engine.config().format.rateDen;
-                std::uint64_t next = 0;
+                replay::Labels const labels{{"channel", std::to_string(channel)}};
+                engine.metrics().inc("output_resyncs_total", labels, 0);
+                replay::PlayoutGrid grid;
                 while (!gStop.load())
                 {
-                    auto const current = replay::timestampToIndex(num, den, replay::taiNowNs());
-                    // Start, or more than two grains late: continue at the current grain.
-                    if (next == 0 || next + 2 < current || next > current + 1)
+                    // Start, or more than two grains late: continue at the current grain (a resync).
+                    bool resynced = false;
+                    auto const index = grid.take(replay::timestampToIndex(num, den, replay::taiNowNs()), resynced);
+                    if (resynced)
                     {
-                        next = current;
+                        engine.metrics().inc("output_resyncs_total", labels);
                     }
-                    auto const tai = replay::indexToTimestamp(num, den, next);
+                    if (auto const count = grid.toLog(replay::taiNowNs()); count != 0)
+                    {
+                        replay::logWarn("output_resync", {{"channel", std::to_string(channel)}, {"resyncs", std::to_string(count)},
+                                                             {"jumped_grains", std::to_string(grid.lastJump)}});
+                    }
+                    auto const tai = replay::indexToTimestamp(num, den, index);
                     auto rendered = engine.render(channel, tai);
                     bridge.publish(channel, rendered, tai);
-                    ++next;
-                    auto const wait = static_cast<std::int64_t>(replay::indexToTimestamp(num, den, next)) - static_cast<std::int64_t>(replay::taiNowNs());
+                    auto const wait = static_cast<std::int64_t>(replay::indexToTimestamp(num, den, grid.next)) - static_cast<std::int64_t>(replay::taiNowNs());
                     if (wait > 0)
                     {
                         std::this_thread::sleep_for(std::chrono::nanoseconds(wait));
@@ -196,6 +247,11 @@ int main(int argc, char** argv)
             }
         }
         server.stop();
+        if (publisher)
+        {
+            publisher->stop();
+        }
+        mediamtx.stop();
         if (gSignal.load() == SIGTERM)
         {
             if (!nmosStopped)

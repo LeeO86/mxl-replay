@@ -99,6 +99,10 @@ of sequences beyond playlists, compressed outputs, HDR.
   fabrics agent restart, new inode), and logs `recording_resumed` with the gap.
   Nothing is stored for a gap: a position inside it shows the nearest recorded
   frame, and its grains are not dropped ones (§10).
+- A camera whose audio flow delivers no samples for `REPLAY_INPUT_STALL_S` worth of
+  video frames while its video keeps recording logs `recording_audio_stopped` once
+  (camera, reason: `flow_missing` or `no_samples`), and `recording_audio_resumed` with
+  the gap when samples come back (1.4.0). The frames of the gap are stored without audio.
 - All cameras are recorded against the **TAI timeline**: the stored timestamp of a
   frame is its TAI grain time. Positions in the UI are TAI times (shown as timecode),
   so all angles of a moment share the same position.
@@ -156,7 +160,9 @@ of sequences beyond playlists, compressed outputs, HDR.
 - Output format = house format (`REPLAY_FORMAT`, default 1080p50); all channels and
   inputs use the same raster. Inputs with another raster are scaled on decode
   (bilinear/bicubic on GPU), and this is shown as a warning.
-- The output clock is TAI: one grain per output grain index, always. When nothing is
+- The output clock is TAI: one grain per output grain index, always. A channel more than
+  two grains late continues at the current grain (a resync): counted per channel in
+  `output_resyncs_total`, logged as `output_resync` at most once per 10 s (1.4.0). When nothing is
   playing, a channel shows its idle source (configurable: last frame, black, or a
   live input "E2E").
 
@@ -311,8 +317,8 @@ The flow step (1–5) is a module behind one interface:
 
 - Camera row with live thumbnails (low-rate) and recording state; click selects the
   camera for the active channel (angle switch).
-- Channel monitor (low-rate JPEG preview; full-motion preview via
-  mxl-webrtc-monitor routed to the channel output).
+- Channel monitor (low-rate JPEG preview, or the full-motion WebRTC mosaic of §8.6;
+  full-motion preview also via mxl-webrtc-monitor routed to the channel output).
 - Timeline of the buffer with markers for clips; scrubbing by drag, mouse wheel
   (frame/second), keyboard (←/→ frame, shift = second).
 - Buttons: IN, OUT, Go IN, Go OUT, Play, Pause, Live, Create clip, speed fader with
@@ -341,7 +347,8 @@ playlists, library, uploads, exports, config) and WebSocket `/api/v1/events`
 other systems (e.g. a control surface or a vision mixer macro) can drive the replay.
 Clips are edited with `PATCH /api/v1/clips/{id}` and playlists read, replaced and
 deleted at `/api/v1/playlists/{id}`. Low-rate JPEG previews are served per channel,
-per camera and per clip (`…/preview.jpg`, `/api/v1/clips/{id}/thumbnail.jpg`); the
+per camera and per clip (`…/preview.jpg`, `/api/v1/clips/{id}/thumbnail.jpg`; in the
+WebRTC mode of §8.6 only the clip thumbnails, and `/api/v1/preview/map`); the
 status carries the timecodes the UI shows (§5.5), formatted by the server.
 `/livez`, `/readyz`, `/statusz`, `/metrics` on `WEB_PORT`. HTTP starts before the
 retained segments are indexed: `/livez` answers at once, while `/readyz` and the API stay
@@ -351,6 +358,67 @@ visible on the Query API.
 document. There are no secret settings.
 
 ---
+
+### 8.6 Previews: JPEG or one WebRTC mosaic (1.4.0)
+
+`REPLAY_PREVIEW_MODE` selects how the UI shows cameras and channels. Never both.
+
+- `jpeg` (default, unset): the pictures of §8.5, made on request.
+- `webrtc`: **one mosaic** of every channel output and every camera input (phase 1),
+  composed on the GPU (on the CPU without one) and encoded **once** as H.264 with NVENC;
+  libx264 only when NVENC cannot be opened, which is logged (`preview_nvenc_unavailable`).
+  The camera and channel JPEG pictures answer 404; clip thumbnails stay. No audio.
+  - Layout: channels at 640×360, three a row, then cameras at 480×270, four a row; the
+    canvas is as wide as its widest row and is scaled down to fit 1920×1080 when taller.
+    Every edge is even. `GET /api/v1/preview/map` gives the mode, canvas size, frame rate,
+    stream path, the WHEP and HLS URLs and each tile (`id` `ch<n>` / `cam<n>`, `kind`,
+    `index`, `label`, `x`, `y`, `w`, `h`).
+  - Rate: every house grain up to 30 per second, every second one above (25 at 50p).
+    Each camera's reader and each channel's playout thread draw their own tile when their
+    grain is due: from the grain already on the GPU (area average), else point-sampled on
+    the CPU. Nothing waits for anything else; a tile may show parts of two pictures.
+  - The UI opens one WHEP session per page and shows each picture as a `<video>` on that
+    one `MediaStream`, cropped to its tile with CSS `object-view-box` (by position in
+    browsers without it).
+- **Preview contract** (platform §11.5 / D-185, as mxl-webrtc-monitor 1.3.0):
+  - `PREVIEW_PUBLISH_URL` (`rtsp://` or `rtsps://` base, no path or credentials): set,
+    the mosaic is published there (RTSP over TCP) and no MediaMTX is started; empty, the
+    image's MediaMTX runs as a supervised child (restarted 1 s after it exits, doubling to
+    10 s; SIGTERM and after 3 s SIGKILL on shutdown; SIGTERM when the replay dies), with
+    RTSP ingest on `127.0.0.1:MEDIAMTX_RTSP_PORT`.
+  - `PREVIEW_PATH_PREFIX` (default `mxl-replay`): the stream is `<prefix>/mosaic`.
+  - `PREVIEW_WHEP_URL` / `PREVIEW_HLS_URL`: public bases, `<base>/<prefix>/mosaic/whep`
+    and `.../index.m3u8`; empty: the own MediaMTX on `NMOS_HOST_ADDRESS` (the page puts in
+    its own host name).
+  - The own MediaMTX's ports (8854 RTSP on localhost, 8689 WHEP, 8688 HLS, 8489 ICE UDP
+    and TCP; no API or metrics) avoid mxl-webrtc-monitor (8554/8889/8888/8189/9997/9998),
+    the FlowXer engine (8654/8989/8988/8289/9897) and mxl-multiviewer 1.4.0
+    (8754/8789/8788/8389). They may not equal the web or NMOS ports (exit 78).
+  - `/statusz` (and the status) has `preview`: `mode`; in WebRTC mode `publish` (`own` or
+    `shared`), `publish_url`, `path_prefix`, `path`, `state` (`connecting`, `publishing`,
+    `error`), `error`, `encoder` (`nvenc`, `x264`), `frames`, in own mode `mediamtx`
+    (`running`, `restarts`), and `streams` (`path`, `state`, `error`). Metrics in §10.
+
+### 8.7 Widgets (1.4.0, operator screens)
+
+The contract of mxl-webrtc-monitor 1.3.0 §6.6.
+
+- `GET /widgets` answers `[{id, title, params, min_size: {w, h}, version}]` (`params` a
+  JSON schema of the query). It carries `Access-Control-Allow-Origin` for an `Origin`
+  that `WIDGET_FRAME_ANCESTORS` lists (or `*`), and `Vary: Origin`; GET only.
+- `transport` (`channel`, required, 1..`REPLAY_CHANNELS`; `min_size` 480×160): one
+  channel's label, state and timecode, Cue (to its IN, paused), Play / Pause, Live (E2E),
+  the speed fader 0–200 % and the presets.
+- `clip-list` (`channel`, optional; `min_size` 400×300): every clip, newest first, with its
+  shotbox button on the channel (Load cues it; then Play, Pause). Without `channel` the
+  widget has a channel picker.
+- `GET /widget/<id>?<params>[&theme=dark|light|transparent]` is the embedded page with only
+  that widget, no app chrome, on the replay's own API (same origin). An invalid parameter
+  answers 400, an unknown widget 404. These routes carry `Content-Security-Policy:
+  frame-ancestors <WIDGET_FRAME_ANCESTORS>` (default `'self'`; `;`, `,` or control
+  characters exit 78) and no `X-Frame-Options`.
+- The page posts `{type: "widget-ready"}` once it shows the replay's status, and
+  `{type: "widget-size", w, h}` then and on every resize, to `window.parent`.
 
 ## 9. NMOS
 
@@ -393,6 +461,11 @@ document. There are no secret settings.
 | `NMOS_REGISTRY_ADDRESS` / `_PORT`, `NMOS_QUERY_ADDRESS` / `_PORT` | empty / 3210, registry address / registry port + 1 |
 | `NMOS_DNS_SD`, `NMOS_PORT`, `NMOS_SEED`, `NMOS_LABEL`, `NMOS_TAGS`, `NMOS_HOST_ADDRESS` | false, 3302, `HOST_ID-replay`, unset, `{}`, first non-loopback IPv4 |
 | `WEB_PORT` / `SHUTDOWN_TIMEOUT_S` | 8150 / 10 |
+| `REPLAY_PREVIEW_MODE` | `jpeg` (`webrtc`: §8.6) |
+| `PREVIEW_PUBLISH_URL` / `PREVIEW_PATH_PREFIX` | empty (own MediaMTX) / `mxl-replay` |
+| `PREVIEW_WHEP_URL` / `PREVIEW_HLS_URL` | empty (the own MediaMTX) |
+| `MEDIAMTX_RTSP_PORT` / `_WHEP_PORT` / `_HLS_PORT` / `_ICE_UDP_PORT` | 8854 / 8689 / 8688 / 8489 |
+| `WIDGET_FRAME_ANCESTORS` | `'self'` |
 
 Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`
 (grains the source wrote that were not recorded; grains it never wrote, before it
@@ -406,7 +479,11 @@ process start at most; also `last_frame_age_s` per camera in the status); per ch
 `flow_cache_hits_total`; storage `write_bytes_per_second` (what the recorder writes,
 0 when nothing records), `storage_measured_bytes_per_second` (the write test at
 start), `read_bytes_per_second`, `free_bytes`, `protected_bytes`; GPU SM/memory/OFA
-utilisation. Grafana dashboard in `deploy/grafana/`.
+utilisation; per channel `output_resyncs_total` (§5.1); previews `preview_mode{mode}`,
+and in WebRTC mode `preview_publish_mode{mode}` (own, shared),
+`preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`,
+`preview_encode_seconds` (histogram: copy, encode, send of one picture) and in own mode
+`preview_mediamtx_restarts_total`. Grafana dashboard in `deploy/grafana/`.
 
 Deployment:
 - Pod network; MXL root `hostPath`; **node-pinned** with local NVMe `hostPath` for
@@ -423,10 +500,12 @@ Deployment:
   and `X.Y.Z` / `X.Y` / `X` from a `vX.Y.Z` tag. Labels include
   `org.opencontainers.image.source`, `.revision`, `.licenses`, and `io.dmf.mxl.revision`.
   The reference-harness image is built in CI but not published by default.
+  The image carries the official MediaMTX binary (pinned, MIT, with its licence) for the
+  own preview mode (§8.6); NVENC needs `video` in `NVIDIA_DRIVER_CAPABILITIES`.
 - Pod network, uid 1000, no `hostIPC`. On SIGTERM: release MXL readers and writers,
   DELETE the node from the registry, and with `MXL_CLEANUP_ON_EXIT=true` remove only
-  the function's own output domain. Exit codes 0, 75 (including a port that will not
-  bind), 78, 143.
+  the function's own output domain, and stop the own MediaMTX. Exit codes 0, 75
+  (including a port that will not bind), 78, 143.
 
 ---
 
@@ -444,6 +523,10 @@ Deployment:
   timecode ANC matches source time; upload a file and play it as a clip; NMOS IS-05
   activation of an input before the flow exists.
 - NMOS conformance: AMWA IS-04-01, IS-05-01, IS-05-02, BCP-007-03-01.
+- Previews (1.4.0): unit tests for the mode selection, never both, the tile map, the
+  canvas, `/widgets`, the CSP and CORS headers, the resync counter and the audio stall
+  watch; `tests/integration/preview.sh` runs the JPEG mode, the WebRTC mode with the
+  own MediaMTX and with a separate (shared) one that goes away and comes back.
 - Hardware (documented): performance targets (§6.3), storage throughput with all
   cameras recording while two channels play, phased HFR with a real HFR camera or a
   simulated phase set.

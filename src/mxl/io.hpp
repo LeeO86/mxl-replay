@@ -77,6 +77,47 @@ struct InputWatch
     [[nodiscard]] char const* reason(bool open) const { return !open ? "flow_missing" : skipped != 0 ? "invalid_grains" : "no_grains"; }
 };
 
+// Stall detection for a camera's audio while its video records: the audio has stopped when `limit` video
+// frames in a row (REPLAY_INPUT_STALL_S worth) were stored without their samples. Counted in video frames,
+// so a pause of the video itself (InputWatch) is not taken for an audio stall.
+struct AudioWatch
+{
+    std::uint64_t limit = 0;
+    std::uint64_t missed = 0; // frames without audio since the last one with audio
+    bool stopped = false;
+
+    enum class Change
+    {
+        None,
+        Stopped,
+        Resumed
+    };
+    // One recorded video frame, with or without its audio. `gap` gets the frames before this one that had none.
+    Change frame(bool audio, std::uint64_t* gap = nullptr)
+    {
+        if (audio)
+        {
+            bool const resumed = stopped;
+            if (gap != nullptr)
+            {
+                *gap = missed;
+            }
+            stopped = false;
+            missed = 0;
+            return resumed ? Change::Resumed : Change::None;
+        }
+        ++missed;
+        if (!stopped && limit > 0 && missed >= limit)
+        {
+            stopped = true;
+            return Change::Stopped;
+        }
+        return Change::None;
+    }
+    // Not connected (or not 48 kHz): nothing to watch.
+    void reset() { *this = AudioWatch{limit}; }
+};
+
 class MxlBridge
 {
 public:

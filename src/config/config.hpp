@@ -121,6 +121,21 @@ struct Config
     std::string nmosHostAddress;
     bool webEnable = true;
     int webPort = 8150;
+    // UI previews (SPECIFICATION.md §8.6): "jpeg" (made on request) or "webrtc" (one H.264 mosaic of
+    // every camera and channel, published to MediaMTX). Never both.
+    std::string previewMode = "jpeg";
+    // The platform's preview contract: a shared MediaMTX (RTSP base), or empty for the built-in one.
+    std::string previewPublishUrl;
+    std::string previewPathPrefix = "mxl-replay";
+    std::string previewWhepUrl;
+    std::string previewHlsUrl;
+    // The built-in MediaMTX: RTSP ingest on 127.0.0.1, WHEP, HLS and ICE (UDP and TCP).
+    int mediamtxRtspPort = 8854;
+    int mediamtxWhepPort = 8689;
+    int mediamtxHlsPort = 8688;
+    int mediamtxIcePort = 8489;
+    // CSP frame-ancestors of the /widget pages; /widgets answers these origins with CORS.
+    std::string widgetFrameAncestors = "'self'";
     std::string logLevel = "info";
     std::string logFormat = "json";
     std::string configFile;
