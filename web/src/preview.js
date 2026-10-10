@@ -1,14 +1,14 @@
 // The WebRTC preview (REPLAY_PREVIEW_MODE=webrtc, SPECIFICATION.md §8.6): one WHEP session per page plays
-// the mosaic of every channel and camera. Each picture is a <video> on that one MediaStream, cropped to its
-// tile with CSS object-view-box (Chrome and Edge 104+; other browsers get the same crop by position). The
-// session starts with the first picture, stays for the page, and connects again when it drops.
+// the mosaic of every channel and camera. Each picture is a <video> on that one MediaStream inside a box with
+// its tile's aspect ratio and overflow hidden; a CSS transform scales and moves the video so only the tile is
+// visible. That works in every browser (object-view-box is Chrome and Edge only). The session starts with the
+// first picture, stays for the page, and connects again when it drops.
 import { reactive } from "vue";
 import { api } from "./api.js";
 
 export const preview = reactive({ map: null, stream: null, connected: false });
 
 const RETRY_MS = 2000;
-const viewBox = typeof CSS !== "undefined" && CSS.supports?.("object-view-box", "inset(0px)");
 let started = false;
 
 // The own MediaMTX is announced on the replay's address; the page may know the host by another name.
@@ -75,18 +75,21 @@ export function startPreview() {
   connect();
 }
 
-/** The style that shows only tile `id` ("ch1", "cam2") of the mosaic in a <video>; null before the map is known. */
-export function tileStyle(id) {
+/**
+ * How tile `id` ("ch1", "cam2") is shown: `box` for its container (the tile's aspect ratio) and `video` for the
+ * <video> filling it, the whole mosaic stretched to the box, moved so the tile is at the top left and scaled up
+ * so the tile fills the box. Null before the map is known.
+ */
+export function tileCrop(id) {
   const map = preview.map;
   const tile = map?.tiles.find((t) => t.id === id);
   if (!tile) return null;
-  if (viewBox) return { objectViewBox: `inset(${tile.y}px ${map.width - tile.x - tile.w}px ${map.height - tile.y - tile.h}px ${tile.x}px)` };
-  // Without object-view-box: the whole mosaic, scaled so that the tile fills the box and moved there.
   return {
-    width: `${(map.width / tile.w) * 100}%`,
-    height: `${(map.height / tile.h) * 100}%`,
-    left: `${(-tile.x / tile.w) * 100}%`,
-    top: `${(-tile.y / tile.h) * 100}%`,
-    objectFit: "fill",
+    box: { aspectRatio: `${tile.w} / ${tile.h}` },
+    video: {
+      objectFit: "fill",
+      transformOrigin: "0 0",
+      transform: `scale(${map.width / tile.w}, ${map.height / tile.h}) translate(${(-100 * tile.x) / map.width}%, ${(-100 * tile.y) / map.height}%)`,
+    },
   };
 }

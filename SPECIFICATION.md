@@ -378,8 +378,9 @@ document. There are no secret settings.
     grain is due: from the grain already on the GPU (area average), else point-sampled on
     the CPU. Nothing waits for anything else; a tile may show parts of two pictures.
   - The UI opens one WHEP session per page and shows each picture as a `<video>` on that
-    one `MediaStream`, cropped to its tile with CSS `object-view-box` (by position in
-    browsers without it).
+    one `MediaStream`, cropped to its tile in every browser: a box with the tile's aspect
+    ratio and `overflow: hidden`, the video in it scaled and moved by a CSS transform
+    (CSS `object-view-box` crops only in Chrome and Edge).
 - **Preview contract** (platform §11.5 / D-185, as mxl-webrtc-monitor 1.3.0):
   - `PREVIEW_PUBLISH_URL` (`rtsp://` or `rtsps://` base, no path or credentials): set,
     the mosaic is published there (RTSP over TCP) and no MediaMTX is started; empty, the

@@ -1,9 +1,10 @@
 <script setup>
 // A preview picture. JPEG mode: fetched every `interval` ms while the page is visible (one request at a
 // time, no request while hidden), and at once when `bump` changes. WebRTC mode (REPLAY_PREVIEW_MODE=webrtc):
-// tile `tile` ("ch1", "cam2") of the page's one mosaic stream. Overlays go in the slot.
+// tile `tile` ("ch1", "cam2") of the page's one mosaic stream, in a box of the tile's aspect ratio.
+// Overlays go in the slot.
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { preview, startPreview, tileStyle } from "../preview.js";
+import { preview, startPreview, tileCrop } from "../preview.js";
 import { state } from "../store.js";
 
 const props = defineProps({
@@ -16,7 +17,7 @@ const props = defineProps({
 
 const webrtc = computed(() => Boolean(props.tile) && state.status?.preview?.mode === "webrtc");
 const video = ref(null);
-const cropped = computed(() => tileStyle(props.tile));
+const crop = computed(() => (webrtc.value ? tileCrop(props.tile) : null));
 watch(webrtc, (on) => on && startPreview(), { immediate: true });
 watch([video, () => preview.stream], ([element, stream]) => {
   if (element && stream && element.srcObject !== stream) {
@@ -69,9 +70,9 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="picture">
+  <div class="picture" :style="crop?.box">
     <template v-if="webrtc">
-      <video ref="video" :style="cropped" muted autoplay playsinline :aria-label="alt"></video>
+      <video ref="video" :style="crop?.video" muted autoplay playsinline :aria-label="alt"></video>
       <div v-if="!preview.connected" class="picture-empty">Connecting…</div>
     </template>
     <img v-else-if="url && !missing" :src="url" :alt="alt" />
