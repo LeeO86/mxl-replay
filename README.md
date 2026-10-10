@@ -183,7 +183,16 @@ The platform's preview contract: with `PREVIEW_PUBLISH_URL` the mosaic goes to t
 
 mxl-webrtc-monitor uses 8554/8889/8888/8189 (and 9997/9998), the FlowXer engine 8654/8989/8988/8289/9897, mxl-multiviewer 1.4.0 8754/8789/8788/8389. A collision with `WEB_PORT` or `NMOS_PORT`/`+1` exits 78. `/statusz` has `preview` (`mode`, and in WebRTC mode `publish` own or shared, `publish_url`, `path`, `state` connecting/publishing/error, `error`, `encoder` nvenc or x264, `frames`, the own MediaMTX's `running` and `restarts`, `streams`).
 
-Lab, NVIDIA A16 (GPU 3), 4 cameras 1080p50 from the test player and 2 live channels, buffer in RAM; CPU of the replay container (perf cgroup and `/proc`): JPEG mode with no page open 0.77–0.80 cores, with one LSM page polling (5 channel and 4 camera pictures a second, median 5 ms each on the HTTP thread) +0.04 cores, with three pages about the same (the pictures are shared for 150 ms and 1 s); WebRTC mode 0.85–0.87 cores with no viewer and the same with one (all 5 tiles of the LSM page from one stream at 25 fps). Its own parts: the encoder thread 2 % of a core, NVENC 1.65 ms per picture (copy on the GPU, encode, send; 2 % of the encoder engine, SM load unchanged at 47 %), the NVENC driver about 2 %, MediaMTX 1 % plus about 1.5 % per WHEP viewer.
+Lab, NVIDIA A16 (GPU 3), 4 cameras 1080p50 from the test player and 2 live channels, buffer in RAM, CPU of the replay process over 60 s, three runs per mode (they spread by about ±0.03 cores):
+
+| Preview | Replay CPU (cores) | Pictures |
+| --- | --- | --- |
+| JPEG, no page open | 0.77–0.82 | – |
+| JPEG, one LSM page (5 channel + 4 camera pictures a second, median 5–7 ms each on the HTTP thread) | +0.04 | channel 5/s, cameras 1/s |
+| WebRTC, NVENC, no viewer or one (Edge, LSM page) | 0.81–0.87, plus MediaMTX 0.01–0.015 (+0.016 with a viewer) | all 6 tiles at 25/s |
+| WebRTC, libx264 fallback (`video` capability removed) | 1.13 | all 6 tiles at 25/s |
+
+The NVENC path: 1.65–2.4 ms per picture in the encoder thread (copy on the GPU, encode, send), 1–2 % of the A16's encoder, SM load unchanged (47 %); perf shows the NVENC driver at about 0.02 cores and the encoder thread at 0.02. The cost does not grow with viewers (one encode; MediaMTX forwards). libx264 takes 4.1 ms per picture and about 0.3 cores more.
 
 ## Widgets
 
