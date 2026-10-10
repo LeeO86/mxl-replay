@@ -3,6 +3,8 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace replay
 {
@@ -22,6 +24,8 @@ struct HttpResponse
     std::string body;
     // Sent as Cache-Control when not empty.
     std::string cacheControl;
+    // More header lines (the widget routes' CSP, CORS).
+    std::vector<std::pair<std::string, std::string>> headers;
     bool websocket = false;
 };
 

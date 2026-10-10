@@ -4,14 +4,17 @@
 #include "flow/dis.hpp"
 #include "library/catalog.hpp"
 #include "media/frame.hpp"
+#include "media/mosaic.hpp"
 #include "nmos/ids.hpp"
 #include "ops/metrics.hpp"
+#include "ops/preview.hpp"
 #include "playout/scheduler.hpp"
 #include "playout/shotbox.hpp"
 #include "record/ring.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -155,6 +158,13 @@ public:
     [[nodiscard]] bool gpuInterpolate() const;
     void setGpuPresent(bool present);
 
+    // The WebRTC preview (REPLAY_PREVIEW_MODE=webrtc, SPECIFICATION.md §8.6): every channel and camera
+    // (phase 1) draws its tile into `mosaic` on every mosaicStep-th grain. Set before recording and
+    // playout start; null (the default) draws nothing. `status` gives the publish state for the status
+    // and the metrics.
+    void setPreviewMosaic(PreviewMosaic* mosaic);
+    void setPreviewStatus(std::function<PreviewStatus()> status);
+
     // The write throughput measured at start.
     [[nodiscard]] double storageBytesPerSecond() const { return storageBps_; }
     [[nodiscard]] std::uint64_t freeBytes() const;
@@ -234,6 +244,8 @@ private:
     void keepPreview(std::string const& key, std::vector<std::uint8_t> const& jpeg) const;
     [[nodiscard]] std::uint64_t sourcePeriod(int camera) const;
     [[nodiscard]] double hfrFactor(int camera) const;
+    // Whether the mosaic is drawn for the house grain at `taiNs`.
+    [[nodiscard]] bool mosaicDue(std::uint64_t taiNs) const;
     void loadRoutes();
     void saveRoutes() const;
     [[nodiscard]] std::string routesPath() const;
@@ -272,5 +284,8 @@ private:
     std::uint64_t startedNs_ = 0;
     std::uint64_t clipSerial_ = 1;
     std::string libraryDir_;
+    PreviewMosaic* mosaic_ = nullptr;
+    std::uint64_t mosaicStep_ = 1;
+    std::function<PreviewStatus()> previewStatus_;
 };
 } // namespace replay

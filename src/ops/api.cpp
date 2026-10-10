@@ -3,6 +3,7 @@
 #include "config/config.hpp"
 #include "media/timebase.hpp"
 #include "ops/httpserver.hpp"
+#include "ops/preview.hpp"
 #include "util/json.hpp"
 #include "util/logging.hpp"
 #include "version.hpp"
@@ -544,6 +545,24 @@ HttpResponse channelCommand(Engine& engine, int channel, std::string const& acti
     return json(200, engine.statusJson());
 }
 
+// The query of /widget/<id>: `channel` (1..REPLAY_CHANNELS; required for transport) and `theme`. Empty when valid.
+std::string widgetError(Config const& cfg, std::string const& id, std::string const& query)
+{
+    auto const channel = queryValue(query, "channel");
+    bool const valid = channel.size() <= 2 && channel.find_first_not_of("0123456789") == std::string::npos &&
+                       (channel.empty() || (std::stoi(channel) >= 1 && std::stoi(channel) <= cfg.channels));
+    if (!valid || (id == "transport" && channel.empty()))
+    {
+        return "channel must be a channel 1.." + std::to_string(cfg.channels);
+    }
+    auto const theme = queryValue(query, "theme");
+    if (!theme.empty() && theme != "dark" && theme != "light" && theme != "transparent")
+    {
+        return "theme must be dark, light or transparent";
+    }
+    return {};
+}
+
 // PATCH /api/v1/clips/{id}: the given fields change, the others stay.
 HttpResponse patchClip(Engine& engine, std::string const& id, Json const& body)
 {
@@ -681,6 +700,46 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
                             ? std::string("<!doctype html><title>MXL Replay</title><h1>MXL Replay</h1><p>API at /api/v1/status</p>")
                             : indexHtml;
         return response;
+    }
+    if (path == "/api/v1/preview/map" && method == "GET")
+    {
+        return json(200, previewMapJson(engine.config()));
+    }
+    if (path == "/widgets" && method == "GET")
+    {
+        // A designer page on an origin WIDGET_FRAME_ANCESTORS lists may read the list itself.
+        auto response = json(200, widgetsJson(engine.config()));
+        auto const origin = request.headers.find("origin");
+        if (origin != request.headers.end() && listedOrigin(engine.config().widgetFrameAncestors, origin->second))
+        {
+            response.headers.emplace_back("Access-Control-Allow-Origin", origin->second);
+        }
+        response.headers.emplace_back("Vary", "Origin");
+        return response;
+    }
+    if (path.rfind("/widget/", 0) == 0 && method == "GET")
+    {
+        auto const id = path.substr(std::string("/widget/").size());
+        if (id != "transport" && id != "clip-list")
+        {
+            return error(404, "widget not found");
+        }
+        if (auto const problem = widgetError(engine.config(), id, request.query); !problem.empty())
+        {
+            return error(400, problem);
+        }
+        // The page picks the widget from its URL. Only these routes may be framed, by WIDGET_FRAME_ANCESTORS.
+        HttpResponse response;
+        response.contentType = "text/html; charset=utf-8";
+        response.body = indexHtml.empty() ? std::string("<!doctype html><title>MXL Replay</title><p>UI was not embedded.</p>") : indexHtml;
+        response.headers.emplace_back("Content-Security-Policy", "frame-ancestors " + engine.config().widgetFrameAncestors);
+        return response;
+    }
+    // Never both (SPECIFICATION.md §8.6): with the WebRTC mosaic no camera or channel JPEG is made.
+    if (engine.config().previewMode == "webrtc" && suffixAfter(path, "/") == "preview.jpg" &&
+        (path.rfind("/api/v1/cameras/", 0) == 0 || path.rfind("/api/v1/channels/", 0) == 0))
+    {
+        return error(404, "the previews are WebRTC (REPLAY_PREVIEW_MODE=webrtc), see /api/v1/preview/map");
     }
     if (path == "/api/v1/config" && method == "GET")
     {

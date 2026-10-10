@@ -92,6 +92,84 @@ std::string take(std::map<std::string, std::string> const& values, std::string c
     return it == values.end() ? fallback : it->second;
 }
 
+// Empty, or an absolute URL of one of `schemes` with a host, an optional port, and no path other
+// than "/", no credentials, query or fragment. A trailing slash is removed. (As mxl-multiviewer 1.4.0.)
+std::string baseUrl(std::string const& key, std::string const& value, std::vector<std::string> const& schemes)
+{
+    if (value.empty())
+    {
+        return {};
+    }
+    std::string names;
+    for (auto const& name : schemes)
+    {
+        names += (names.empty() ? "" : " or ") + name;
+    }
+    auto const sep = value.find("://");
+    auto const scheme = sep == std::string::npos ? std::string{} : lower(value.substr(0, sep));
+    if (std::find(schemes.begin(), schemes.end(), scheme) == schemes.end())
+    {
+        throw ConfigError(key + " must be an absolute " + names + " URL");
+    }
+    auto rest = value.substr(sep + 3);
+    if (!rest.empty() && rest.back() == '/')
+    {
+        rest.pop_back();
+    }
+    if (rest.empty() || rest.find_first_of("/@?# ") != std::string::npos)
+    {
+        throw ConfigError(key + " must be an absolute " + names + " URL with a host and no path");
+    }
+    return scheme + "://" + rest;
+}
+
+// PREVIEW_PATH_PREFIX: MediaMTX path segments joined by '/'; outer slashes are dropped, empty is the default.
+std::string pathPrefix(std::string const& value)
+{
+    auto const first = value.find_first_not_of('/');
+    if (first == std::string::npos)
+    {
+        return Config{}.previewPathPrefix;
+    }
+    auto const prefix = value.substr(first, value.find_last_not_of('/') - first + 1);
+    std::stringstream stream(prefix);
+    std::string segment;
+    while (std::getline(stream, segment, '/'))
+    {
+        if (segment.empty() || segment == "." || segment == ".." ||
+            segment.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-") != std::string::npos)
+        {
+            throw ConfigError("PREVIEW_PATH_PREFIX must be path segments of letters, digits, '.', '_', '~' and '-' joined by '/'");
+        }
+    }
+    return prefix;
+}
+
+// The built-in MediaMTX listens next to the web and NMOS ports: no two may be the same.
+void checkPreviewPorts(Config const& cfg)
+{
+    std::vector<std::pair<std::string, int>> ports{{"WEB_PORT", cfg.webPort},
+        {"MEDIAMTX_RTSP_PORT", cfg.mediamtxRtspPort},
+        {"MEDIAMTX_WHEP_PORT", cfg.mediamtxWhepPort},
+        {"MEDIAMTX_HLS_PORT", cfg.mediamtxHlsPort},
+        {"MEDIAMTX_ICE_UDP_PORT", cfg.mediamtxIcePort}};
+    if (cfg.nmosEnable)
+    {
+        ports.push_back({"NMOS_PORT", cfg.nmosPort});
+        ports.push_back({"NMOS_PORT+1", cfg.nmosPort + 1});
+    }
+    for (std::size_t i = 0; i < ports.size(); ++i)
+    {
+        for (std::size_t j = i + 1; j < ports.size(); ++j)
+        {
+            if (ports[i].second != 0 && ports[i].second == ports[j].second)
+            {
+                throw ConfigError(ports[i].first + " collides with " + ports[j].first);
+            }
+        }
+    }
+}
+
 bool isIndexedKey(std::string const& key, char const* prefix, int* index, std::string* field)
 {
     std::string const head(prefix);
@@ -281,7 +359,9 @@ std::vector<std::string> configKeys()
         "MXL_OUTPUT_DOMAIN_ID",
         "MXL_HISTORY_DURATION", "MXL_CLEANUP_ON_EXIT", "SHUTDOWN_TIMEOUT_S", "NMOS_ENABLE", "NMOS_REGISTRY_ADDRESS", "NMOS_REGISTRY_PORT",
         "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "NMOS_DNS_SD", "NMOS_PORT", "NMOS_SEED", "NMOS_LABEL", "NMOS_TAGS", "NMOS_HOST_ADDRESS", "WEB_ENABLE",
-        "WEB_PORT", "LOG_LEVEL", "LOG_FORMAT", "REPLAY_CONFIG_FILE"};
+        "WEB_PORT", "LOG_LEVEL", "LOG_FORMAT", "REPLAY_CONFIG_FILE", "REPLAY_PREVIEW_MODE", "PREVIEW_PUBLISH_URL", "PREVIEW_PATH_PREFIX",
+        "PREVIEW_WHEP_URL", "PREVIEW_HLS_URL", "MEDIAMTX_RTSP_PORT", "MEDIAMTX_WHEP_PORT", "MEDIAMTX_HLS_PORT", "MEDIAMTX_ICE_UDP_PORT",
+        "WIDGET_FRAME_ANCESTORS"};
 }
 
 std::string hostnameString()
@@ -636,6 +716,40 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     }
     cfg.webEnable = flag;
     cfg.webPort = parseInt("WEB_PORT", take(values, "WEB_PORT", "8150"), 0, 65535);
+    cfg.previewMode = lower(take(values, "REPLAY_PREVIEW_MODE", "jpeg"));
+    if (cfg.previewMode.empty())
+    {
+        cfg.previewMode = "jpeg";
+    }
+    if (cfg.previewMode != "jpeg" && cfg.previewMode != "webrtc")
+    {
+        throw ConfigError("REPLAY_PREVIEW_MODE must be jpeg or webrtc");
+    }
+    cfg.previewPublishUrl = baseUrl("PREVIEW_PUBLISH_URL", take(values, "PREVIEW_PUBLISH_URL", ""), {"rtsp", "rtsps"});
+    cfg.previewPathPrefix = pathPrefix(take(values, "PREVIEW_PATH_PREFIX", ""));
+    cfg.previewWhepUrl = baseUrl("PREVIEW_WHEP_URL", take(values, "PREVIEW_WHEP_URL", ""), {"http", "https"});
+    cfg.previewHlsUrl = baseUrl("PREVIEW_HLS_URL", take(values, "PREVIEW_HLS_URL", ""), {"http", "https"});
+    cfg.mediamtxRtspPort = parseInt("MEDIAMTX_RTSP_PORT", take(values, "MEDIAMTX_RTSP_PORT", "8854"), 1, 65535);
+    cfg.mediamtxWhepPort = parseInt("MEDIAMTX_WHEP_PORT", take(values, "MEDIAMTX_WHEP_PORT", "8689"), 1, 65535);
+    cfg.mediamtxHlsPort = parseInt("MEDIAMTX_HLS_PORT", take(values, "MEDIAMTX_HLS_PORT", "8688"), 1, 65535);
+    cfg.mediamtxIcePort = parseInt("MEDIAMTX_ICE_UDP_PORT", take(values, "MEDIAMTX_ICE_UDP_PORT", "8489"), 1, 65535);
+    cfg.widgetFrameAncestors = take(values, "WIDGET_FRAME_ANCESTORS", "");
+    if (cfg.widgetFrameAncestors.find_first_not_of(' ') == std::string::npos)
+    {
+        cfg.widgetFrameAncestors = Config{}.widgetFrameAncestors;
+    }
+    // One CSP directive's source list: a ';' or ',' would start another directive or policy.
+    for (unsigned char const c : cfg.widgetFrameAncestors)
+    {
+        if (c < 0x20 || c == 0x7f || c == ';' || c == ',')
+        {
+            throw ConfigError("WIDGET_FRAME_ANCESTORS must be a CSP source list, e.g. 'self' https://designer.example");
+        }
+    }
+    if (cfg.previewMode == "webrtc" && cfg.previewPublishUrl.empty())
+    {
+        checkPreviewPorts(cfg);
+    }
     cfg.logLevel = lower(take(values, "LOG_LEVEL", "info"));
     cfg.logFormat = lower(take(values, "LOG_FORMAT", "json"));
     cfg.configFile = take(values, "REPLAY_CONFIG_FILE", "");

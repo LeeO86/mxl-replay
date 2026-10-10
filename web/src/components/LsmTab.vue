@@ -118,7 +118,7 @@ const recordText = (cam) => (!cam.record ? "OFF" : cam.recording ? "REC" : "NO S
   <div v-if="active" class="lsm">
     <div class="lsm-left">
       <div class="monitor-wrap" @wheel.prevent="onMonitorWheel">
-        <LivePicture :src="`/api/v1/channels/${active.index}/preview.jpg`" :interval="200" :bump="state.previewBump" alt="channel monitor">
+        <LivePicture :src="`/api/v1/channels/${active.index}/preview.jpg`" :tile="`ch${active.index}`" :interval="200" :bump="state.previewBump" alt="channel monitor">
           <span class="ov tl">
             <span class="state-tag" :class="channelState(active)">{{ channelState(active).toUpperCase() }}</span>
             <span class="swatch" :style="{ background: cameraColour(active.camera) }"></span>{{ cameraLabel(active.camera) }}
@@ -148,7 +148,7 @@ const recordText = (cam) => (!cam.record ? "OFF" : cam.recording ? "REC" : "NO S
           :title="`Switch ${active.label} to ${cam.label} (key ${cam.index})`"
           @click="setAngle(cam.index)"
         >
-          <LivePicture :src="`/api/v1/cameras/${cam.index}/preview.jpg`" :interval="1000" :alt="cam.label" />
+          <LivePicture :src="`/api/v1/cameras/${cam.index}/preview.jpg`" :tile="`cam${cam.index}`" :interval="1000" :alt="cam.label" />
           <span class="cam-label">
             <kbd v-if="cam.index < 10">{{ cam.index }}</kbd>
             <span class="swatch" :style="{ background: cam.colour }"></span>

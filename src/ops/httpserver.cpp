@@ -247,9 +247,14 @@ struct HttpServer::Impl
                     }
                     continue;
                 }
+                std::string extra;
+                for (auto const& [name, value] : response.headers)
+                {
+                    extra += "\r\n" + name + ": " + value;
+                }
                 std::string message = "HTTP/1.1 " + std::to_string(response.status) + " " + statusText(response.status) + "\r\nContent-Type: " +
                                       response.contentType + "\r\nContent-Length: " + std::to_string(response.body.size()) +
-                                      (response.cacheControl.empty() ? std::string{} : "\r\nCache-Control: " + response.cacheControl) +
+                                      (response.cacheControl.empty() ? std::string{} : "\r\nCache-Control: " + response.cacheControl) + extra +
                                       "\r\nConnection: close\r\n\r\n" + response.body;
                 sendAll(job.fd, message.data(), message.size());
                 drop.push_back(job.fd);

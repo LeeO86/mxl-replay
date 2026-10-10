@@ -25,7 +25,7 @@ spec:
         mxl.replay/nvme: "true"
       containers:
         - name: mxl-replay
-          image: ghcr.io/leeo86/mxl-replay:1.3.2
+          image: ghcr.io/leeo86/mxl-replay:1.4.0
           ports:
             - name: web
               containerPort: 8150
@@ -72,6 +72,20 @@ spec:
               value: "3302"
             - name: WEB_PORT
               value: "8150"
+            # One WebRTC mosaic instead of the JPEG previews (README "Previews"). With the platform's
+            # shared MediaMTX set the preview contract; without PREVIEW_PUBLISH_URL the image's own
+            # MediaMTX runs, and its WHEP (8689), HLS (8688) and ICE (8489 UDP and TCP) ports must be
+            # reachable from the browsers.
+            # - name: REPLAY_PREVIEW_MODE
+            #   value: webrtc
+            # - name: PREVIEW_PUBLISH_URL
+            #   value: rtsp://mediamtx.example.svc:8554
+            # - name: PREVIEW_PATH_PREFIX
+            #   value: example/replay
+            # - name: PREVIEW_WHEP_URL
+            #   value: https://whep.example
+            # - name: WIDGET_FRAME_ANCESTORS
+            #   value: "'self' https://designer.example"
           volumeMounts:
             - name: mxl
               mountPath: /Volumes/mxl

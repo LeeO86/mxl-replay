@@ -48,4 +48,18 @@ void gpuReleaseHostMemory();
 
 // One upload of 10-bit planes that are already on the host (tests, uploads, phased assembly).
 [[nodiscard]] std::vector<std::uint8_t> gpuEncodeFrame10(Frame10 const& frame, int quality);
+
+// The preview mosaic's NV12 canvas in device memory (SPECIFICATION.md §8.6): `height` luma rows, then
+// height/2 rows of interleaved CbCr, `pitch` bytes apart; black. Null without a device.
+[[nodiscard]] std::uint8_t* gpuCanvasCreate(int width, int height, int& pitch);
+void gpuCanvasDestroy(std::uint8_t* canvas);
+// Scales the picture the calling thread last moved through the GPU (gpuEncodeV210, gpuEncodeFrame10,
+// gpuRenderFromJpeg) into the canvas rectangle x, y, w, h (even values), area-averaged, on the
+// thread's stream. False when the thread has no such picture.
+bool gpuCanvasDrawLast(std::uint8_t* canvas, int pitch, int height, int x, int y, int w, int h);
+// `rows` rows of `bytes` from `src` to `dst`, each in host or device memory. Returns when copied.
+bool gpuCopyRows(void* dst, std::size_t dstPitch, void const* src, std::size_t srcPitch, std::size_t bytes, std::size_t rows);
+// The CUDA context this process works in (the runtime's primary context), made current on the
+// calling thread: NVENC encodes the canvas there. Null without a device.
+[[nodiscard]] void* gpuContext();
 } // namespace replay

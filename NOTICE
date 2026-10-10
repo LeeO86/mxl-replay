@@ -21,3 +21,17 @@ The occlusion-aware blend follows the temporal-interpolation method Futatabi
 uses, which is based on occlusion reasoning for frame interpolation with
 optical flow. Ported sources under src/flow keep that attribution in their
 headers.
+
+The WebRTC preview (1.4.0) adapts code by the same author from:
+
+  mxl-webrtc-monitor (https://github.com/LeeO86/mxl-webrtc-monitor), MIT License,
+  Copyright (c) 2026 Adrian Hilber: the MediaMTX child supervisor
+  (src/ops/child.cpp) and the MediaMTX configuration (src/ops/preview.cpp).
+  mxl-multiviewer (https://github.com/LeeO86/mxl-multiviewer), Apache License 2.0:
+  the H.264 publisher, the preview settings checks and the widget origin check.
+  FlowXer engine prototype (https://github.com/Firesh0ot/FlowXer), Apache License
+  2.0: NVENC on CUDA frames in the process's own context.
+
+The container image bundles MediaMTX (https://github.com/bluenviron/mediamtx),
+MIT License, as a separate program; its licence is in
+/usr/share/doc/mediamtx/LICENSE in the image.

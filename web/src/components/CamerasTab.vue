@@ -40,7 +40,7 @@ function recordPill(cam) {
         <span class="spacer"></span>
         <Pill :text="recordPill(cam).text" :kind="recordPill(cam).kind" />
       </h3>
-      <LivePicture :src="`/api/v1/cameras/${cam.index}/preview.jpg`" :interval="2000" :alt="cam.label" />
+      <LivePicture :src="`/api/v1/cameras/${cam.index}/preview.jpg`" :tile="`cam${cam.index}`" :interval="2000" :alt="cam.label" />
       <dl class="kv">
         <dt>Video input</dt>
         <dd>

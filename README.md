@@ -6,7 +6,7 @@ The interpolation is a derivative of [Futatabi](https://nageru.sesse.net/doc/fut
 
 This program is free software under **GPL-3.0-or-later**. See `LICENSE`.
 
-The published image also contains NVIDIA `libcudart.so.12` and `libnvjpeg.so.12`. Those libraries are NVIDIA's, used under the NVIDIA software licence, and are loaded at runtime. `libcuda` is not in the image; the NVIDIA container toolkit injects it. The source can be built without CUDA, in which case JPEG uses libjpeg-turbo and interpolation falls back to repeat or blend.
+The published image also contains the [MediaMTX](https://github.com/bluenviron/mediamtx) 1.20.1 binary (MIT, licence in `/usr/share/doc/mediamtx/LICENSE`), a separate program the WebRTC preview runs, and NVIDIA `libcudart.so.12` and `libnvjpeg.so.12`. Those libraries are NVIDIA's, used under the NVIDIA software licence, and are loaded at runtime. `libcuda` is not in the image; the NVIDIA container toolkit injects it. The source can be built without CUDA, in which case JPEG uses libjpeg-turbo and interpolation falls back to repeat or blend.
 
 ## What it does
 
@@ -16,6 +16,8 @@ The published image also contains NVIDIA `libcudart.so.12` and `libnvjpeg.so.12`
 - Native high frame rate and phased high frame rate (for example 3 × 50p). Missing phases repeat a neighbour and are counted.
 - Clips, a shotbox, playlists, upload (FFmpeg), and export (JPEG sequence + WAV).
 - NMOS IS-04/IS-05 node, REST, WebSocket, and Prometheus metrics on `WEB_PORT` (default 8150).
+- UI previews as JPEG pictures, or as one WebRTC mosaic of every camera and channel encoded once (`REPLAY_PREVIEW_MODE=webrtc`, see "Previews").
+- Operator-screen widgets: `transport` and `clip-list` (see "Widgets").
 
 ## Storage
 
@@ -52,6 +54,7 @@ Dependencies: libjpeg-turbo, SQLite, FFmpeg libraries (libavcodec, libavformat, 
 
 ```
 tests/integration/replay.sh ./build/mxl-replay
+MEDIAMTX_BIN=/path/to/mediamtx tests/integration/preview.sh ./build/mxl-replay
 ```
 
 ## Configuration
@@ -105,6 +108,14 @@ Process state (the SQLite catalog, imported settings, and IS-05 routes) lives in
 | `NMOS_HOST_ADDRESS` | first non-loopback IPv4. This is the only address announced (node href, API endpoints, IS-05 controls). `0.0.0.0`, `127.0.0.1`, and hostnames are rejected |
 | `WEB_ENABLE` | true |
 | `WEB_PORT` | 8150 |
+| `REPLAY_PREVIEW_MODE` | `jpeg`: pictures on request. `webrtc`: one H.264 mosaic over WebRTC, no camera or channel JPEG ("Previews") |
+| `PREVIEW_PUBLISH_URL` | empty: the image's own MediaMTX runs. An `rtsp://` or `rtsps://` base (no path, no credentials): publish to that shared MediaMTX, start none |
+| `PREVIEW_PATH_PREFIX` | `mxl-replay`. The stream is `<prefix>/mosaic` |
+| `PREVIEW_WHEP_URL` / `PREVIEW_HLS_URL` | empty: the own MediaMTX on `NMOS_HOST_ADDRESS`. Otherwise the public base the page plays from |
+| `MEDIAMTX_RTSP_PORT` | 8854, RTSP ingest of the own MediaMTX on 127.0.0.1 |
+| `MEDIAMTX_WHEP_PORT` / `MEDIAMTX_HLS_PORT` | 8689 / 8688 (own MediaMTX) |
+| `MEDIAMTX_ICE_UDP_PORT` | 8489, WebRTC ICE of the own MediaMTX, UDP and TCP |
+| `WIDGET_FRAME_ANCESTORS` | `'self'`. CSP `frame-ancestors` of the widget pages; `/widgets` answers these origins with CORS |
 | `LOG_LEVEL` | `info` |
 | `LOG_FORMAT` | `json` |
 
@@ -117,7 +128,7 @@ Per-camera keys are `CAM1_LABEL`, `CAM1_COLOUR` (alias `CAM1_COLOR`), `CAM1_RECO
 The UI is served on `/`. The pages are tabs with their own address (`/#shotbox`, `#lsm`, `#library`, `#playlists`, `#cameras`, `#nmos`, `#settings`):
 
 - **Shotbox**: one button per clip and playlist. One click cues it (yellow), the next plays it (green, with progress), the next pauses, the next resumes; an ended shot is grey. *Back to live*, speed presets, and the target channel at the top. Keys: 1–9 and 0 select a button of the bank, Enter cues/plays it, Space is play/pause, PgUp/PgDn change the bank.
-- **LSM**: the channel monitor (a JPEG preview five times a second; full motion is the WebRTC monitor on the channel output), the cameras (click or 1–9 switches the angle), IN/OUT, Go IN/OUT, frame and second steps, Play/Pause/Live, the speed fader with presets and reverse, motion, audio and timecode mode, lock to the first channel, and the buffer timeline (drag to scrub, wheel ±1 frame, Shift ±1 s). *Create clip* asks for name, all angles, colour and tags.
+- **LSM**: the channel monitor (a JPEG preview five times a second, or the full-motion mosaic in WebRTC mode; full motion is also the WebRTC monitor on the channel output), the cameras (click or 1–9 switches the angle), IN/OUT, Go IN/OUT, frame and second steps, Play/Pause/Live, the speed fader with presets and reverse, motion, audio and timecode mode, lock to the first channel, and the buffer timeline (drag to scrub, wheel ±1 frame, Shift ±1 s). *Create clip* asks for name, all angles, colour and tags.
 - **Library**: search, the clip inspector (IN/OUT frame by frame, speed, modes, end action, name, colour, tags), export, consolidate, delete, upload.
 - **Playlists**: entries with their own speed, end action and auto-advance; play on the selected channel. When an entry ends with *next*, auto-advance plays the next clip at once, otherwise it is cued and waits for Play.
 - **Cameras**, **NMOS**, **Settings** (configuration export and import, the keyboard map, a WebHID jog/shuttle).
@@ -130,7 +141,8 @@ HTTP on `WEB_PORT`:
 | --- | --- |
 | GET | `/livez`, `/readyz`, `/statusz`, `/metrics`, `/` |
 | GET | `/api/v1/status`, `/api/v1/config`, `/api/v1/config/export`, `/api/v1/nmos`, `/api/v1/clips`, `/api/v1/playlists`, `/api/v1/playlists/{id}` |
-| GET | `/api/v1/channels/{n}/preview.jpg`, `/api/v1/cameras/{n}/preview.jpg`, `/api/v1/clips/{id}/thumbnail.jpg` |
+| GET | `/api/v1/channels/{n}/preview.jpg`, `/api/v1/cameras/{n}/preview.jpg` (JPEG mode), `/api/v1/clips/{id}/thumbnail.jpg`, `/api/v1/preview/map` |
+| GET | `/widgets`, `/widget/transport?channel=<n>`, `/widget/clip-list[?channel=<n>]` (with `&theme=dark\|light\|transparent`) |
 | POST | `/api/v1/channels/{n}/transport` (`command`: `play`, `pause`, `live`), `/speed` (`speed`, −1…2), `/position` (`frames`, `seconds` or `tai_ns`), `/marks` (`which`: `in`, `out`, `goto-in`, `goto-out`), `/angle` (`camera`), `/mode` (`motion`, `audio`, `timecode`: `source` or `output`), `/lock` (`enable`) |
 | POST | `/api/v1/clips` (`channel`, `name`, `all_angles`, `force`, `colour`, `tags`), `/api/v1/clips/{id}/export`, `/api/v1/clips/{id}/consolidate`, `/api/v1/shotbox/{id}` (a clip or playlist; `channel`) |
 | POST | `/api/v1/playlists` (`name`, `clips` or `entries`), `/api/v1/playlists/{id}/play` (`channel`), `/api/v1/uploads?name=…` (the file is the body), `/api/v1/config/import`, `/api/v1/control` |
@@ -147,11 +159,55 @@ On SIGTERM the process stops playout, releases MXL readers and writers, removes 
 
 Playout channels are NMOS senders (video `video/v210`, audio `audio/float32`, data `video/smpte291`) in the replay's own domain, labelled `<channel label> Video`, `Audio` and `Data`. Inputs are receivers, labelled `<camera label> Video` and `Audio` the same way. A receiver accepts activation before the flow exists and stays `waiting` until the grain can be read. A connected camera input that records nothing for `REPLAY_INPUT_STALL_S` (its writer stopped or restarted, the flow was removed, a fabrics mirror lost its link) logs `recording_stopped` once, with `camera`, `phase` and `reason` (`no_grains`; `invalid_grains`: grains arrive but are invalid or incomplete; `flow_missing`: the flow cannot be opened). Recording resumes by itself when grains come back, also on a flow that was removed and created again, and logs `recording_resumed` with the `gap_ms`. Nothing is stored for the gap. Camera audio (`CAM<n>_AUDIO`, default on) is stored with each video frame: the frame's samples of a 48 kHz `audio/float32` flow, first two channels, mono doubled. Another sample rate leaves the audio receiver `unsupported`. An HFR camera takes its audio with phase 1. The process does not write into a mirror domain.
 
+A camera whose audio delivers no samples for `REPLAY_INPUT_STALL_S` worth of video frames while its video records logs `recording_audio_stopped` (`camera`, `reason`: `flow_missing` or `no_samples`) once, and `recording_audio_resumed` with `gap_ms` when it is back; those frames are stored without audio. A channel that falls more than two grains behind its output clock continues at the current grain (a resync): `output_resyncs_total` counts it and the log has `output_resync` (`channel`, `resyncs` since the last line, `jumped_grains`) at most every 10 s. One at the start is normal (the first grains set up the GPU path).
+
 `REPLAY_SYNTHETIC=true` feeds a moving test raster into the recorder so the UI and the integration test can run without other MXL flows.
+
+## Previews
+
+`REPLAY_PREVIEW_MODE` picks one of two ways the UI shows cameras and channels; the replay never makes both.
+
+- `jpeg` (the default): the pictures above, made on request (a channel 5 times a second on the LSM page, a camera once a second).
+- `webrtc`: **one mosaic** of every channel and every camera at 25 pictures a second (every second grain at 50p, every grain up to 30p), encoded **once** as H.264 with NVENC and published to MediaMTX, which serves WebRTC (WHEP) and HLS. The page opens one WHEP session and shows every picture as a `<video>` on that one stream, cropped to its tile in every browser: the video sits in a box with the tile's aspect ratio and `overflow: hidden`, and a CSS transform scales and moves it so only the tile shows (CSS `object-view-box` would be Chrome and Edge only). There is no audio. Without NVENC (no GPU, or `video` missing from `NVIDIA_DRIVER_CAPABILITIES`) libx264 encodes it and `preview_nvenc_unavailable` says why. Camera and channel JPEGs answer 404; clip thumbnails stay.
+
+The mosaic has the channels at 640×360 (three a row) above the cameras at 480×270 (four a row): 1920×630 for 2 channels and 4 cameras. A canvas taller than 1080 lines is scaled down to fit 1920×1080. `GET /api/v1/preview/map` lists every tile (`ch<n>`, `cam<n>`) with `x`, `y`, `w`, `h`, the canvas size, the stream path and the WHEP and HLS URLs. Each camera's reader and each channel's playout thread draw their own tile from the grain they already have on the GPU (area average; without a GPU point-sampled on the CPU), so nothing extra is decoded or copied to the host.
+
+The platform's preview contract: with `PREVIEW_PUBLISH_URL` the mosaic goes to that shared MediaMTX as `<PREVIEW_PATH_PREFIX>/mosaic` over RTSP/TCP and the replay starts no MediaMTX; set `PREVIEW_WHEP_URL` (and `PREVIEW_HLS_URL`) to its public bases so the page plays from there. Without it the image's MediaMTX runs as a child of the replay (restarted when it exits, stopped with the replay) on these ports, chosen next to the other media functions:
+
+| Port | Own MediaMTX |
+| --- | --- |
+| 8854/tcp | RTSP ingest, 127.0.0.1 only |
+| 8689/tcp | WHEP (WebRTC) |
+| 8688/tcp | low-latency HLS |
+| 8489/udp+tcp | WebRTC ICE (host candidate `NMOS_HOST_ADDRESS`) |
+
+mxl-webrtc-monitor uses 8554/8889/8888/8189 (and 9997/9998), the FlowXer engine 8654/8989/8988/8289/9897, mxl-multiviewer 1.4.0 8754/8789/8788/8389. A collision with `WEB_PORT` or `NMOS_PORT`/`+1` exits 78. `/statusz` has `preview` (`mode`, and in WebRTC mode `publish` own or shared, `publish_url`, `path`, `state` connecting/publishing/error, `error`, `encoder` nvenc or x264, `frames`, the own MediaMTX's `running` and `restarts`, `streams`).
+
+Lab, NVIDIA A16 (GPU 3), 4 cameras 1080p50 from the test player and 2 live channels, buffer in RAM, CPU of the replay process over 60 s, three runs per mode (they spread by about ±0.03 cores):
+
+| Preview | Replay CPU (cores) | Pictures |
+| --- | --- | --- |
+| JPEG, no page open | 0.77–0.82 | – |
+| JPEG, one LSM page (5 channel + 4 camera pictures a second, median 5–7 ms each on the HTTP thread) | +0.04 | channel 5/s, cameras 1/s |
+| WebRTC, NVENC, no viewer or one (Edge, LSM page) | 0.81–0.87, plus MediaMTX 0.01–0.015 (+0.016 with a viewer) | all 6 tiles at 25/s |
+| WebRTC, libx264 fallback (`video` capability removed) | 1.13 | all 6 tiles at 25/s |
+
+The NVENC path: 1.65–2.4 ms per picture in the encoder thread (copy on the GPU, encode, send), 1–2 % of the A16's encoder, SM load unchanged (47 %); perf shows the NVENC driver at about 0.02 cores and the encoder thread at 0.02. The cost does not grow with viewers (one encode; MediaMTX forwards). libx264 takes 4.1 ms per picture and about 0.3 cores more.
+
+## Widgets
+
+Operator screens (the platform's production designer) frame single controls of the replay:
+
+| Widget | Query | Minimum size | Shows |
+| --- | --- | --- | --- |
+| `transport` | `channel` (required) | 480×160 | label, state, timecode; Cue (back to IN, paused), Play/Pause, Live (E2E); speed fader 0–200 % and presets |
+| `clip-list` | `channel` (optional: without it a channel picker) | 400×300 | every clip, newest first, with Load (cues it on the channel; then Play, Pause) |
+
+`GET /widgets` lists them with a JSON schema of their parameters; it answers an `Origin` that `WIDGET_FRAME_ANCESTORS` names (or `*`) with `Access-Control-Allow-Origin`. `GET /widget/<id>?…[&theme=dark|light|transparent]` is the page without the app around it, on the replay's own API; a bad parameter answers 400, an unknown widget 404. Only these routes carry `Content-Security-Policy: frame-ancestors <WIDGET_FRAME_ANCESTORS>` (default `'self'`), and none carries `X-Frame-Options`. The page posts `{type: "widget-ready"}` and `{type: "widget-size", w, h}` to its parent.
 
 ## Metrics
 
-Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, `disk_bytes`, and `record_last_frame_age_seconds`: seconds since the camera's newest recorded frame, counted from the process start at most. It stays below 0.1 s while the camera records and grows when it does not (also when it is not connected or `CAM<n>_RECORD` is off); the status has it per camera as `last_frame_age_s`. Channels report state, speed, and late grains. `frame_gpu_seconds` is a histogram labelled by stage. Storage reports `write_bytes_per_second` (what the recorder wrote since the previous scrape, over at least a second: 0 when nothing records), `storage_measured_bytes_per_second` (the write test at start, `storage_bps` in the status), free bytes, and protected bytes. A Grafana dashboard is in `deploy/grafana/`.
+Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, `disk_bytes`, and `record_last_frame_age_seconds`: seconds since the camera's newest recorded frame, counted from the process start at most. It stays below 0.1 s while the camera records and grows when it does not (also when it is not connected or `CAM<n>_RECORD` is off); the status has it per camera as `last_frame_age_s`. Channels report state, speed, and late grains. `frame_gpu_seconds` is a histogram labelled by stage. Storage reports `write_bytes_per_second` (what the recorder wrote since the previous scrape, over at least a second: 0 when nothing records), `storage_measured_bytes_per_second` (the write test at start, `storage_bps` in the status), free bytes, and protected bytes. Channels also report `output_resyncs_total`. Previews: `preview_mode{mode}` (jpeg, webrtc) and in WebRTC mode `preview_publish_mode{mode}` (own, shared), `preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`, `preview_encode_seconds` (histogram of one picture's copy, encode and send) and `preview_mediamtx_restarts_total` (own mode). A Grafana dashboard is in `deploy/grafana/`.
 
 ## Deploy
 
@@ -180,7 +236,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.3.2
+  ghcr.io/leeo86/mxl-replay:1.4.0
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.

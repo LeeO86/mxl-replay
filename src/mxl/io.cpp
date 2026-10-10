@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -302,6 +303,9 @@ void MxlBridge::readInput(int camera, int phase)
     // costs the video at most one frame per 50.
     std::uint64_t audioMisses = 0;
     auto const audioWaitNs = static_cast<std::uint64_t>(framePeriodNs(cfg.format.rateNum, cfg.format.rateDen));
+    // Why the last audio read gave no samples: "" (it did), "off" (not routed, or not 48 kHz),
+    // "flow_missing" or "no_samples".
+    std::string audioProblem;
     auto audioRoute = [&](Route const& route, std::string const& state) {
         if (state != audioState)
         {
@@ -311,6 +315,7 @@ void MxlBridge::readInput(int camera, int phase)
     };
     auto readAudio = [&](std::uint64_t index) -> std::vector<float> {
         auto const route = engine_.route(camera, 1, false);
+        audioProblem = "off";
         if (!route.active || route.flowId.empty() || route.domainId.empty())
         {
             close(audio, false);
@@ -322,6 +327,7 @@ void MxlBridge::readInput(int camera, int phase)
         if (!attach(audio, route, false))
         {
             audioRoute(route, "waiting");
+            audioProblem = "flow_missing";
             return {};
         }
         if (reopened)
@@ -348,6 +354,7 @@ void MxlBridge::readInput(int camera, int phase)
                                        : mxlFlowReaderGetSamplesNonBlocking(audio.reader, end, count, &slices);
         if (status != MXL_STATUS_OK || slices.count == 0)
         {
+            audioProblem = "no_samples";
             ++audioMisses;
             if (status == MXL_ERR_FLOW_INVALID)
             {
@@ -372,7 +379,28 @@ void MxlBridge::readInput(int camera, int phase)
             }
         }
         audioRoute(route, "running");
+        audioProblem.clear();
         return pcm;
+    };
+    // Logs once when the camera's audio stops while its video records, and again when it is back.
+    auto const period = framePeriodNs(cfg.format.rateNum, cfg.format.rateDen);
+    AudioWatch audioWatch{static_cast<std::uint64_t>(std::ceil(cfg.inputStallS * 1e9 / static_cast<double>(period)))};
+    auto watchAudio = [&](bool samples) {
+        if (audioProblem == "off")
+        {
+            audioWatch.reset();
+            return;
+        }
+        std::uint64_t gap = 0;
+        auto const change = audioWatch.frame(samples, &gap);
+        if (change == AudioWatch::Change::Stopped)
+        {
+            logWarn("recording_audio_stopped", {{"camera", std::to_string(camera)}, {"reason", audioProblem}});
+        }
+        else if (change == AudioWatch::Change::Resumed)
+        {
+            logInfo("recording_audio_resumed", {{"camera", std::to_string(camera)}, {"gap_ms", std::to_string(gap * static_cast<std::uint64_t>(period) / 1000000)}});
+        }
     };
     // Logs once when the camera input stops (InputWatch) and again when it resumes.
     InputWatch watch{static_cast<std::uint64_t>(cfg.inputStallS * 1e9)};
@@ -461,7 +489,9 @@ void MxlBridge::readInput(int camera, int phase)
                 if (withAudio)
                 {
                     // Taken by the next frame this phase stores, which is this grain's.
-                    engine_.ingestAudio(camera, mxlIndexToTimestamp(&rate, input.next), readAudio(input.next), 2);
+                    auto pcm = readAudio(input.next);
+                    watchAudio(!pcm.empty());
+                    engine_.ingestAudio(camera, mxlIndexToTimestamp(&rate, input.next), std::move(pcm), 2);
                 }
                 engine_.ingestV210(camera, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
                 engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});

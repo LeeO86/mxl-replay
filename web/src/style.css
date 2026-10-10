@@ -14,8 +14,9 @@
   --live: #d9483b;
   font-size: 15px;
 }
+/* A widget's theme=dark|light|transparent (data-theme) overrides the browser's; transparent keeps the dark colours. */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme]) {
     --bg: #f3f5f8;
     --panel: #ffffff;
     --panel2: #eef1f5;
@@ -30,6 +31,23 @@
     --live: #c23b2f;
   }
 }
+:root[data-theme="light"] {
+  --bg: #f3f5f8;
+  --panel: #ffffff;
+  --panel2: #eef1f5;
+  --border: #d4dbe3;
+  --text: #1b2430;
+  --muted: #5d6b7a;
+  --accent: #1f6fd1;
+  --ok: #1f8f47;
+  --warn: #a86d00;
+  --bad: #c23b2f;
+  --chip: #e6ebf1;
+  --live: #c23b2f;
+  color-scheme: light;
+}
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="transparent"] { --bg: transparent; }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
 header { display: flex; align-items: center; gap: 1rem; padding: .7rem 1.2rem; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
@@ -136,7 +154,7 @@ button.btn[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--text); }
 
 /* Pictures (previews refreshed by the page) */
 .picture { position: relative; background: #000; border-radius: 6px; overflow: hidden; aspect-ratio: 16 / 9; }
-.picture img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+.picture img, .picture video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
 .picture .picture-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #8496a8; font-size: .8rem; }
 .ov { position: absolute; padding: .2rem .5rem; background: rgba(0, 0, 0, .62); color: #fff; font-size: .8rem; font-weight: 600; border-radius: 4px; display: flex; align-items: center; gap: .45rem; }
 .ov.tl { top: .5rem; left: .5rem; }
@@ -252,6 +270,26 @@ td input[type="number"] { width: 5.5rem; }
 .swatches input[type="color"] { width: 2.4rem; height: 1.8rem; padding: .1rem; }
 .capture { color: var(--warn); font-weight: 600; }
 kbd { background: var(--chip); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 0 .35rem; font-size: .76rem; font-family: ui-monospace, monospace; }
+
+/* Widgets (/widget/transport, /widget/clip-list): fill the frame */
+.widget-root { position: relative; height: 100vh; display: flex; flex-direction: column; gap: .4rem; padding: .5rem; overflow: hidden; }
+.widget-root > .empty { padding: .6rem; }
+.widget-error { position: absolute; left: .5rem; right: .5rem; bottom: .5rem; padding: .3rem .5rem; border-radius: 5px; background: var(--bad); color: #fff; font-size: .78rem; font-weight: 600; cursor: pointer; }
+.widget-head { display: flex; align-items: center; gap: .5rem; font-size: .85rem; }
+.widget-head .name { font-weight: 700; }
+.widget-head .tc { font-family: ui-monospace, monospace; font-size: 1.15rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.widget-transport { display: flex; flex-direction: column; gap: .4rem; }
+.widget-transport .btn-grid button.btn { padding: .45rem .3rem; }
+.widget-clips { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: .4rem; }
+.widget-list { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: .3rem; }
+.widget-clip { position: relative; display: flex; align-items: center; gap: .5rem; padding: .3rem .5rem .3rem .7rem; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+.widget-clip.cued { border-color: var(--warn); }
+.widget-clip.playing, .widget-clip.paused { border-color: var(--ok); }
+.widget-clip .stripe { position: absolute; left: 0; top: 0; bottom: 0; width: 4px; border-radius: 6px 0 0 6px; }
+.widget-clip img { flex: none; width: 64px; height: 36px; object-fit: cover; border-radius: 3px; background: #000; }
+.widget-clip .text { flex: 1; min-width: 0; }
+.widget-clip .name { font-weight: 600; font-size: .85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.widget-clip .meta { font-size: .72rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 @media (max-width: 1100px) {
   .lsm { grid-template-columns: 1fr; grid-template-rows: auto; }

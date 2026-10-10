@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(mxl-replay VERSION 1.3.2 LANGUAGES CXX)
+project(mxl-replay VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,6 +29,7 @@ add_library(replay-core STATIC
     src/media/anc.cpp
     src/media/scale.cpp
     src/media/convert.cpp
+    src/media/mosaic.cpp
     src/flow/dis.cpp
     src/flow/cuda_flow.cpp
     src/flow/ofa.cpp
@@ -43,6 +44,9 @@ add_library(replay-core STATIC
     src/ops/metrics.cpp
     src/ops/httpserver.cpp
     src/ops/api.cpp
+    src/ops/preview.cpp
+    src/ops/publisher.cpp
+    src/ops/child.cpp
     src/app/engine.cpp
     src/mxl/io.cpp
     src/nmos/node.cpp
@@ -69,6 +73,7 @@ if(REPLAY_BUILD_TESTS)
     add_executable(unit-tests
         tests/unit/test_main.cpp
         tests/unit/test_replay.cpp
+        tests/unit/test_preview.cpp
     )
     target_link_libraries(unit-tests PRIVATE replay-core)
     target_compile_options(unit-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)

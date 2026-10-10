@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1
 # Pins: IMPLEMENTATION_PLAN.md. MXL_REF is the single MXL pin.
 ARG CUDA_IMAGE=nvidia/cuda:12.8.2-devel-ubuntu24.04
+# The built-in MediaMTX of the WebRTC preview (own mode) is the official image's static binary (MIT).
+ARG MEDIAMTX_VERSION=1.20.1
+
+FROM bluenviron/mediamtx:${MEDIAMTX_VERSION} AS mediamtx
 
 FROM node:22-bookworm AS webui
 WORKDIR /web
@@ -72,6 +76,8 @@ COPY --from=build /opt/mxl/lib/ /usr/local/lib/
 COPY --from=build /tmp/mxl/build/vcpkg_installed/x64-linux/lib/ /usr/local/lib/
 COPY --from=build /src/build/mxl-replay /usr/local/bin/mxl-replay
 COPY --from=build /src/build/mxl-replay-harness /usr/local/bin/mxl-replay-harness
+COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
+COPY --from=mediamtx /LICENSE /usr/share/doc/mediamtx/LICENSE
 # ubuntu:24.04 already owns uid/gid 1000 (user "ubuntu"), so
 # `useradd --uid 1000` exits 4. Rename that account and keep the id.
 RUN set -eu; \
@@ -94,5 +100,6 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 LABEL org.opencontainers.image.source="https://github.com/LeeO86/mxl-replay" \
       org.opencontainers.image.licenses="GPL-3.0-or-later" \
       io.dmf.mxl.revision="${MXL_REF}"
-EXPOSE 8150 3302 3303
+# Web, NMOS; the built-in MediaMTX (REPLAY_PREVIEW_MODE=webrtc, own mode): WHEP, HLS, ICE.
+EXPOSE 8150 3302 3303 8689 8688 8489/tcp 8489/udp
 ENTRYPOINT ["/usr/local/bin/mxl-replay"]
