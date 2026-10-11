@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -27,14 +28,37 @@ struct GpuPicture
     std::vector<std::uint8_t> v210;
 };
 
-// Decode JPEG bitstreams on the device, run blend or DIS interpolation there,
+// The priority of a thread's GPU stream: playout above the recording (every other thread) above flows
+// computed ahead, which share the lowest with the preview copies.
+enum class GpuPriority
+{
+    Flow,
+    Record,
+    Playout
+};
+
+// Creates the calling thread's GPU state (its stream at `priority`, nvJPEG) unless it has one: playout
+// threads and flow workers call it first. Other threads get theirs, at Record, on their first GPU call.
+bool gpuPrepareThread(GpuPriority priority);
+
+// The optical flow of a source pair in device memory (opaque).
+struct GpuFlow;
+
+// Decodes A and B (unless the thread holds them from its last call) and computes their flow on the calling
+// thread's stream; returns when it is done, null when there is no device or nvJPEG rejects a bitstream.
+// `gpuSeconds` is the stream's time for the flow. The flow is freed on the stream of the thread that drops
+// the last reference, after that thread's work with it is done.
+[[nodiscard]] std::shared_ptr<GpuFlow const> gpuComputeFlow(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB,
+    std::size_t sizeB, std::string const& keyB, OperatingPoint const& op, int width, int height, double& gpuSeconds);
+
+// Decode JPEG bitstreams on the device, blend there (interpolate with `flow` when it is given),
 // pack v210 there, and download only the packed grain (UI previews are made from it on request).
 // Returns false when there is no device or nvJPEG rejects the bitstream; the
 // caller then uses the CPU path.
 // keyA and keyB name the source frames (camera and time): a frame still decoded on the
 // device from the previous call is not decoded again.
 bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB, std::size_t sizeB, std::string const& keyB,
-    float phase, bool interpolate, OperatingPoint const& op, std::string const& flowKey, int width, int height, GpuPicture& out);
+    float phase, GpuFlow const* flow, int width, int height, GpuPicture& out);
 
 // One upload of a packed v210 grain, nvJPEG 4:2:2 encode, one download of the bitstream.
 // Every GPU function here works on the calling thread's own stream and nvJPEG state,

@@ -172,6 +172,8 @@ int main(int argc, char** argv)
         for (int channel = 1; channel <= engine.config().channels; ++channel)
         {
             playout.emplace_back([&engine, &bridge, channel] {
+                // The playout's GPU stream is above the flows computed ahead, the recording and the previews.
+                replay::gpuPrepareThread(replay::GpuPriority::Playout);
                 // One grain per house period on the TAI grid, rendered for the grain's own time.
                 // Rendering for the wake-up time put live playout between two source frames
                 // (interpolated, or flipping between them) and could write a grain index twice.

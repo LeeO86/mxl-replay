@@ -70,7 +70,7 @@ stop_replay() {
 }
 
 statusz() { # <python expression on the preview object `p`>
-  curl -sf "http://127.0.0.1:${WEB_PORT}/statusz" | python3 -c "import json,sys; p=json.load(sys.stdin)['preview']; print($1)"
+  curl -sf "http://127.0.0.1:${WEB_PORT}/statusz" | python3 -c "import json,sys; p=json.load(sys.stdin)['preview']; print(($1))"
 }
 
 wait_state() { # <state> <seconds>

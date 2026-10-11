@@ -99,7 +99,7 @@ void releasePlanes(DevPlanes& planes)
     planes = {};
 }
 
-// One per thread (recorder input, playout channel): its own nvJPEG states, stream and
+// One per thread (recorder input, playout channel, flow worker): its own nvJPEG states, stream and
 // buffers, so cameras and channels run in parallel instead of behind one mutex.
 struct Nv
 {
@@ -118,7 +118,6 @@ struct Nv
     DevPlanes const* last = nullptr;
     Buffer packed;
     Buffer pinned;
-    std::map<std::string, DevFlow> flows;
 
     Nv() = default;
     Nv(Nv const&) = delete;
@@ -131,11 +130,6 @@ struct Nv
             return;
         }
         cudaStreamSynchronize(stream);
-        for (auto& entry : flows)
-        {
-            cudaFree(entry.second.u);
-            cudaFree(entry.second.v);
-        }
         for (auto& slot : slots)
         {
             releasePlanes(slot);
@@ -299,7 +293,7 @@ bool primeDevice()
     return true;
 }
 
-bool prepareNv()
+bool prepareNv(GpuPriority priority = GpuPriority::Record)
 {
     auto& state = nv();
     if (state.ready)
@@ -318,7 +312,12 @@ bool prepareNv()
     {
         return false;
     }
-    if (cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking) != cudaSuccess)
+    // Lower numbers are higher priorities; 0, the default, is the lowest.
+    int least = 0;
+    int greatest = 0;
+    cudaDeviceGetStreamPriorityRange(&least, &greatest);
+    int const value = priority == GpuPriority::Playout ? greatest : priority == GpuPriority::Record ? std::min(least, greatest + 1) : least;
+    if (cudaStreamCreateWithPriority(&state.stream, cudaStreamNonBlocking, value) != cudaSuccess)
     {
         return false;
     }
@@ -944,7 +943,8 @@ __global__ void mosaicTileKernel(std::uint8_t const* y, std::uint8_t const* cb, 
     pair[1] = static_cast<std::uint8_t>(boxMean(cr, pitchC, cx0, cx1, cy0, cy1) + 0.5f);
 }
 
-// The stream of this thread's canvas copies (the encoder thread has no nvJPEG state).
+// The stream of this thread's canvas copies (the encoder thread has no nvJPEG state); the default
+// priority, the lowest (as flows).
 cudaStream_t copyStream()
 {
     struct Holder
@@ -1061,62 +1061,12 @@ std::vector<std::uint8_t> downloadV210(DevPlanes const& planes)
     return std::vector<std::uint8_t>(pinned, pinned + bytes);
 }
 
-DevFlow cachedFlow(std::string const& key, DevPlanes const& a, DevPlanes const& b, OperatingPoint const& op)
+// Puts frame A, and B when `needB`, into slots 0 and 1, decoding only a frame the thread does not hold from
+// its last call. Returns A's slot (B is in the other); -1 when a bitstream is rejected or not width × height.
+int loadPair(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB, std::size_t sizeB, std::string const& keyB,
+    bool needB, int width, int height)
 {
     auto& state = nv();
-    auto const found = state.flows.find(key);
-    if (found != state.flows.end())
-    {
-        return found->second;
-    }
-    if (state.flows.size() > 8)
-    {
-        auto const oldest = state.flows.begin();
-        devFree(oldest->second.u);
-        devFree(oldest->second.v);
-        state.flows.erase(oldest);
-    }
-    float* grayA = nullptr;
-    float* grayB = nullptr;
-    if (!launchGray(a, grayA) || !launchGray(b, grayB))
-    {
-        devFree(grayA);
-        devFree(grayB);
-        return {};
-    }
-    DevFlow flow = computeFlowDevice(grayA, grayB, a.width, a.height, op);
-    devFree(grayA);
-    devFree(grayB);
-    if (flow.u != nullptr)
-    {
-        state.flows.emplace(key, flow);
-    }
-    return flow;
-}
-} // namespace
-
-int cudaFlowDeviceCount()
-{
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count < 0)
-    {
-        return 0;
-    }
-    return count;
-}
-
-bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB, std::size_t sizeB, std::string const& keyB,
-    float phase, bool interpolate, OperatingPoint const& op, std::string const& flowKey, int width, int height, GpuPicture& out)
-{
-    if (jpegA == nullptr || sizeA == 0 || width < 2 || height < 1)
-    {
-        return false;
-    }
-    auto& state = nv();
-    if (!prepareNv())
-    {
-        return false;
-    }
     auto holding = [&](std::string const& key) {
         for (int i = 0; i < 2; ++i)
         {
@@ -1141,23 +1091,116 @@ bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string
         state.slotKey[index] = key;
         return true;
     };
-    bool const needB = jpegB != nullptr && sizeB > 0 && phase > 0.001f && phase < 0.999f;
     int a = holding(keyA);
     if (a < 0)
     {
         a = needB && holding(keyB) == 0 ? 1 : 0;
     }
-    if (!load(a, jpegA, sizeA, keyA))
+    if (!load(a, jpegA, sizeA, keyA) || (needB && !load(1 - a, jpegB, sizeB, keyB)))
+    {
+        return -1;
+    }
+    return a;
+}
+} // namespace
+
+// Device memory from the computing thread's stream-ordered pool, freed on the stream of the thread that
+// drops the last reference: every holder has synchronised its own work with it by then.
+struct GpuFlow
+{
+    float* u = nullptr;
+    float* v = nullptr;
+    int width = 0;
+    int height = 0;
+
+    GpuFlow() = default;
+    GpuFlow(GpuFlow const&) = delete;
+    GpuFlow& operator=(GpuFlow const&) = delete;
+
+    ~GpuFlow()
+    {
+        devFree(u);
+        devFree(v);
+    }
+};
+
+int cudaFlowDeviceCount()
+{
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count < 0)
+    {
+        return 0;
+    }
+    return count;
+}
+
+bool gpuPrepareThread(GpuPriority priority)
+{
+    return prepareNv(priority);
+}
+
+std::shared_ptr<GpuFlow const> gpuComputeFlow(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB,
+    std::size_t sizeB, std::string const& keyB, OperatingPoint const& op, int width, int height, double& gpuSeconds)
+{
+    if (jpegA == nullptr || sizeA == 0 || jpegB == nullptr || sizeB == 0 || width < 2 || height < 1 || !prepareNv())
+    {
+        return nullptr;
+    }
+    int const a = loadPair(jpegA, sizeA, keyA, jpegB, sizeB, keyB, true, width, height);
+    if (a < 0)
+    {
+        return nullptr;
+    }
+    auto& state = nv();
+    cudaEvent_t began{};
+    cudaEvent_t ended{};
+    cudaEventCreate(&began);
+    cudaEventCreate(&ended);
+    cudaEventRecord(began, state.stream);
+    float* grayA = nullptr;
+    float* grayB = nullptr;
+    auto flow = std::make_shared<GpuFlow>();
+    if (launchGray(state.slots[a], grayA) && launchGray(state.slots[1 - a], grayB))
+    {
+        auto const dev = computeFlowDevice(grayA, grayB, width, height, op);
+        flow->u = dev.u;
+        flow->v = dev.v;
+        flow->width = dev.width;
+        flow->height = dev.height;
+    }
+    devFree(grayA);
+    devFree(grayB);
+    cudaEventRecord(ended, state.stream);
+    // Done before anyone else can see it: the playout never waits for a flow.
+    bool const done = cudaStreamSynchronize(state.stream) == cudaSuccess && cudaGetLastError() == cudaSuccess && flow->u != nullptr;
+    float ms = 0;
+    cudaEventElapsedTime(&ms, began, ended);
+    gpuSeconds = ms / 1000.0;
+    cudaEventDestroy(began);
+    cudaEventDestroy(ended);
+    return done ? flow : nullptr;
+}
+
+bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB, std::size_t sizeB, std::string const& keyB,
+    float phase, GpuFlow const* flow, int width, int height, GpuPicture& out)
+{
+    if (jpegA == nullptr || sizeA == 0 || width < 2 || height < 1)
     {
         return false;
     }
-    int const b = 1 - a;
-    if (needB && !load(b, jpegB, sizeB, keyB))
+    auto& state = nv();
+    if (!prepareNv())
+    {
+        return false;
+    }
+    bool const needB = jpegB != nullptr && sizeB > 0 && phase > 0.001f && phase < 0.999f;
+    int const a = loadPair(jpegA, sizeA, keyA, jpegB, sizeB, keyB, needB, width, height);
+    if (a < 0)
     {
         return false;
     }
     auto const& planesA = state.slots[a];
-    auto const& planesB = state.slots[b];
+    auto const& planesB = state.slots[1 - a];
     DevPlanes* source = &state.slots[a];
     if (needB)
     {
@@ -1165,13 +1208,10 @@ bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string
         {
             return false;
         }
-        DevFlow flow;
-        if (interpolate)
-        {
-            flow = cachedFlow(flowKey, planesA, planesB, op);
-        }
+        // Without a flow the kernel blends.
+        DevFlow const f = flow != nullptr ? DevFlow{flow->u, flow->v, flow->width, flow->height} : DevFlow{};
         blendKernel<<<grid2(planesA.width, planesA.height), block2(), 0, nv().stream>>>(planesA.y, planesA.cb, planesA.cr, planesB.y, planesB.cb, planesB.cr,
-            planesA.pitchY, planesA.pitchC, planesB.pitchY, planesB.pitchC, planesA.width, planesA.height, flow.u, flow.v, flow.width, flow.height, phase,
+            planesA.pitchY, planesA.pitchC, planesB.pitchY, planesB.pitchC, planesA.width, planesA.height, f.u, f.v, f.width, f.height, phase,
             state.slots[2].y, state.slots[2].cb, state.slots[2].cr, state.slots[2].pitchY, state.slots[2].pitchC);
         source = &state.slots[2];
     }

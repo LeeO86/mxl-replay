@@ -120,6 +120,9 @@ Frame10 sampleV210(std::uint8_t const* v210, int width, int height, int previewW
 
 constexpr int kPreviewQuality = 80;
 
+// How many grains ahead a channel's flows are computed (SPECIFICATION.md §5.3).
+constexpr int kFlowAheadGrains = 8;
+
 std::string jsonString(std::string const& text)
 {
     return "\"" + jsonEscape(text) + "\"";
@@ -248,6 +251,11 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         runtime.shot.playOnFirstClick = config_.playOnFirstClick;
         runtime.last = black;
         runtime.lastV210 = blackV210_;
+        // Its flows are computed ahead on a worker whose GPU stream is below the playout's and the recording's.
+        int const index = static_cast<int>(channels_.size()) + 1;
+        runtime.ahead = std::make_unique<FlowAhead>([this, index](FlowAhead::Pair const& pair) { return computeFlow(pair, index); },
+            [] { gpuPrepareThread(GpuPriority::Flow); });
+        metrics_.inc("interpolation_fallbacks_total", {{"channel", std::to_string(index)}}, 0);
         (void)channel;
         channels_.push_back(std::move(runtime));
     }
@@ -744,6 +752,25 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     auto const periodSrc = sourcePeriod(camera);
     std::uint64_t const taiA = static_cast<std::uint64_t>(pick.frameA) * periodSrc;
     std::uint64_t const taiB = static_cast<std::uint64_t>(pick.frameB) * periodSrc;
+    planFlows(channel);
+    bool const wantFlow = motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate;
+    // A grain that interpolates: with its flow (a hit), or blended because the flow is not ready yet (a
+    // fallback, logged at most every 10 s). Lock held.
+    auto const countFlow = [&](bool ready) {
+        Labels const labels{{"channel", std::to_string(channel)}};
+        if (ready)
+        {
+            metrics_.inc("flow_cache_hits_total", labels);
+            return;
+        }
+        metrics_.inc("interpolation_fallbacks_total", labels);
+        ++runtime.fallbackLog.unlogged;
+        if (auto const count = runtime.fallbackLog.toLog(taiNowNs()); count != 0)
+        {
+            logWarn("interpolation_fallback", {{"channel", std::to_string(channel)}, {"fallbacks", std::to_string(count)},
+                                                  {"flow_ms", std::to_string(std::lround(runtime.ahead->flowSeconds() * 1000))}});
+        }
+    };
     bool exact = pick.kind == SourcePick::Kind::Exact;
     bool renderedOnGpu = false;
     // The output grain is this thread's last GPU picture (the preview tile is drawn from it there).
@@ -752,22 +779,22 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     {
         // Read, decode, interpolate and download without the engine lock, so channels and
         // the recorder do not wait for each other's disk or GPU work.
-        auto const op = operatingPoint(config_.preset);
         bool const wantB = pick.kind != SourcePick::Kind::Exact && pick.kind != SourcePick::Kind::Repeat;
+        auto& ahead = *runtime.ahead;
         lock.unlock();
         auto const storedA = ring->findNearest(taiA);
         auto const storedB = wantB ? ring->findNearest(taiB) : std::nullopt;
         bool const second = storedB && storedA && storedB->taiNs != storedA->taiNs;
         GpuPicture gpuPicture;
-        auto const key = std::to_string(camera) + ":" + std::to_string(taiA) + ":" + std::to_string(taiB);
+        // Held until the picture is done.
+        auto const flow = wantFlow && second ? ahead.find(flowKey(camera, taiA, taiB)).gpu : nullptr;
         bool onGpu = false;
         if (storedA && !storedA->jpeg.empty())
         {
             auto const keyA = std::to_string(camera) + ":" + std::to_string(storedA->taiNs);
             auto const keyB = second ? std::to_string(camera) + ":" + std::to_string(storedB->taiNs) : std::string{};
             onGpu = gpuRenderFromJpeg(storedA->jpeg.data(), storedA->jpeg.size(), keyA, second ? storedB->jpeg.data() : nullptr, second ? storedB->jpeg.size() : 0,
-                keyB, static_cast<float>(pick.phase), motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate, op, key, config_.format.width,
-                config_.format.height, gpuPicture);
+                keyB, static_cast<float>(pick.phase), flow.get(), config_.format.width, config_.format.height, gpuPicture);
         }
         lock.lock();
         if (onGpu)
@@ -776,9 +803,9 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             runtime.lastV210 = rendered.v210;
             renderedOnGpu = true;
             devicePicture = true;
-            if (motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate)
+            if (wantFlow)
             {
-                metrics_.inc("flow_cache_hits_total", {{"channel", std::to_string(channel)}});
+                countFlow(!second || flow != nullptr);
             }
         }
     }
@@ -862,20 +889,22 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     }
     else
     {
-        auto const key = std::to_string(camera) + ":" + std::to_string(taiA) + ":" + std::to_string(taiB);
-        if (flowCache_.count(key) == 0)
+        // Interpolation on the CPU (REPLAY_ALLOW_CPU_INTERP without a GPU) with the flow computed ahead; blended
+        // while it is not ready.
+        auto const flow = runtime.ahead->find(flowKey(camera, taiA, taiB)).cpu;
+        auto const op = operatingPoint(config_.preset);
+        lock.unlock();
+        if (flow)
         {
-            auto const op = operatingPoint(config_.preset);
-            flowCache_[key] = computeFlowPair(grayFromLuma(toFloat(frameA)), grayFromLuma(toFloat(frameB)), op);
-            metrics_.inc("flow_cache_miss_total", {{"channel", std::to_string(channel)}});
+            picture = fromFloat(interpolateFrames(toFloat(frameA), toFloat(frameB), flow->forward, flow->backward, static_cast<float>(pick.phase), op));
         }
         else
         {
-            metrics_.inc("flow_cache_hits_total", {{"channel", std::to_string(channel)}});
+            blendInto(frameA, frameB, pick.phase);
+            picture = std::move(frameA);
         }
-        auto const& pair = flowCache_[key];
-        auto const op = operatingPoint(config_.preset);
-        picture = fromFloat(interpolateFrames(toFloat(frameA), toFloat(frameB), pair.forward, pair.backward, static_cast<float>(pick.phase), op));
+        lock.lock();
+        countFlow(flow != nullptr);
     }
     if (blackFrame)
     {
@@ -968,6 +997,81 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         }
     }
     return rendered;
+}
+
+void Engine::planFlows()
+{
+    std::lock_guard lock{mutex_};
+    for (std::size_t i = 0; i < channels_.size(); ++i)
+    {
+        planFlows(static_cast<int>(i) + 1);
+    }
+}
+
+void Engine::planFlows(int channel)
+{
+    // None while the channel is live, black or does not interpolate, and none whose frame B is not recorded
+    // yet (close to live). A locked channel moves with channel 1.
+    auto const& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    auto const& cfg = config_.channelList[static_cast<std::size_t>(channel - 1)];
+    int const camera = runtime.scheduler.camera;
+    auto const* ring = ringOf(camera);
+    std::vector<FlowAhead::Pair> plan;
+    if (cfg.motion == MotionMode::Interpolate && gpuInterpolate() && !runtime.liveMode && !runtime.black && ring != nullptr)
+    {
+        auto const periodSrc = sourcePeriod(camera);
+        auto const newest = ring->newestNs();
+        auto const now = FlowAhead::Clock::now();
+        auto const& moving = cfg.lockToFirst && channel > 1 ? channels_[0].scheduler : runtime.scheduler;
+        for (auto const& pair : pairsAhead(moving, hfrFactor(camera), config_.hfrSnap, kFlowAheadGrains))
+        {
+            auto const a = static_cast<std::uint64_t>(pair.frameA) * periodSrc;
+            auto const b = static_cast<std::uint64_t>(pair.frameB) * periodSrc;
+            if (b <= newest)
+            {
+                plan.push_back({flowKey(camera, a, b), camera, a, b, now + std::chrono::nanoseconds(pair.last * moving.framePeriodNs)});
+            }
+        }
+    }
+    runtime.ahead->plan(std::move(plan));
+}
+
+AheadFlow Engine::computeFlow(FlowAhead::Pair const& pair, int channel)
+{
+    // On the channel's worker, without the engine lock: the rings have their own.
+    AheadFlow flow;
+    auto const op = operatingPoint(config_.preset);
+    auto const* ring = ringOf(pair.camera);
+    if (ring == nullptr)
+    {
+        return flow;
+    }
+    if (cudaFlowAvailable())
+    {
+        auto const a = ring->findNearest(pair.taiA);
+        auto const b = ring->findNearest(pair.taiB);
+        if (!a || !b || a->taiNs == b->taiNs)
+        {
+            return flow;
+        }
+        double gpuSeconds = 0;
+        flow.gpu = gpuComputeFlow(a->jpeg.data(), a->jpeg.size(), std::to_string(pair.camera) + ":" + std::to_string(a->taiNs), b->jpeg.data(), b->jpeg.size(),
+            std::to_string(pair.camera) + ":" + std::to_string(b->taiNs), op, config_.format.width, config_.format.height, gpuSeconds);
+        if (flow.gpu)
+        {
+            metrics_.observe("frame_gpu_seconds", {{"channel", std::to_string(channel)}, {"stage", "flow"}}, gpuSeconds);
+        }
+        return flow;
+    }
+    bool foundA = false;
+    bool foundB = false;
+    auto const a = frameAt(pair.camera, pair.taiA, &foundA);
+    auto const b = frameAt(pair.camera, pair.taiB, &foundB);
+    if (foundA && foundB)
+    {
+        flow.cpu = std::make_shared<FlowPair const>(computeFlowPair(grayFromLuma(toFloat(a)), grayFromLuma(toFloat(b)), op));
+    }
+    return flow;
 }
 
 void Engine::finishClip(int channel)

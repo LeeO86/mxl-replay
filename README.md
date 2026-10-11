@@ -161,6 +161,8 @@ Playout channels are NMOS senders (video `video/v210`, audio `audio/float32`, da
 
 A camera whose audio delivers no samples for `REPLAY_INPUT_STALL_S` worth of video frames while its video records logs `recording_audio_stopped` (`camera`, `reason`: `flow_missing` or `no_samples`) once, and `recording_audio_resumed` with `gap_ms` when it is back; those frames are stored without audio. A channel that falls more than two grains behind its output clock continues at the current grain (a resync): `output_resyncs_total` counts it and the log has `output_resync` (`channel`, `resyncs` since the last line, `jumped_grains`) at most every 10 s. One at the start is normal (the first grains set up the GPU path).
 
+In `interpolate` the optical flow of each source pair is computed ahead, by a worker per channel, for the pairs the channel's next 8 grains need (a paused channel: its own pair and the first ones of a play; a command starts them at once). The playout never waits for a flow: a grain whose flow is not ready yet is blended, counted in `interpolation_fallbacks_total` and logged as `interpolation_fallback` (`channel`, `fallbacks` since the last line, `flow_ms`: the last flow's time) at most every 10 s. On a GPU shared with another process the channel then blends some grains instead of falling behind. Without such load the first 1–3 grains of a play that starts right after its cue can be blended (lab A16: 22 ms per flow), and so can a few grains on a GPU the replay saturates alone. GPU stream priorities: playout first, then the recording, then the flows.
+
 `REPLAY_SYNTHETIC=true` feeds a moving test raster into the recorder so the UI and the integration test can run without other MXL flows.
 
 ## Previews
@@ -207,7 +209,7 @@ Operator screens (the platform's production designer) frame single controls of t
 
 ## Metrics
 
-Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, `disk_bytes`, and `record_last_frame_age_seconds`: seconds since the camera's newest recorded frame, counted from the process start at most. It stays below 0.1 s while the camera records and grows when it does not (also when it is not connected or `CAM<n>_RECORD` is off); the status has it per camera as `last_frame_age_s`. Channels report state, speed, and late grains. `frame_gpu_seconds` is a histogram labelled by stage. Storage reports `write_bytes_per_second` (what the recorder wrote since the previous scrape, over at least a second: 0 when nothing records), `storage_measured_bytes_per_second` (the write test at start, `storage_bps` in the status), free bytes, and protected bytes. Channels also report `output_resyncs_total`. Previews: `preview_mode{mode}` (jpeg, webrtc) and in WebRTC mode `preview_publish_mode{mode}` (own, shared), `preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`, `preview_encode_seconds` (histogram of one picture's copy, encode and send) and `preview_mediamtx_restarts_total` (own mode). A Grafana dashboard is in `deploy/grafana/`.
+Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, `disk_bytes`, and `record_last_frame_age_seconds`: seconds since the camera's newest recorded frame, counted from the process start at most. It stays below 0.1 s while the camera records and grows when it does not (also when it is not connected or `CAM<n>_RECORD` is off); the status has it per camera as `last_frame_age_s`. Channels report state, speed, and late grains. `frame_gpu_seconds{channel,stage}` is a histogram of GPU time; only `stage="flow"` (one flow computed ahead) is measured. Storage reports `write_bytes_per_second` (what the recorder wrote since the previous scrape, over at least a second: 0 when nothing records), `storage_measured_bytes_per_second` (the write test at start, `storage_bps` in the status), free bytes, and protected bytes. Channels also report `output_resyncs_total`, `flow_cache_hits_total` (grains interpolated with their flow) and `interpolation_fallbacks_total` (grains blended because their flow was not ready, 0 from the start). Previews: `preview_mode{mode}` (jpeg, webrtc) and in WebRTC mode `preview_publish_mode{mode}` (own, shared), `preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`, `preview_encode_seconds` (histogram of one picture's copy, encode and send) and `preview_mediamtx_restarts_total` (own mode). A Grafana dashboard is in `deploy/grafana/`.
 
 ## Deploy
 
@@ -236,7 +238,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.4.0
+  ghcr.io/leeo86/mxl-replay:1.4.1
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.
