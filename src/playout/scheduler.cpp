@@ -128,7 +128,7 @@ std::uint64_t PlayoutGrid::take(std::uint64_t current, bool& resynced)
     return next++;
 }
 
-std::uint64_t PlayoutGrid::toLog(std::uint64_t nowNs)
+std::uint64_t LogLimit::toLog(std::uint64_t nowNs)
 {
     constexpr std::uint64_t kInterval = 10'000'000'000ull;
     if (unlogged == 0 || (loggedNs != 0 && nowNs < loggedNs + kInterval))
@@ -139,6 +139,42 @@ std::uint64_t PlayoutGrid::toLog(std::uint64_t nowNs)
     auto const count = unlogged;
     unlogged = 0;
     return count;
+}
+
+std::vector<PairAhead> pairsAhead(Scheduler scheduler, double hfrFactor, double hfrSnap, int grains)
+{
+    std::vector<PairAhead> pairs;
+    bool const paused = !scheduler.playing;
+    scheduler.playing = true;
+    for (int grain = 1; grain <= grains; ++grain)
+    {
+        if (!paused || grain > 1)
+        {
+            scheduler.step();
+        }
+        auto const pick = pickSource(std::max<std::int64_t>(0, scheduler.positionNs), 0, scheduler.framePeriodNs, hfrFactor, hfrSnap,
+            MotionMode::Interpolate);
+        if (pick.kind != SourcePick::Kind::Interpolate)
+        {
+            continue;
+        }
+        int const last = paused && grain == 1 ? grains : grain;
+        auto const known = std::find_if(pairs.begin(), pairs.end(), [&](PairAhead const& pair) { return pair.frameA == pick.frameA && pair.frameB == pick.frameB; });
+        if (known == pairs.end())
+        {
+            pairs.push_back({pick.frameA, pick.frameB, last});
+        }
+        else
+        {
+            known->last = std::max(known->last, last);
+        }
+    }
+    return pairs;
+}
+
+std::string flowKey(int camera, std::uint64_t taiA, std::uint64_t taiB)
+{
+    return std::to_string(camera) + ":" + std::to_string(taiA) + ":" + std::to_string(taiB);
 }
 
 MotionMode parseMotion(std::string const& text, bool* ok)

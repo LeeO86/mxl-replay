@@ -28,8 +28,19 @@ int cudaFlowDeviceCount()
     return 0;
 }
 
-bool gpuRenderFromJpeg(std::uint8_t const*, std::size_t, std::string const&, std::uint8_t const*, std::size_t, std::string const&, float, bool, OperatingPoint const&,
-    std::string const&, int, int, GpuPicture&)
+bool gpuPrepareThread(GpuPriority)
+{
+    return false;
+}
+
+std::shared_ptr<GpuFlow const> gpuComputeFlow(std::uint8_t const*, std::size_t, std::string const&, std::uint8_t const*, std::size_t, std::string const&,
+    OperatingPoint const&, int, int, double&)
+{
+    return nullptr;
+}
+
+bool gpuRenderFromJpeg(std::uint8_t const*, std::size_t, std::string const&, std::uint8_t const*, std::size_t, std::string const&, float, GpuFlow const*, int, int,
+    GpuPicture&)
 {
     return false;
 }

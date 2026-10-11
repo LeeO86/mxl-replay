@@ -162,7 +162,9 @@ of sequences beyond playlists, compressed outputs, HDR.
   (bilinear/bicubic on GPU), and this is shown as a warning.
 - The output clock is TAI: one grain per output grain index, always. A channel more than
   two grains late continues at the current grain (a resync): counted per channel in
-  `output_resyncs_total`, logged as `output_resync` at most once per 10 s (1.4.0). When nothing is
+  `output_resyncs_total`, logged as `output_resync` at most once per 10 s (1.4.0). The playout
+  never waits for an optical flow (§5.3, 1.4.1), and its GPU work goes before the recording's,
+  which goes before the flows'. When nothing is
   playing, a channel shows its idle source (configurable: last frame, black, or a
   live input "E2E").
 
@@ -199,6 +201,21 @@ Per channel (and stored per clip), `motion_mode`:
   interpolates between real HFR frames).
 - At 100 % speed on a house-rate camera no processing is done (source frames only).
 - The interpolation engine is invoked only when needed; idle channels use no GPU.
+- Flows are computed ahead (1.4.1). A worker per channel computes the flows of the source
+  pairs the next 8 grains interpolate (a paused channel: its own pair, and the first pairs
+  of a play), one at a time, on a CUDA stream below the playout's and the recording's. A
+  command (cue, play, speed, angle, mode) plans them at once; a pair is planned once its
+  frame B is recorded. A pair the worker cannot finish before its last grain (one flow takes
+  the shortest of the last three) is skipped for the next one; when none can, one is
+  computed once a second.
+- The playout MUST NOT wait for a flow: a grain whose flow is not ready is rendered as
+  `blend` and counted (`interpolation_fallbacks_total{channel}`, logged as
+  `interpolation_fallback` at most once per 10 s with the count and the last flow's time).
+  This is the degradation under GPU contention: the channel stays on time and the recording
+  does not drop. Without contention steady play at 25 % and 50 % has no fallbacks. Two
+  cases do: the first 1–3 grains of a play that starts within about two flow times of its
+  cue (lab A16: 22 ms per flow), and a few grains when the replay alone saturates the GPU
+  (75 % on an A16: 16 of 1100 grains in 30 s).
 
 ### 5.4 Audio
 
@@ -476,11 +493,13 @@ started or while it stopped, do not count),
 `record_last_frame_age_seconds` (since the newest recorded frame, counted from the
 process start at most; also `last_frame_age_s` per camera in the status); per channel
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,
-`frame_gpu_seconds` (histogram by stage: decode, flow, interpolate, pack),
+`frame_gpu_seconds` (histogram by stage: decode, flow, interpolate, pack; only `flow` is
+measured, 1.4.1),
 `flow_cache_hits_total`; storage `write_bytes_per_second` (what the recorder writes,
 0 when nothing records), `storage_measured_bytes_per_second` (the write test at
 start), `read_bytes_per_second`, `free_bytes`, `protected_bytes`; GPU SM/memory/OFA
-utilisation; per channel `output_resyncs_total` (§5.1); previews `preview_mode{mode}`,
+utilisation; per channel `output_resyncs_total` (§5.1) and `interpolation_fallbacks_total`
+(§5.3); previews `preview_mode{mode}`,
 and in WebRTC mode `preview_publish_mode{mode}` (own, shared),
 `preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`,
 `preview_encode_seconds` (histogram: copy, encode, send of one picture) and in own mode
@@ -528,6 +547,10 @@ Deployment:
   canvas, `/widgets`, the CSP and CORS headers, the resync counter and the audio stall
   watch; `tests/integration/preview.sh` runs the JPEG mode, the WebRTC mode with the
   own MediaMTX and with a separate (shared) one that goes away and comes back.
+- Flows ahead (1.4.1): unit tests for the pairs ahead (25/50/75 %, reverse, a ramp, a
+  paused channel, the angle in the key), the worker (order, a new plan, a pair it cannot
+  finish skipped) and a grain blended and counted while its flow is not ready, then
+  interpolated, also after an angle switch.
 - Hardware (documented): performance targets (§6.3), storage throughput with all
   cameras recording while two channels play, phased HFR with a real HFR camera or a
   simulated phase set.

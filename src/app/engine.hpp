@@ -8,6 +8,7 @@
 #include "nmos/ids.hpp"
 #include "ops/metrics.hpp"
 #include "ops/preview.hpp"
+#include "playout/flowahead.hpp"
 #include "playout/scheduler.hpp"
 #include "playout/shotbox.hpp"
 #include "record/ring.hpp"
@@ -87,6 +88,9 @@ public:
     void ingestAudio(int camera, std::uint64_t taiNs, std::vector<float> audio, int channels);
 
     [[nodiscard]] RenderedFrame render(int channel, std::uint64_t outputTaiNs);
+    // Plans every channel's flows again (render does it each grain): after a command, so the flows its
+    // next grains need start now (SPECIFICATION.md §5.3).
+    void planFlows();
 
     void play(int channel);
     void pause(int channel);
@@ -212,6 +216,9 @@ private:
         std::string timecode; // of the last output grain (its ANC)
         std::uint64_t late = 0;
         std::uint64_t ancSequence = 0;
+        // The flows of the next grains (SPECIFICATION.md §5.3) and the grains blended without one.
+        std::unique_ptr<FlowAhead> ahead;
+        LogLimit fallbackLog;
     };
 
     // Encode into `pending`; pushFrames() writes them after the engine lock is released.
@@ -228,6 +235,10 @@ private:
     // whether a frame exists; false with found set means it is not in the house format.
     bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found) const;
     void finishClip(int channel);
+    // Posts the pairs the channel's next grains interpolate to its flow worker. Lock held.
+    void planFlows(int channel);
+    // A pair's flow for the channel's worker: on the GPU when there is one (its GPU time is observed), else on the CPU.
+    AheadFlow computeFlow(FlowAhead::Pair const& pair, int channel);
     // Back to live on the channel (lock held). Uploads have no live picture: live follows camera 1.
     void goLive(ChannelRuntime& runtime);
     // Clips keep REPLAY_PROTECT_MAX_PCT of the storage budget or more (lock held).
@@ -272,7 +283,6 @@ private:
     std::atomic<bool> bufferReady_{false};
     std::vector<ChannelRuntime> channels_;
     std::map<std::string, Route> routes_;
-    std::map<std::string, FlowPair> flowCache_;
     bool gpu_ = false;
     double storageBps_ = 0;
     // Bytes the recorder wrote, and the write rate made from them by updateMetrics.

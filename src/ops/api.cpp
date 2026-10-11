@@ -643,9 +643,8 @@ HttpResponse patchClip(Engine& engine, std::string const& id, Json const& body)
     }
     return error(500, "unexpected clip edit result");
 }
-} // namespace
 
-HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string const& indexHtml)
+HttpResponse respond(Engine& engine, HttpRequest const& request, std::string const& indexHtml)
 {
     auto const& path = request.path;
     auto const& method = request.method;
@@ -1065,5 +1064,17 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
         return json(200, engine.statusJson());
     }
     return error(404, "not found");
+}
+} // namespace
+
+HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string const& indexHtml)
+{
+    auto response = respond(engine, request, indexHtml);
+    // A command (cue, play, speed, angle, mode) starts the flows of its next grains now, not at the next grain.
+    if (request.method != "GET" && engine.bufferReady())
+    {
+        engine.planFlows();
+    }
+    return response;
 }
 } // namespace replay
