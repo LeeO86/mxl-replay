@@ -867,6 +867,41 @@ TEST_CASE("pause, a clip's end and black fade the audio out to silence, play and
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("a pause fades out over the audio that follows the last grain, not over the paused frame again")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-silence-splice";
+    std::filesystem::remove_all(dir);
+    auto const loaded = loadConfig(
+        {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+            {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+            {"CH1_MOTION", "repeat"}, {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    Engine engine(loaded.config, loaded.flat);
+    engine.openBuffer();
+    std::uint64_t const period = 20000000ull;
+    std::uint64_t const base = 1000 * period;
+    for (int i = 0; i < 20; ++i)
+    {
+        auto const tai = base + static_cast<std::uint64_t>(i) * period;
+        engine.ingestAudio(1, tai, std::vector<float>(960 * 2, 0.1F + 0.01F * static_cast<float>(i)), 2);
+        Frame10 frame;
+        frame.allocate(64, 32);
+        frame.fill(300, 512, 512);
+        engine.ingestVideo(1, 1, tai, std::move(frame));
+    }
+    // Live, two frames behind: frame 8. Paused there, the fade reads frames 9 and 10.
+    CHECK(engine.render(1, base + 10 * period).audio.front() == doctest::Approx(0.18F));
+    engine.pause(1);
+    auto const first = engine.render(1, base + 11 * period).audio;
+    CHECK(first.front() == doctest::Approx(0.19F));
+    CHECK(first.back() == doctest::Approx(0.095F));
+    auto const second = engine.render(1, base + 12 * period).audio;
+    CHECK(second.front() == doctest::Approx(0.10F));
+    CHECK(second.back() == doctest::Approx(0.F));
+    CHECK(engine.render(1, base + 13 * period).audio.front() == doctest::Approx(0.F));
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("clip ids continue after a restart")
 {
     auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-serial";

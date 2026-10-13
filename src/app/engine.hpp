@@ -219,6 +219,8 @@ private:
         int playlistIndex = -1;
         // The audio fade: 0 audible, 2 silent; each grain moves one step (render).
         int fadeFramesLeft = 0;
+        // The house time of the audio the last grain read (0: none yet).
+        std::uint64_t audioNs = 0;
         Frame10 last;
         std::vector<std::uint8_t> lastV210;
         std::string timecode; // of the last output grain (its ANC)

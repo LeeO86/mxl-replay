@@ -940,12 +940,24 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     int const samples = audioSamplesForFrame(timestampToIndex(config_.format.rateNum, config_.format.rateDen, outputTaiNs), config_.format.rateNum,
         config_.format.rateDen, 48000);
     int const audioCamera = cfg.atmosCamera > 0 ? cfg.atmosCamera : camera;
+    double const speed = std::fabs(runtime.scheduler.speed);
+    // A channel that stands still (paused, cued, at a clip's end, black, or at speed 0) is silent: its position
+    // does not move, and its frame's samples repeated every grain are a buzz. Slow motion in `mute` is silent too.
+    bool const still = !runtime.liveMode && (!runtime.scheduler.playing || runtime.black || speed <= 0.01);
+    bool const silent = still || (!runtime.liveMode && speed < 0.999 && cfg.audio == AudioMode::Mute);
     std::vector<float> pcm(static_cast<std::size_t>(samples) * 2, 0.f);
     if (auto const* ring = ringOf(audioCamera))
     {
         // Audio is stored with the frames on house times (phase 1 of an HFR camera).
         auto const house = static_cast<std::uint64_t>(std::max<std::int64_t>(1, period));
-        auto const at = (position + house / 2) / house * house;
+        auto at = (position + house / 2) / house * house;
+        // A channel that just stopped fades out over the audio after the grain it played last (no splice, no click),
+        // not over its frame again.
+        if (still && runtime.fadeFramesLeft < 2 && runtime.audioNs != 0)
+        {
+            at = runtime.audioNs + house;
+        }
+        runtime.audioNs = at;
         lock.unlock();
         auto audio = ring->findNearestAudio(at);
         lock.lock();
@@ -955,11 +967,6 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             pcm = std::move(audio);
         }
     }
-    double const speed = std::fabs(runtime.scheduler.speed);
-    // A channel that stands still (paused, cued, at a clip's end, black, or at speed 0) is silent: its position
-    // does not move, and its frame's samples repeated every grain are a buzz. Slow motion in `mute` is silent too.
-    bool const still = !runtime.liveMode && (!runtime.scheduler.playing || runtime.black || speed <= 0.01);
-    bool const silent = still || (!runtime.liveMode && speed < 0.999 && cfg.audio == AudioMode::Mute);
     if (!silent && !runtime.liveMode && speed < 0.999)
     {
         if (cfg.audio == AudioMode::Stretch)
