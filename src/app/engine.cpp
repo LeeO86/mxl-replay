@@ -260,6 +260,11 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         (void)channel;
         channels_.push_back(std::move(runtime));
     }
+    if (config_.tslEnable)
+    {
+        metrics_.inc("tsl_packets_total", {}, 0);
+        metrics_.inc("tsl_errors_total", {}, 0);
+    }
     if (settings_.empty())
     {
         std::istringstream lines(exportKeyValue(config_));
