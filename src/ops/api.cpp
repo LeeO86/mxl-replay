@@ -538,6 +538,19 @@ HttpResponse channelCommand(Engine& engine, int channel, std::string const& acti
         }
         engine.setLock(channel, enable);
     }
+    else if (action == "play-on-tally")
+    {
+        bool enable = false;
+        if (!fields.boolean("enable", enable))
+        {
+            return missing(fields, "enable");
+        }
+        std::string problem;
+        if (!engine.setPlayOnTally(channel, enable, problem))
+        {
+            return error(500, problem);
+        }
+    }
     else
     {
         return error(404, "not found");

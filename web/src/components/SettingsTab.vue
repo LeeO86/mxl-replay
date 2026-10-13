@@ -1,11 +1,27 @@
 <script setup>
-// Settings: configuration export/import as one JSON document (SPECIFICATION.md §8.5), the
-// keyboard map and the jog/shuttle controller (§8.4).
+// Settings: the channel modes and play on red light (SPECIFICATION.md §8.2, §8.8), configuration
+// export/import as one JSON document (§8.5), the keyboard map and the jog/shuttle controller (§8.4).
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { api } from "../api.js";
+import Segmented from "./Segmented.vue";
+import { api, AUDIO_MODES, MOTION_MODES } from "../api.js";
 import { ACTIONS, comboOf, keyLabel, keymap, resetKeys, setKey } from "../keys.js";
 import { BUTTON_LAYOUTS, connectHid, disconnectHid, hid, SHUTTLE_SPEEDS } from "../hid.js";
-import { act, refreshLists, refreshStatus, state } from "../store.js";
+import { act, channelPost, channels, refreshLists, refreshStatus, setMode, state } from "../store.js";
+
+// Channel modes (the same calls the LSM screen made): they apply at once and are not kept over a restart.
+const motionOptions = computed(() =>
+  MOTION_MODES.map((m) => ({ ...m, disabled: m.value === "interpolate" && !state.status?.gpu, title: m.value === "interpolate" && !state.status?.gpu ? "needs a GPU: the channel blends instead" : "" })),
+);
+const tcOptions = [
+  { value: "source", label: "Source", title: "the recording time of the frame shown" },
+  { value: "output", label: "Output", title: "the time of day of the output" },
+];
+// Play on red light is kept in the state directory (CH<n>_PLAY_ON_TALLY): reload the export.
+async function setPlayOnTally(channel, enable) {
+  await channelPost("play-on-tally", { enable }, channel);
+  loadExport();
+}
+const tallyText = (c) => ["off", "red", "green", "amber"][c.tally] || "off";
 
 const exported = ref(null);
 const exportText = computed(() => (exported.value ? JSON.stringify(exported.value, null, 2) : ""));
@@ -87,6 +103,39 @@ const ACTION_LABELS = { ...Object.fromEntries(ACTIONS.map((a) => [a.id, a.label]
 </script>
 
 <template>
+  <div class="grid two">
+    <div v-for="c in channels" :key="c.index" class="panel">
+      <h3>{{ c.label }} <span class="muted small">channel {{ c.index }}</span></h3>
+      <div class="modes">
+        <span>Motion</span>
+        <Segmented :options="motionOptions" :model-value="c.motion" fullwidth label="Motion" @update:model-value="(motion) => setMode({ motion }, c.index)" />
+        <span>Audio</span>
+        <Segmented :options="AUDIO_MODES" :model-value="c.audio" fullwidth label="Audio" @update:model-value="(audio) => setMode({ audio }, c.index)" />
+        <span>Timecode</span>
+        <Segmented :options="tcOptions" :model-value="c.tc_mode" fullwidth label="Timecode" @update:model-value="(timecode) => setMode({ timecode }, c.index)" />
+        <template v-if="c.index > 1">
+          <span>Lock</span>
+          <button class="btn secondary" :aria-pressed="c.lock" @click="channelPost('lock', { enable: !c.lock }, c.index)">
+            {{ c.lock ? "Following" : "Follow" }} {{ channels[0].label }} position
+          </button>
+        </template>
+        <span>Red light</span>
+        <button
+          class="btn secondary"
+          :aria-pressed="c.play_on_tally"
+          :title="state.status?.tsl_enable ? 'A rising red tally (TSL) plays the channel when it is cued or paused' : 'Needs TSL_ENABLE=true (TSL UMD 5.0)'"
+          @click="setPlayOnTally(c.index, !c.play_on_tally)"
+        >
+          Play on red light: {{ c.play_on_tally ? "on" : "off" }}
+        </button>
+      </div>
+      <p class="note">
+        Tally {{ state.status?.tsl_enable ? tallyText(c) : "off (TSL_ENABLE is false)" }}<template v-if="c.tally_play_ns"> · last red-light play
+          {{ Math.max(0, Math.round((state.status.tai_ns - c.tally_play_ns) / 1e9)) }} s ago</template>
+      </p>
+    </div>
+  </div>
+
   <div class="grid two">
     <div class="panel">
       <h3>Export</h3>

@@ -162,7 +162,7 @@ TEST_CASE("the tile map: channels above cameras, even edges, within 1920x1080")
     CHECK(layout.height == 630);
     REQUIRE(layout.tiles.size() == 6);
     CHECK(layout.tiles[0].id == "ch1");
-    CHECK(layout.tiles[0].label == "PGM");
+    CHECK(layout.tiles[0].label == "LSM A");
     CHECK(layout.tiles[1].id == "ch2");
     CHECK((layout.tiles[1].x == 640 && layout.tiles[1].y == 0 && layout.tiles[1].w == 640 && layout.tiles[1].h == 360));
     CHECK(layout.tiles[2].id == "cam1");

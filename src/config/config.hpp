@@ -74,6 +74,8 @@ struct ChannelConfig
     FlowModuleKind flow = FlowModuleKind::DisCuda;
     int atmosCamera = 0;
     bool lockToFirst = false;
+    // A rising red tally (TSL) plays the channel's Cued or Paused shot (CH<n>_PLAY_ON_TALLY).
+    bool playOnTally = true;
 };
 
 struct Config
@@ -136,6 +138,13 @@ struct Config
     int mediamtxIcePort = 8489;
     // CSP frame-ancestors of the /widget pages; /widgets answers these origins with CORS.
     std::string widgetFrameAncestors = "'self'";
+    // TSL UMD 5.0 tally (SPECIFICATION.md §8.8). The ports are next to the multiviewer's (8910/8911) and the
+    // monitor's (8912/8913), so all three can share a host network.
+    bool tslEnable = false;
+    int tslUdpPort = 8914;
+    int tslTcpPort = 8915;
+    int tslScreen = -1;
+    std::string tslMap;
     std::string logLevel = "info";
     std::string logFormat = "json";
     std::string configFile;
