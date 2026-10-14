@@ -77,6 +77,29 @@ export const END_ACTIONS = [
   { value: "next", label: "Next" },
   { value: "return-to-live", label: "Return to live" },
 ];
+// Playlist transitions (1.7.0): the entry's `transition` and `transition_frames` as one choice for compact editors.
+export const TRANSITION_PRESETS = [
+  { value: "cut", label: "Cut", transition: "cut", frames: 0 },
+  { value: "mix12", label: "Mix 12", transition: "mix", frames: 12 },
+  { value: "mix25", label: "Mix 25", transition: "mix", frames: 25 },
+  { value: "mix50", label: "Mix 50", transition: "mix", frames: 50 },
+];
+/** The preset of an entry; a mix of another length is offered as its own choice. */
+export function transitionPreset(entry) {
+  if (entry.transition !== "mix") return "cut";
+  const preset = TRANSITION_PRESETS.find((p) => p.transition === "mix" && p.frames === entry.transition_frames);
+  return preset ? preset.value : `mix${entry.transition_frames}`;
+}
+/** The default aux track of a playlist (the server's defaults). */
+export const AUX_DEFAULTS = { source: "", level_db: 0, loop: true, fade_out_frames: 50, duck_db: -12, attack_ms: 200, release_ms: 500 };
+/** The transition fields an editor keeps per entry, from a playlist answer. */
+export const entryTransition = (e) => ({
+  transition: e.transition || "cut",
+  transition_frames: e.transition_frames || 0,
+  audio_frames: e.audio_frames ?? -1,
+  own_audio: e.own_audio ?? true,
+});
+
 export const MOTION_MODES = [
   { value: "repeat", label: "Repeat" },
   { value: "blend", label: "Blend" },

@@ -15,6 +15,7 @@ export const state = reactive({
   status: null,
   clips: [],
   playlists: [],
+  audio: [], // audio items (1.7.0): uploads without video, for playlists' aux tracks
   channel: storedChannel(),
   connected: false, // WebSocket /api/v1/events
   indexing: false, // 503 {"status":"indexing"} while the buffer is indexed
@@ -77,7 +78,8 @@ export async function refreshStatus() {
 }
 
 export async function refreshLists() {
-  const [clips, playlists] = await Promise.allSettled([api.get("/api/v1/clips"), api.get("/api/v1/playlists")]);
+  const [clips, playlists, audio] = await Promise.allSettled([api.get("/api/v1/clips"), api.get("/api/v1/playlists"), api.get("/api/v1/audio")]);
+  if (audio.status === "fulfilled") state.audio = audio.value.sort((a, b) => serial(a.id) - serial(b.id));
   if (clips.status === "fulfilled") state.clips = clips.value.sort((a, b) => serial(a.id) - serial(b.id));
   if (playlists.status === "fulfilled") state.playlists = playlists.value.sort((a, b) => serial(a.id) - serial(b.id));
 }

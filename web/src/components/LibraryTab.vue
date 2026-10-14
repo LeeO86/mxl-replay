@@ -51,6 +51,18 @@ async function consolidate(clip) {
     refreshLists();
   }
 }
+// Audio items (1.7.0): uploads without video, the sources of playlists' aux tracks.
+async function renameAudio(item) {
+  const name = prompt("Name of the audio item", item.name);
+  if (!name || name.trim() === item.name) return;
+  if (await act(() => api.put(`/api/v1/audio/${encodeURIComponent(item.id)}`, { name: name.trim() }))) refreshLists();
+}
+async function removeAudio(item) {
+  const users = state.playlists.filter((p) => p.aux_source === item.id).map((p) => p.name);
+  if (!confirm(`Delete audio "${item.name}"?${users.length ? ` It is the aux track of ${users.join(", ")}.` : ""}`)) return;
+  if (await act(() => api.del(`/api/v1/audio/${encodeURIComponent(item.id)}`))) refreshLists();
+}
+
 async function remove(clip) {
   if (!confirm(`Delete "${clip.name}"? Its frames in the buffer are no longer kept.`)) return;
   if (await act(() => api.del(`/api/v1/clips/${encodeURIComponent(clip.id)}`))) refreshLists();
@@ -87,7 +99,11 @@ function upload() {
       /* not JSON */
     }
     uploadOk.value = xhr.status === 201;
-    uploadMessage.value = uploadOk.value ? `Uploaded as ${body.id}.` : `Upload failed: ${body.error || xhr.statusText}`;
+    uploadMessage.value = uploadOk.value
+      ? body.kind === "audio"
+        ? `Uploaded as audio item ${body.id} (an aux track source for playlists).`
+        : `Uploaded as ${body.id}.`
+      : `Upload failed: ${body.error || xhr.statusText}`;
     progress.value = -1;
     if (uploadOk.value) {
       file.value = null;
@@ -110,8 +126,8 @@ function upload() {
     <h3>Upload a file</h3>
     <div class="row">
       <div style="flex: 2">
-        <label for="up-file">Video or still image (converted to the house format)</label>
-        <input id="up-file" ref="fileInput" type="file" accept="video/*,image/*,.mxf,.mov,.mkv" :disabled="progress >= 0" @change="pick" />
+        <label for="up-file">Video or still image (converted to the house format), or audio (WAV, MP3, AAC, FLAC: an audio item)</label>
+        <input id="up-file" ref="fileInput" type="file" accept="video/*,image/*,audio/*,.mxf,.mov,.mkv,.wav,.mp3,.m4a,.aac,.flac" :disabled="progress >= 0" @change="pick" />
       </div>
       <div style="flex: 2">
         <label for="up-name">Name</label>
@@ -177,6 +193,37 @@ function upload() {
       </tbody>
     </table>
     <div v-else class="empty">{{ state.clips.length ? "No clip matches the search." : "No clips yet: create one on the LSM page or upload a file." }}</div>
+  </div>
+
+  <div class="panel">
+    <h3>
+      Audio <span class="muted">{{ state.audio.length }}</span>
+    </h3>
+    <table v-if="state.audio.length">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th class="num">Length</th>
+          <th>Aux track of</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="item in state.audio" :key="item.id">
+          <td>
+            <strong>{{ item.name }}</strong>
+            <div class="muted small">{{ item.id }} · 48 kHz stereo</div>
+          </td>
+          <td class="num">{{ fmtNs(item.duration_ns) }}</td>
+          <td>{{ state.playlists.filter((p) => p.aux_source === item.id).map((p) => p.name).join(", ") || "–" }}</td>
+          <td class="actions-cell">
+            <button class="btn small secondary" @click="renameAudio(item)">Rename</button>
+            <button class="btn small danger" @click="removeAudio(item)">Delete</button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <div v-else class="empty">No audio items yet: upload a WAV, MP3, AAC or FLAC file above. A playlist plays one as its aux track.</div>
   </div>
 
   <ClipInspector :clip="editing" @close="editing = null" />
