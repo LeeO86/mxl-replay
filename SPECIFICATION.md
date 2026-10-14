@@ -231,6 +231,26 @@ Per channel (and stored per clip), `motion_mode`:
   it plays or goes live (1.5.0; it repeated the frame's samples before). Live is unchanged.
 - Audio comes from the camera being played (angle switch switches audio), or from a
   fixed "atmos" camera (configurable per channel).
+- **Playlist transitions** (1.7.0, §7): a transition into an entry crossfades the two entries'
+  audio over `audio_frames` with **equal power** (`out = cos(π/2·t)`, `in = sin(π/2·t)`,
+  `t = (n + 0.5)/S` per sample over the crossfade's `S` samples). Two entries are different
+  moments or cameras, uncorrelated programme: equal power keeps the loudness across the join,
+  where a linear crossfade dips by 3 dB in the middle. Both gains are continuous and start and
+  end within half a sample step of 1 and 0: no click. Each side reads its own audio at its own
+  position with its own speed and mode; an entry with `own_audio` off is silent (with the 2-frame
+  fade). A channel that stops during a crossfade ends it with a 1-frame fade of the outgoing side.
+- **Aux track** (1.7.0): a playlist's `aux` plays under its entries while the channel is on
+  the playlist and not live: a clip's audio (IN to OUT) or an **audio item** (§7). It starts at
+  its beginning when the playlist starts (play, cue, shotbox, idle) and runs at 100 %, whatever
+  the entries' speeds; with `loop` it starts again at its end, else it stops. Its gain per sample
+  is `level_db` × duck × end fade × edge: the **duck** ramps in dB to `duck_db` (−60…0, default
+  −12) over `attack_ms` (200) while the current entry's own audio is audible (own audio on, not
+  muted by slow motion or a stop; the outgoing entry's during a crossfade) and back over
+  `release_ms` (500); the **end fade** is linear to silence over the playlist's last
+  `fade_out_frames` (50; from the countdown `playlist_remaining_ns`, so a looped playlist does not
+  fade); the **edges** are 5 ms fades at the source's start, end and loop point. Paused, cued or
+  stopped the aux pauses with the channel (2-frame fades). CPU only: per grain one read (a ring
+  frame's audio or a `pread` of the item's file) and a few operations per sample.
 
 ### 5.5 Timecode
 
@@ -312,14 +332,42 @@ The flow step (1–5) is a module behind one interface:
   released.
 - **Upload** files (video/still) like mxl-test-player: converted at upload to house
   format and stored as JPEG frame sequence + PCM, so they behave exactly like buffer
-  clips (any speed, interpolation, frame-accurate).
+  clips (any speed, interpolation, frame-accurate). A file with an audio stream and no
+  video (WAV, MP3, AAC, FLAC: anything FFmpeg decodes) is an **audio item** (1.7.0):
+  resampled to 48 kHz stereo float and kept as `<library>/audio/<id>.f32` (ids `audio-N`;
+  `GET /api/v1/audio`, `GET`/`PUT {"name"}`/`DELETE /api/v1/audio/{id}`; deleting one removes
+  it from the playlists that use it as aux). Items are files: they are not in the config export.
 - **Playlists**: ordered clips with per-entry speed, end action, auto-advance;
-  next clip preloaded; cut transitions in v1. A playlist can **loop** (1.6.0): after its
+  next clip preloaded; cut transitions in v1, **mix** transitions since 1.7.0. A playlist can **loop** (1.6.0): after its
   last entry it starts again at its first (`loop` in the API, the catalog and the config
   export). With `loop` on, the last playable entry's `freeze` or `black` acts as `next`
   (the list wraps and plays on); that entry's own `loop` (the clip repeats) and
   `return-to-live` still apply.
 - End action per clip: `freeze` (default), `black`, `loop`, `next`, `return-to-live`.
+- **Transitions** (1.7.0). Each entry has a transition **into** it from the entry before (the
+  edit-list convention; the first entry's applies when a looped or idle playlist wraps to it):
+  `transition` `cut` (default) or `mix`, `transition_frames` (a mix: 1–250, default 25),
+  `audio_frames` (the audio crossfade, 0–250; −1, the default, is the video's: 0 for a cut)
+  and `own_audio` (default true). A transition takes `L = max(transition_frames, audio_frames)`
+  frames and starts on the grain where the outgoing entry has `L` grains left to its OUT at
+  its speed, when that entry continues into the next one with *next* and auto-advance (or the
+  loop wrap, or the idle playlist); otherwise the join is a cut as before. At that grain the
+  channel **moves to the incoming entry** (clip, index, speed, modes, status, countdowns) and
+  keeps the outgoing side as it plays on to its OUT (and holds there). The two entries overlap
+  by `L`: the countdowns and `duration_ns` take it off. Grain `k` of an `N`-frame mix shows
+  `(k+1)/(N+1)` of the incoming picture over the outgoing (never a pure picture inside the
+  mix); each side shows its nearest source frame at its own position, as `repeat` (exact at
+  100 % on a house-rate camera; a side is not interpolated inside a mix). On the GPU the two
+  JPEGs are decoded and blended by the blend path without a flow (one extra nvJPEG decode per
+  grain of a mix, nothing outside one); on the CPU in 1/1024 steps. A cut with `audio_frames`
+  cuts the picture at the start of the overlap and crossfades the audio over it. The audio is in
+  §5.4. Per channel the status has `own_audio`, `transition` (`null` or `kind`, `frames`,
+  `audio_frames`, `done`) and `aux` (`null` or `source`, `gain_db`, `ducked`, `position_ns`);
+  `mxl_replay_transitions_total{channel,kind}` counts them and `transition` logs each.
+- **Aux track** per playlist (1.7.0, §5.4): `aux` `{source, level_db, loop, fade_out_frames,
+  duck_db, attack_ms, release_ms}` in `POST`/`PUT /api/v1/playlists` (a partial object on `PUT`
+  changes only its fields; `source` `""` removes it), the answers, the catalog and the config
+  export. `GET /api/v1/playlists` adds each playlist's `aux_source`.
 - **Idle playlist** (1.6.0): per channel `CH<n>_IDLE_PLAYLIST` (a playlist id; Settings;
   `POST /api/v1/channels/{n}/idle-playlist {"playlist": id}`, `""` clears it; kept in the
   state directory and the config export; deleting the playlist clears it). It plays, looped:
@@ -378,7 +426,8 @@ The flow step (1–5) is a module behind one interface:
 
 ### 8.3 Other pages
 
-Library (clips, uploads, conversion queue, export), Playlists, Cameras (inputs,
+Library (clips, uploads, conversion queue, export; audio items, 1.7.0), Playlists (per
+entry the clip's IN thumbnail, the transition in and own audio; the aux track, 1.7.0), Cameras (inputs,
 phase groups, buffer settings, storage status), NMOS, Settings (per channel: motion,
 audio and timecode mode, lock to the first channel, play on red light (§8.8) and the
 tally; config import/export as one JSON document) — like the siblings.
@@ -397,7 +446,8 @@ playlists, library, uploads, exports, config) and WebSocket `/api/v1/events`
 (positions, states, thumbnails at low rate, alarms) so several UIs stay in sync and
 other systems (e.g. a control surface or a vision mixer macro) can drive the replay.
 Clips are edited with `PATCH /api/v1/clips/{id}` and playlists read, replaced and
-deleted at `/api/v1/playlists/{id}`; `POST /api/v1/playlists/{id}/play {"channel"}` plays one
+deleted at `/api/v1/playlists/{id}` (with the entries' transitions and the `aux` track, 1.7.0);
+audio items are listed at `/api/v1/audio` and renamed or deleted at `/api/v1/audio/{id}`; `POST /api/v1/playlists/{id}/play {"channel"}` plays one
 and `…/cue` cues its first clip, paused (a shotbox click on it then plays). Low-rate JPEG previews are served per channel,
 per camera and per clip (`…/preview.jpg`, `/api/v1/clips/{id}/thumbnail.jpg`; in the
 WebRTC mode of §8.6 only the clip thumbnails, and `/api/v1/preview/map`); the
@@ -475,8 +525,10 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
   shotbox button on the channel (Load cues it; then Play, Pause). Without `channel` the
   widget has a channel picker.
 - `playlist-editor` (`playlist`, optional; `min_size` 480×320): one playlist's entries, each
-  with its clip, length, speed (1–200 %), end action, up, down and remove, and *Add a
-  clip* (newest first; a new entry ends with `next` and auto-advances). Every change is
+  with its clip's IN thumbnail, length, speed (1–200 %), end action, transition (*Cut*,
+  *Mix 12*, *Mix 25*, *Mix 50*; 1.7.0), own audio (♪), up, down and remove, the aux track's
+  source and level (1.7.0), and *Add a clip* (newest first; a new entry ends with `next` and
+  auto-advances). Every change is
   saved at once (`PUT /api/v1/playlists/{id}` with the entries). Without `playlist` the
   widget has a playlist picker. A channel on the playlist marks its entry.
 - `playlist-player` (`channel`, required; `playlist`, optional: a picker; `min_size`
