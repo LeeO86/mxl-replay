@@ -211,10 +211,17 @@ std::string playlistJson(Catalog::Playlist const& playlist, std::vector<ClipRef>
         }
     }
     std::ostringstream out;
-    out << "{\"id\":\"" << jsonEscape(playlist.id) << "\",\"name\":\"" << jsonEscape(playlist.name) << "\",\"entries\":";
+    out << "{\"id\":\"" << jsonEscape(playlist.id) << "\",\"name\":\"" << jsonEscape(playlist.name) << "\",\"loop\":" << (playlist.loop ? "true" : "false")
+        << ",\"entries\":";
     if (!entries)
     {
-        out << playlist.entries.size();
+        // The count, and the entries' clips in order (the shotbox stacks their thumbnails).
+        out << playlist.entries.size() << ",\"clip_ids\":[";
+        for (std::size_t i = 0; i < playlist.entries.size(); ++i)
+        {
+            out << (i > 0 ? "," : "") << '"' << jsonEscape(playlist.entries[i].clipId) << '"';
+        }
+        out << ']';
     }
     else
     {
@@ -405,9 +412,13 @@ HttpResponse channelCommand(Engine& engine, int channel, std::string const& acti
         {
             engine.live(channel);
         }
+        else if (command == "stop")
+        {
+            engine.stop(channel);
+        }
         else
         {
-            return error(400, "command must be play, pause or live");
+            return error(400, "command must be play, pause, stop or live");
         }
     }
     else if (action == "speed")
@@ -537,6 +548,20 @@ HttpResponse channelCommand(Engine& engine, int channel, std::string const& acti
             return missing(fields, "enable");
         }
         engine.setLock(channel, enable);
+    }
+    else if (action == "idle-playlist")
+    {
+        // {"playlist": "<id>"} plays it now and whenever the channel stops; "" clears it.
+        std::string id;
+        if (!fields.string("playlist", id))
+        {
+            return missing(fields, "playlist");
+        }
+        std::string problem;
+        if (!engine.setIdlePlaylist(channel, id, problem))
+        {
+            return error(problem == "unknown playlist" ? 404 : 500, problem);
+        }
     }
     else if (action == "play-on-tally")
     {
@@ -950,7 +975,12 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         {
             return error(400, "unknown clip " + unknown);
         }
-        auto const id = engine.createPlaylist(name, entries);
+        bool loop = false;
+        if (fields.has("loop") && !fields.boolean("loop", loop))
+        {
+            return error(400, fields.error());
+        }
+        auto const id = engine.createPlaylist(name, entries, loop);
         return json(201, std::string("{\"id\":\"") + jsonEscape(id) + "\"}");
     }
     if (path.rfind("/api/v1/playlists/", 0) == 0)
@@ -970,6 +1000,10 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         {
             // The given name and entries replace the stored ones.
             fields.string("name", playlist.name);
+            if (fields.has("loop"))
+            {
+                fields.boolean("loop", playlist.loop);
+            }
             std::vector<PlaylistEntry> entries;
             std::string problem;
             if (!fields.error().empty() || !readEntries(body, entries, problem))
@@ -1040,6 +1074,10 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         {
             engine.live(channel);
         }
+        else if (action == "stop")
+        {
+            engine.stop(channel);
+        }
         else if (action == "in")
         {
             engine.markIn(channel);
@@ -1072,7 +1110,7 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         }
         else
         {
-            return error(400, "action must be play, pause, live, in, out, scrub or speed");
+            return error(400, "action must be play, pause, stop, live, in, out, scrub or speed");
         }
         return json(200, engine.statusJson());
     }

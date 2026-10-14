@@ -45,6 +45,20 @@ void Catalog::open(std::string const& path)
         "CREATE TABLE IF NOT EXISTS playlists (id TEXT PRIMARY KEY, name TEXT);"
         "CREATE TABLE IF NOT EXISTS playlist_entries (playlist TEXT, position INTEGER, clip_id TEXT, speed REAL, end_action TEXT, auto_advance INTEGER);"
         "CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);");
+    // 1.5.0: a playlist can loop. A catalog from before gets the column (off).
+    bool hasLoop = false;
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db_, "PRAGMA table_info(playlists)", -1, &stmt, nullptr);
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        auto const* column = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 1));
+        hasLoop = hasLoop || (column != nullptr && std::string(column) == "loop");
+    }
+    sqlite3_finalize(stmt);
+    if (!hasLoop)
+    {
+        exec(db_, "ALTER TABLE playlists ADD COLUMN loop INTEGER NOT NULL DEFAULT 0;");
+    }
 }
 
 void Catalog::close()
@@ -149,9 +163,11 @@ ClipRef Catalog::clip(std::string const& id) const
 void Catalog::upsertPlaylist(Playlist const& playlist)
 {
     sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db_, "INSERT INTO playlists (id,name) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name", -1, &stmt, nullptr);
+    sqlite3_prepare_v2(db_, "INSERT INTO playlists (id,name,loop) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,loop=excluded.loop", -1, &stmt,
+        nullptr);
     sqlite3_bind_text(stmt, 1, playlist.id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, playlist.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, playlist.loop ? 1 : 0);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     sqlite3_prepare_v2(db_, "DELETE FROM playlist_entries WHERE playlist=?", -1, &stmt, nullptr);
@@ -192,12 +208,13 @@ std::vector<Catalog::Playlist> Catalog::playlists() const
 {
     std::vector<Playlist> out;
     sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db_, "SELECT id,name FROM playlists ORDER BY name", -1, &stmt, nullptr);
+    sqlite3_prepare_v2(db_, "SELECT id,name,loop FROM playlists ORDER BY name", -1, &stmt, nullptr);
     while (sqlite3_step(stmt) == SQLITE_ROW)
     {
         Playlist playlist;
         playlist.id = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 0));
         playlist.name = reinterpret_cast<char const*>(sqlite3_column_text(stmt, 1));
+        playlist.loop = sqlite3_column_int(stmt, 2) != 0;
         out.push_back(std::move(playlist));
     }
     sqlite3_finalize(stmt);

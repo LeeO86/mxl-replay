@@ -7,7 +7,7 @@ import { api, END_ACTIONS, fmtNs, playNs } from "../api.js";
 import { act, cameraLabel, channels, clipsById, refreshLists, refreshStatus, state } from "../store.js";
 
 const selectedId = ref("");
-const draft = ref(null); // { name, entries: [{ clip_id, speed (percent), end, auto_advance }] }
+const draft = ref(null); // { name, loop, entries: [{ clip_id, speed (percent), end, auto_advance }] }
 const saved = ref("");
 const message = ref("");
 const newName = ref("");
@@ -19,6 +19,7 @@ const dirty = computed(() => draft.value && JSON.stringify(draft.value) !== save
 const speedOk = (speed) => typeof speed === "number" && speed >= 1 && speed <= 200;
 const entriesOk = computed(() => (draft.value?.entries || []).every((e) => speedOk(e.speed)));
 const playingOn = (id) => channels.value.filter((c) => c.playlist === id && !c.live);
+const idleOn = (id) => channels.value.filter((c) => c.idle_playlist === id);
 
 async function load(id) {
   // Another playlist: unsaved edits are only dropped when the operator says so.
@@ -29,6 +30,7 @@ async function load(id) {
   if (!playlist) return;
   draft.value = {
     name: playlist.name,
+    loop: !!playlist.loop,
     entries: playlist.entries.map((e) => ({ clip_id: e.clip_id, speed: Math.round(e.speed * 100), end: e.end, auto_advance: e.auto_advance })),
   };
   saved.value = JSON.stringify(draft.value);
@@ -64,7 +66,7 @@ async function create() {
 }
 async function save() {
   message.value = "";
-  const body = { name: draft.value.name.trim(), entries: draft.value.entries.map((e) => ({ ...e, speed: e.speed / 100 })) };
+  const body = { name: draft.value.name.trim(), loop: draft.value.loop, entries: draft.value.entries.map((e) => ({ ...e, speed: e.speed / 100 })) };
   try {
     await api.put(`/api/v1/playlists/${encodeURIComponent(selectedId.value)}`, body);
     saved.value = JSON.stringify(draft.value);
@@ -106,7 +108,8 @@ async function play(id) {
       >
         <strong>{{ p.name }}</strong>
         <span v-for="c in playingOn(p.id)" :key="c.index" class="pill ok" style="margin-left: 0.4rem">{{ c.label }} {{ c.playing ? "playing" : c.shot }}</span>
-        <div class="meta">{{ p.entries }} clips · {{ fmtNs(p.duration_ns) }}</div>
+        <span v-for="c in idleOn(p.id)" :key="`idle${c.index}`" class="pill" style="margin-left: 0.4rem" title="the channel's idle playlist">idle {{ c.label }}</span>
+        <div class="meta">{{ p.entries }} clips · {{ fmtNs(p.duration_ns) }}<template v-if="p.loop"> · loops</template></div>
       </button>
       <div v-if="!state.playlists.length" class="empty">No playlists yet.</div>
       <form class="row" style="margin-top: 0.8rem" @submit.prevent="create">
@@ -125,6 +128,9 @@ async function play(id) {
       </h3>
       <label for="pl-name">Name</label>
       <input id="pl-name" v-model="draft.name" maxlength="120" />
+      <label class="row" style="gap: 0.4rem; margin-top: 0.5rem; align-items: center">
+        <input v-model="draft.loop" type="checkbox" style="width: auto" /> Loop: after the last clip, start again at the first
+      </label>
       <table style="margin-top: 0.8rem">
         <thead>
           <tr>
@@ -171,7 +177,10 @@ async function play(id) {
         </select>
         <button class="btn secondary" style="flex: none" :disabled="!addClip" @click="add">Add</button>
       </div>
-      <div class="note">Total {{ fmtNs(draftLength) }}. At the end: <em>Next</em> goes to the next clip; with auto-advance it plays at once, otherwise it waits cued.</div>
+      <div class="note">
+        Total {{ fmtNs(draftLength) }}. At the end: <em>Next</em> goes to the next clip; with auto-advance it plays at once, otherwise it waits cued.
+        As a channel's idle playlist (Settings) every clip plays on and the playlist loops.
+      </div>
       <div v-if="!entriesOk" class="msg err">Each speed is 1 to 200 %.</div>
       <div v-if="message" class="msg err">{{ message }}</div>
       <div class="actions">

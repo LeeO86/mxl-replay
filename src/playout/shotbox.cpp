@@ -120,4 +120,64 @@ int playlistNext(std::vector<PlaylistEntry> const& entries, int index)
     }
     return next;
 }
+
+std::int64_t remainingNs(std::int64_t positionNs, std::uint64_t outNs, double speed)
+{
+    auto const out = static_cast<std::int64_t>(outNs);
+    if (positionNs >= out)
+    {
+        return 0;
+    }
+    if (!(speed > 0.0))
+    {
+        return -1;
+    }
+    return static_cast<std::int64_t>(static_cast<double>(out - positionNs) / speed);
+}
+
+std::int64_t playlistRemainingNs(std::vector<PlaylistEntry> const& entries, std::vector<std::int64_t> const& lengthsNs, int index,
+    std::int64_t clipRemainingNs)
+{
+    if (clipRemainingNs < 0 || index < 0 || index >= static_cast<int>(entries.size()))
+    {
+        return clipRemainingNs;
+    }
+    std::int64_t total = clipRemainingNs;
+    for (int i = index; i < static_cast<int>(entries.size()); ++i)
+    {
+        auto const& entry = entries[static_cast<std::size_t>(i)];
+        if (i > index)
+        {
+            auto const length = i < static_cast<int>(lengthsNs.size()) ? lengthsNs[static_cast<std::size_t>(i)] : -1;
+            if (length < 0)
+            {
+                continue; // a deleted clip is skipped
+            }
+            total += length;
+        }
+        if (entry.end == EndAction::Loop)
+        {
+            return -1;
+        }
+        if (entry.end != EndAction::Next)
+        {
+            return total;
+        }
+    }
+    return total;
+}
+
+int idleNext(std::vector<bool> const& present, int index)
+{
+    int const size = static_cast<int>(present.size());
+    for (int step = 1; step <= size; ++step)
+    {
+        int const i = ((index < 0 ? -1 : index) + step) % size;
+        if (i >= 0 && present[static_cast<std::size_t>(i)])
+        {
+            return i;
+        }
+    }
+    return -1;
+}
 } // namespace replay

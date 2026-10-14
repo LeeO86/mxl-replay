@@ -24,6 +24,7 @@
 #include "util/uuid.hpp"
 
 #include <arpa/inet.h>
+#include <sqlite3.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -377,6 +378,31 @@ TEST_CASE("shotbox cues then plays and a playlist advances")
     CHECK(playlistNext(entries, 1) == -1);
 }
 
+TEST_CASE("shotbox countdowns run to OUT and to the playlist's end; an idle playlist wraps")
+{
+    CHECK(remainingNs(0, 2000, 1.0) == 2000);
+    CHECK(remainingNs(1000, 2000, 0.5) == 2000);
+    CHECK(remainingNs(2000, 2000, 1.0) == 0);
+    CHECK(remainingNs(2500, 2000, 1.0) == 0);
+    CHECK(remainingNs(0, 2000, 0.0) == -1);
+    CHECK(remainingNs(0, 2000, -0.5) == -1);
+    std::vector<PlaylistEntry> entries{{"a", 1, EndAction::Next, true}, {"b", 1, EndAction::Next, false}, {"gone", 1, EndAction::Next, true},
+        {"c", 1, EndAction::Freeze, true}, {"d", 1, EndAction::Next, true}};
+    std::vector<std::int64_t> const lengths{100, 200, -1, 400, 800};
+    // From entry 0 with 50 left: b and c (the deleted entry is skipped), and c's freeze ends the playlist.
+    CHECK(playlistRemainingNs(entries, lengths, 0, 50) == 650);
+    CHECK(playlistRemainingNs(entries, lengths, 3, 10) == 10);
+    CHECK(playlistRemainingNs(entries, lengths, 4, 10) == 10);
+    CHECK(playlistRemainingNs(entries, lengths, 0, -1) == -1);
+    entries[1].end = EndAction::Loop;
+    CHECK(playlistRemainingNs(entries, lengths, 0, 50) == -1);
+    CHECK(idleNext({true, false, true}, 0) == 2);
+    CHECK(idleNext({true, false, true}, 2) == 0);
+    CHECK(idleNext({false, true}, -1) == 1);
+    CHECK(idleNext({false, false}, 0) == -1);
+    CHECK(idleNext({}, -1) == -1);
+}
+
 TEST_CASE("time stretch length and mute fade")
 {
     std::vector<float> input(2000, 0.25f);
@@ -543,6 +569,32 @@ TEST_CASE("catalog stores a clip and a playlist")
     catalog.upsertPlaylist(playlist);
     CHECK(catalog.playlists().size() == 1);
     CHECK(catalog.playlists()[0].entries[0].autoAdvance);
+    CHECK_FALSE(catalog.playlists()[0].loop);
+    playlist.loop = true;
+    catalog.upsertPlaylist(playlist);
+    CHECK(catalog.playlists()[0].loop);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a catalog from before playlist loops gets the column")
+{
+    auto const path = std::filesystem::temp_directory_path() / "mxl-replay-catalog-old.sqlite";
+    std::filesystem::remove(path);
+    {
+        sqlite3* db = nullptr;
+        REQUIRE(sqlite3_open(path.string().c_str(), &db) == SQLITE_OK);
+        CHECK(sqlite3_exec(db, "CREATE TABLE playlists (id TEXT PRIMARY KEY, name TEXT); INSERT INTO playlists VALUES ('p1','old');", nullptr, nullptr,
+                  nullptr) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+    Catalog catalog;
+    catalog.open(path.string());
+    REQUIRE(catalog.playlists().size() == 1);
+    CHECK(catalog.playlists()[0].name == "old");
+    CHECK_FALSE(catalog.playlists()[0].loop);
+    catalog.close();
+    catalog.open(path.string());
+    CHECK(catalog.playlists().size() == 1);
     std::filesystem::remove(path);
 }
 
@@ -1472,6 +1524,155 @@ TEST_CASE("a playlist keeps deleted clips as skipped entries and a playing chann
     CHECK(call(*engine, "PUT", "/api/v1/playlists/" + id, entries({second, first})).status == 200);
     CHECK(engine->statusJson().find("\"playlist_index\":0") != std::string::npos);
     engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("an idle playlist plays when set, at a clip's end and on stop, and loops; a looped playlist starts again")
+{
+    auto const dir = freshDir("mxl-replay-idle");
+    auto engine = recordedEngine(dir, 20);
+    auto const clipFrom = [&](int in, int out) {
+        engine->setPosition(1, frameTime(in));
+        engine->markIn(1);
+        engine->setPosition(1, frameTime(out));
+        engine->markOut(1);
+        std::string error;
+        return engine->createClip(1, "", false, false, error);
+    };
+    auto const shot = clipFrom(0, 4);
+    auto const idleA = clipFrom(10, 12);
+    auto const idleB = clipFrom(15, 17);
+    auto const idle = engine->createPlaylist("idle", {PlaylistEntry{idleA, 1, EndAction::Freeze, false}, PlaylistEntry{idleB, 1, EndAction::Black, true}});
+    auto const has = [&](std::string const& text) { return engine->statusJson().find(text) != std::string::npos; };
+
+    // The countdowns of a clip: 4 frames to OUT at 100 %, 8 at 50 %; no playlist.
+    engine->playClip(1, shot);
+    CHECK(has("\"clip_remaining_ns\":80000000"));
+    CHECK(has("\"playlist_remaining_ns\":null"));
+    engine->setSpeed(1, 0.5);
+    CHECK(has("\"clip_remaining_ns\":160000000"));
+    engine->live(1);
+    CHECK(has("\"clip_remaining_ns\":null"));
+
+    // Without an idle playlist, stop ends the shot where it stands.
+    engine->playClip(1, shot);
+    engine->setSpeed(1, 1);
+    (void)engine->render(1, 0);
+    engine->stop(1);
+    CHECK(has("\"shot\":\"ended\""));
+    CHECK(has("\"playing\":false"));
+
+    // Set: it plays at once.
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"playlist-404\"}").status == 404);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{}").status == 400);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"" + idle + "\"}").status == 200);
+    CHECK(has("\"idle_playlist\":\"" + idle + "\""));
+    CHECK(has("\"idle\":true"));
+    CHECK(has("\"playlist\":\"" + idle + "\""));
+    CHECK(has("\"clip\":\"" + idleA + "\""));
+    // The idle playlist plays every entry on (the end actions and auto-advance do not stop it) and loops.
+    CHECK(has("\"playlist_remaining_ns\":80000000"));
+    std::vector<std::string> seen;
+    for (int i = 0; i < 12; ++i)
+    {
+        (void)engine->render(1, 0);
+        auto const status = engine->statusJson();
+        CHECK(status.find("\"playing\":true") != std::string::npos);
+        CHECK(status.find("\"black\":false") != std::string::npos);
+        auto const clip = status.find("\"clip\":\"" + idleA + "\"") != std::string::npos ? idleA : idleB;
+        if (seen.empty() || seen.back() != clip)
+        {
+            seen.push_back(clip);
+        }
+    }
+    CHECK(seen.size() >= 4);
+    CHECK(seen[0] == idleA);
+    CHECK(seen[1] == idleB);
+    CHECK(seen[2] == idleA);
+
+    // A clip played on the channel: the idle playlist plays again at its end.
+    engine->playClip(1, shot);
+    CHECK(has("\"idle\":false"));
+    for (int i = 0; i < 6; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    CHECK(has("\"idle\":true"));
+    CHECK(has("\"shot_id\":\"" + idle + "\""));
+    // Stopped: the idle playlist plays.
+    CHECK(engine->shotClick(1, shot) == ShotState::Cued);
+    CHECK(has("\"idle\":false"));
+    CHECK(call(*engine, "POST", "/api/v1/control", "{\"action\":\"stop\"}").status == 200);
+    CHECK(has("\"idle\":true"));
+    CHECK(has("\"playing\":true"));
+    // Live leaves it, a transport stop starts it again.
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/transport", "{\"command\":\"live\"}").status == 200);
+    CHECK(has("\"idle\":false"));
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/transport", "{\"command\":\"stop\"}").status == 200);
+    CHECK(has("\"idle\":true"));
+    // Kept in the state directory and the export.
+    CHECK(engine->exportConfigJson().find("\"CH1_IDLE_PLAYLIST\":\"" + idle + "\"") != std::string::npos);
+
+    // A looped playlist starts again at its first entry; its playlist countdown is the end of the pass.
+    auto const looped = engine->createPlaylist("looped", {PlaylistEntry{idleA, 1, EndAction::Next, true}, PlaylistEntry{idleB, 1, EndAction::Next, true}});
+    auto const body = call(*engine, "PUT", "/api/v1/playlists/" + looped, "{\"loop\":true}");
+    CHECK(body.status == 200);
+    CHECK(body.body.find("\"loop\":true") != std::string::npos);
+    CHECK(call(*engine, "PUT", "/api/v1/playlists/" + looped, "{\"loop\":\"yes\"}").status == 400);
+    CHECK(call(*engine, "GET", "/api/v1/playlists").body.find("\"clip_ids\":[\"" + idleA + "\",\"" + idleB + "\"]") != std::string::npos);
+    engine->playPlaylist(1, looped);
+    CHECK(has("\"playlist_loop\":true"));
+    CHECK(has("\"playlist_remaining_ns\":80000000"));
+    for (int i = 0; i < 5; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    CHECK(has("\"playlist\":\"" + looped + "\""));
+    CHECK(has("\"playlist_index\":0"));
+    CHECK(has("\"idle\":false"));
+    CHECK(engine->exportConfigJson().find("\"loop\":true") != std::string::npos);
+
+    // Deleting the idle playlist clears it; a stop then ends the shot.
+    CHECK(engine->deletePlaylist(idle));
+    CHECK(has("\"idle_playlist\":\"\""));
+    CHECK(engine->exportConfigJson().find("CH1_IDLE_PLAYLIST") == std::string::npos);
+    // Cleared with "": the channel keeps playing what it plays.
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"" + looped + "\"}").status == 200);
+    CHECK(has("\"idle\":true"));
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"\"}").status == 200);
+    CHECK(has("\"idle\":false"));
+    CHECK(has("\"playing\":true"));
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a channel with an idle playlist starts with it")
+{
+    auto const dir = freshDir("mxl-replay-idle-start");
+    std::string idle;
+    {
+        auto engine = recordedEngine(dir, 12);
+        engine->setPosition(1, frameTime(2));
+        engine->markIn(1);
+        engine->setPosition(1, frameTime(6));
+        engine->markOut(1);
+        std::string error;
+        auto const clip = engine->createClip(1, "", false, false, error);
+        idle = engine->createPlaylist("idle", {PlaylistEntry{clip, 1, EndAction::Next, true}});
+        REQUIRE(engine->setIdlePlaylist(1, idle, error));
+    }
+    auto const loaded = loadConfig({{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+                                       {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()},
+                                       {"REPLAY_STORAGE_MIN_MBPS", "0"}, {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {}, readConfigFile((dir / "state" / "config.json").string()));
+    CHECK(loaded.config.channelList[0].idlePlaylist == idle);
+    {
+        Engine engine(loaded.config, loaded.flat);
+        engine.openBuffer();
+        auto const status = engine.statusJson();
+        CHECK(status.find("\"idle\":true") != std::string::npos);
+        CHECK(status.find("\"live\":false") != std::string::npos);
+    }
     std::filesystem::remove_all(dir);
 }
 

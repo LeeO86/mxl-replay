@@ -217,7 +217,7 @@ bool knownIndexed(std::string const& key)
     }
     if (isIndexedKey(key, "CH", &index, &field))
     {
-        static std::vector<std::string> const fields = {"LABEL", "IDLE", "MOTION", "AUDIO", "TC", "FLOW", "ATMOS", "LOCK", "PLAY_ON_TALLY"};
+        static std::vector<std::string> const fields = {"LABEL", "IDLE", "MOTION", "AUDIO", "TC", "FLOW", "ATMOS", "LOCK", "PLAY_ON_TALLY", "IDLE_PLAYLIST"};
         return std::find(fields.begin(), fields.end(), field) != fields.end();
     }
     return false;
@@ -853,6 +853,7 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
         {
             throw ConfigError("CH play on tally must be a boolean");
         }
+        channel.idlePlaylist = take(values, "CH" + std::to_string(i) + "_IDLE_PLAYLIST", "");
         cfg.channelList.push_back(channel);
     }
     if (!parseBool(take(values, "TSL_ENABLE", "false"), &cfg.tslEnable))

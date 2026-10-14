@@ -1,23 +1,92 @@
 <script setup>
 // Shotbox (SPECIFICATION.md §8.1): one button per clip and playlist. A click cues (yellow), the
-// next plays (green, with progress), the next pauses; an ended shot turns grey.
+// next plays (green, with progress), the next pauses; an ended shot turns grey. Every channel's
+// countdowns (to the clip's OUT and to the playlist's end), a filter (all, clips, playlists), and
+// playlists with their clips' thumbnails stacked.
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import ChannelPicker from "./ChannelPicker.vue";
 import LivePicture from "./LivePicture.vue";
 import Segmented from "./Segmented.vue";
 import { api, fmtBytes, fmtNs, fmtSpeed, playNs, serial, SPEED_PRESETS } from "../api.js";
-import { act, active, cameraLabel, cameras, channels, channelState, refreshStatus, setSpeed, state, transport } from "../store.js";
+import { act, active, cameraLabel, cameras, channels, channelState, clipsById, refreshStatus, setSpeed, state, transport } from "../store.js";
 import { keyLabel, keymap } from "../keys.js";
 
 const CELL_MIN_WIDTH = 230;
 const CELL_HEIGHT = 196;
 const GAP = 11; // .7rem
 
+// The filter is kept in the browser.
+const FILTERS = [
+  { value: "all", label: "All" },
+  { value: "clip", label: "Clips" },
+  { value: "playlist", label: "Playlists" },
+];
+function storedFilter() {
+  try {
+    const v = localStorage.getItem("mxl-replay.shotbox-filter");
+    return FILTERS.some((f) => f.value === v) ? v : "all";
+  } catch {
+    return "all";
+  }
+}
+const filter = ref(storedFilter());
+watch(filter, (v) => {
+  try {
+    localStorage.setItem("mxl-replay.shotbox-filter", v);
+  } catch {
+    /* only for this tab */
+  }
+  bank.value = 0;
+  selected.value = -1;
+});
+
+/** Up to three of a playlist's clips (first entries, each clip once) for its stacked thumbnails. */
+function stackOf(p) {
+  const seen = new Set();
+  const out = [];
+  for (const id of p.clip_ids || []) {
+    const c = clipsById.value[id];
+    if (c && !seen.has(id)) {
+      seen.add(id);
+      out.push(c);
+      if (out.length === 3) break;
+    }
+  }
+  return out;
+}
+
 const items = computed(() => {
   const clips = state.clips.map((c) => ({ kind: "clip", id: c.id, name: c.name, colour: c.colour, speed: c.speed, ns: playNs(c), sub: cameraLabel(c.camera), clip: c }));
-  const lists = state.playlists.map((p) => ({ kind: "playlist", id: p.id, name: p.name, colour: "#94a3b8", speed: null, ns: p.duration_ns, sub: `${p.entries} clips` }));
-  return [...clips, ...lists].sort((a, b) => serial(a.id) - serial(b.id));
+  const lists = state.playlists.map((p) => ({
+    kind: "playlist",
+    id: p.id,
+    name: p.name,
+    colour: "#94a3b8",
+    speed: null,
+    ns: p.duration_ns,
+    sub: `${p.entries} clips`,
+    loop: p.loop,
+    stack: stackOf(p),
+  }));
+  const all = [...clips, ...lists].sort((a, b) => serial(a.id) - serial(b.id));
+  return filter.value === "all" ? all : all.filter((i) => i.kind === filter.value);
 });
+
+/** Countdowns of a channel (null: nothing to count, or a speed that never gets there). */
+function countdowns(c) {
+  const clip = clipsById.value[c.clip];
+  const list = state.playlists.find((p) => p.id === c.playlist);
+  return {
+    clipName: c.live ? "" : clip?.name || c.clip || "",
+    listName: c.live ? "" : list?.name || c.playlist || "",
+    clip: c.clip_remaining_ns,
+    list: c.playlist_remaining_ns,
+    loop: c.idle || c.playlist_loop,
+  };
+}
+const idleName = (c) => (c.idle_playlist ? state.playlists.find((p) => p.id === c.idle_playlist)?.name || c.idle_playlist : "");
+const idleOn = (item) => channels.value.filter((c) => c.idle_playlist === item.id);
+const soon = (ns, c) => ns != null && c.playing && ns < 5e9;
 
 // Bank size from the space the grid has (§8.1: the grid adapts to the screen).
 const area = ref(null);
@@ -110,13 +179,44 @@ onUnmounted(() => observer?.disconnect());
           <span class="caption">Speed</span>
           <Segmented :options="speedOptions" :model-value="currentPreset" label="Speed preset" @update:model-value="setSpeed" />
         </div>
+        <div class="group">
+          <span class="caption">Show</span>
+          <Segmented v-model="filter" :options="FILTERS" label="Show" />
+        </div>
         <div v-if="banks > 1" class="group">
           <span class="caption">Bank</span>
           <Segmented v-model="bank" :options="bankOptions" label="Bank" />
         </div>
       </div>
     </div>
+    <div class="countdowns" aria-label="Countdowns">
+      <div v-for="c in channels" :key="c.index" class="countdown" :class="{ selected: c.index === state.channel }">
+        <div class="cd-head">
+          <strong>{{ c.label }}</strong>
+          <span class="state-tag" :class="channelState(c)">{{ channelState(c).toUpperCase() }}</span>
+          <span v-if="c.idle" class="state-tag idle" title="the channel plays its idle playlist">IDLE</span>
+        </div>
+        <div class="cd-row" :class="{ soon: soon(countdowns(c).clip, c) }">
+          <span class="cd-label" :title="countdowns(c).clipName">Clip<template v-if="countdowns(c).clipName"> · {{ countdowns(c).clipName }}</template></span>
+          <span class="cd-time num">{{ countdowns(c).clip == null ? "–" : `−${fmtNs(countdowns(c).clip)}` }}</span>
+        </div>
+        <div class="cd-row" :class="{ soon: soon(countdowns(c).list, c) }">
+          <span class="cd-label" :title="countdowns(c).listName">
+            Playlist<template v-if="countdowns(c).listName"> · {{ countdowns(c).listName }}</template><template v-if="countdowns(c).loop && countdowns(c).listName"> ↻</template>
+          </span>
+          <span class="cd-time num">{{ countdowns(c).list == null ? "–" : `−${fmtNs(countdowns(c).list)}` }}</span>
+        </div>
+        <div class="cd-idle muted small">Idle: {{ idleName(c) || "none" }}</div>
+      </div>
+    </div>
     <span class="spacer"></span>
+    <button
+      class="btn secondary backlive"
+      :title="active?.idle_playlist ? 'Stop: the idle playlist plays' : 'Stop: the shot ends where it stands (no idle playlist; Settings)'"
+      @click="transport('stop')"
+    >
+      Stop
+    </button>
     <button class="btn live backlive" @click="transport('live')">Back to live</button>
   </div>
 
@@ -136,6 +236,19 @@ onUnmounted(() => observer?.disconnect());
       >
         <div class="thumb">
           <img v-if="item.kind === 'clip'" :src="`/api/v1/clips/${encodeURIComponent(item.id)}/thumbnail.jpg?in=${item.clip.in_ns}`" alt="" loading="lazy" @error="$event.target.style.visibility = 'hidden'" />
+          <div v-else-if="item.stack.length" class="stack" :class="`n${item.stack.length}`">
+            <img
+              v-for="(c, k) in [...item.stack].reverse()"
+              :key="c.id"
+              :class="`s${item.stack.length - 1 - k}`"
+              :src="`/api/v1/clips/${encodeURIComponent(c.id)}/thumbnail.jpg?in=${c.in_ns}`"
+              :style="{ borderColor: c.colour }"
+              alt=""
+              loading="lazy"
+              @error="$event.target.style.visibility = 'hidden'"
+            />
+            <span class="stack-tag">PLAYLIST{{ item.loop ? " ↻" : "" }}</span>
+          </div>
           <div v-else class="playlist-mark">PLAYLIST</div>
           <span class="key">{{ i < 10 ? (i + 1) % 10 : "" }}</span>
           <span v-if="STATE_TEXT[shotState(item)]" class="badge-state state-tag" :class="shotState(item)">{{ STATE_TEXT[shotState(item)] }}</span>
@@ -148,6 +261,7 @@ onUnmounted(() => observer?.disconnect());
             <span>{{ item.sub }}</span>
             <span v-if="item.speed != null" class="speed">{{ fmtSpeed(item.speed) }}</span>
             <span v-if="item.kind === 'playlist' && active?.playlist === item.id">entry {{ active.playlist_index + 1 }}</span>
+            <span v-for="c in item.kind === 'playlist' ? idleOn(item) : []" :key="c.index" class="speed" title="idle playlist of this channel">idle {{ c.label }}</span>
           </div>
         </div>
         <span class="stripe" :style="{ background: item.colour }"></span>

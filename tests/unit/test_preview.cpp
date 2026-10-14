@@ -327,7 +327,7 @@ TEST_CASE("widgets: the list with CORS for listed origins, the pages with CSP fr
     auto const& transport = widgets.items[0];
     CHECK(transport.get("id")->text == "transport");
     CHECK(transport.get("min_size")->get("w")->text == "480");
-    CHECK(transport.get("min_size")->get("h")->text == "160");
+    CHECK(transport.get("min_size")->get("h")->text == "180");
     CHECK(transport.get("params")->get("properties")->get("channel")->get("maximum")->text == "2");
     CHECK(transport.get("params")->get("required")->items[0].text == "channel");
     auto const& clips = widgets.items[1];

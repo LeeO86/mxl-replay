@@ -21,6 +21,12 @@ async function setPlayOnTally(channel, enable) {
   await channelPost("play-on-tally", { enable }, channel);
   loadExport();
 }
+// The idle playlist (CH<n>_IDLE_PLAYLIST, kept in the state directory) plays at once, looped, and whenever the
+// channel stops or its clip or playlist ends.
+async function setIdlePlaylist(channel, playlist) {
+  await channelPost("idle-playlist", { playlist }, channel);
+  loadExport();
+}
 const tallyText = (c) => ["off", "red", "green", "amber"][c.tally] || "off";
 
 const exported = ref(null);
@@ -119,6 +125,11 @@ const ACTION_LABELS = { ...Object.fromEntries(ACTIONS.map((a) => [a.id, a.label]
             {{ c.lock ? "Following" : "Follow" }} {{ channels[0].label }} position
           </button>
         </template>
+        <span>Idle playlist</span>
+        <select :value="c.idle_playlist" aria-label="Idle playlist" @change="setIdlePlaylist(c.index, $event.target.value)">
+          <option value="">None</option>
+          <option v-for="p in state.playlists" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
         <span>Red light</span>
         <button
           class="btn secondary"

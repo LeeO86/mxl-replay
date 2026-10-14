@@ -316,6 +316,11 @@ void Engine::openBuffer()
         camera.ring.enforceRetention();
     }
     library_->enforceRetention();
+    // A channel with an idle playlist starts with it (SPECIFICATION.md §7).
+    for (int channel = 1; channel <= static_cast<int>(channels_.size()); ++channel)
+    {
+        startIdle(channel);
+    }
     bufferReady_ = true;
     auto const seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     logInfo("buffer_ready", {{"cameras", std::to_string(cameras_.size())}, {"seconds", std::to_string(seconds)}});
@@ -1099,6 +1104,25 @@ void Engine::finishClip(int channel)
     auto clip = catalog_.clip(runtime.clipId);
     // A playlist entry has its own end action and auto-advance.
     auto const list = runtime.playlistId.empty() ? Catalog::Playlist{} : findPlaylist(catalog_, runtime.playlistId);
+    // The idle playlist plays every entry on and starts again after the last (SPECIFICATION.md §7).
+    if (runtime.idle && !list.id.empty())
+    {
+        std::vector<bool> present;
+        for (auto const& item : list.entries)
+        {
+            present.push_back(!catalog_.clip(item.clipId).id.empty());
+        }
+        int const next = idleNext(present, runtime.playlistIndex);
+        if (next >= 0)
+        {
+            runtime.playlistIndex = next;
+            cueClip(channel, catalog_.clip(list.entries[static_cast<std::size_t>(next)].clipId), &list.entries[static_cast<std::size_t>(next)]);
+            runtime.idle = true;
+            runtime.scheduler.playing = true;
+            runtime.shot.state = ShotState::Playing;
+            return;
+        }
+    }
     PlaylistEntry const* entry = nullptr;
     if (runtime.playlistIndex >= 0 && runtime.playlistIndex < static_cast<int>(list.entries.size()))
     {
@@ -1107,6 +1131,22 @@ void Engine::finishClip(int channel)
     auto const action = entry != nullptr ? entry->end : clip.id.empty() ? runtime.shot.end : clip.end;
     runtime.shot.end = action;
     runtime.shot.finished();
+    // The clip or the playlist ends here: the idle playlist plays, else the end action (freeze or black) stays.
+    auto const ended = [&](bool black) {
+        if (startIdle(channel))
+        {
+            return;
+        }
+        runtime.scheduler.playing = false;
+        if (black)
+        {
+            runtime.black = true;
+        }
+        else
+        {
+            runtime.scheduler.positionNs = static_cast<std::int64_t>(runtime.outNs);
+        }
+    };
     if (action == EndAction::Loop)
     {
         runtime.scheduler.positionNs = static_cast<std::int64_t>(runtime.inNs);
@@ -1115,8 +1155,7 @@ void Engine::finishClip(int channel)
     }
     else if (action == EndAction::Black)
     {
-        runtime.scheduler.playing = false;
-        runtime.black = true;
+        ended(true);
     }
     else if (action == EndAction::ReturnToLive)
     {
@@ -1124,7 +1163,8 @@ void Engine::finishClip(int channel)
     }
     else if (action == EndAction::Next && entry != nullptr)
     {
-        // The next entry whose clip still exists; auto-advance plays it, otherwise it is cued.
+        // The next entry whose clip still exists; auto-advance plays it, otherwise it is cued. A looped
+        // playlist starts again at its first.
         bool const autoAdvance = entry->autoAdvance;
         int next = playlistNext(list.entries, runtime.playlistIndex);
         ClipRef nextClip;
@@ -1132,10 +1172,13 @@ void Engine::finishClip(int channel)
         {
             next = playlistNext(list.entries, next);
         }
+        if (next < 0 && list.loop)
+        {
+            next = firstPlayable(catalog_, list, nextClip);
+        }
         if (next < 0)
         {
-            runtime.scheduler.playing = false;
-            runtime.scheduler.positionNs = static_cast<std::int64_t>(runtime.outNs);
+            ended(false);
         }
         else
         {
@@ -1147,9 +1190,91 @@ void Engine::finishClip(int channel)
     }
     else
     {
-        runtime.scheduler.playing = false;
-        runtime.scheduler.positionNs = static_cast<std::int64_t>(runtime.outNs);
+        ended(false);
     }
+}
+
+bool Engine::startIdle(int channel)
+{
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    auto const& id = config_.channelList[static_cast<std::size_t>(channel - 1)].idlePlaylist;
+    if (id.empty())
+    {
+        return false;
+    }
+    auto const list = findPlaylist(catalog_, id);
+    ClipRef clip;
+    int const first = firstPlayable(catalog_, list, clip);
+    if (first < 0)
+    {
+        return false;
+    }
+    runtime.playlistId = list.id;
+    runtime.playlistIndex = first;
+    cueClip(channel, clip, &list.entries[static_cast<std::size_t>(first)]);
+    runtime.idle = true;
+    runtime.scheduler.playing = true;
+    runtime.shot.clipId = list.id;
+    runtime.shot.state = ShotState::Playing;
+    logInfo("idle_playlist", {{"channel", std::to_string(channel)}, {"playlist", list.id}});
+    return true;
+}
+
+void Engine::stop(int channel)
+{
+    std::lock_guard lock{mutex_};
+    if (channel < 1 || channel > static_cast<int>(channels_.size()))
+    {
+        return;
+    }
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    if (runtime.idle)
+    {
+        // The idle playlist is what a stopped channel plays: a paused one plays on.
+        runtime.black = false;
+        runtime.scheduler.playing = true;
+        runtime.shot.state = ShotState::Playing;
+        return;
+    }
+    if (startIdle(channel) || runtime.liveMode)
+    {
+        return;
+    }
+    runtime.scheduler.playing = false;
+    runtime.shot.state = ShotState::Ended;
+}
+
+bool Engine::setIdlePlaylist(int channel, std::string const& id, std::string& error)
+{
+    std::lock_guard lock{mutex_};
+    if (channel < 1 || channel > static_cast<int>(channels_.size()))
+    {
+        error = "unknown channel";
+        return false;
+    }
+    if (!id.empty() && findPlaylist(catalog_, id).id.empty())
+    {
+        error = "unknown playlist";
+        return false;
+    }
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    config_.channelList[static_cast<std::size_t>(channel - 1)].idlePlaylist = id;
+    auto const key = "CH" + std::to_string(channel) + "_IDLE_PLAYLIST";
+    if (id.empty())
+    {
+        settings_.erase(key);
+        // The playlist plays on as an ordinary one.
+        runtime.idle = false;
+    }
+    else
+    {
+        settings_[key] = id;
+        if (!(runtime.idle && runtime.playlistId == id))
+        {
+            startIdle(channel);
+        }
+    }
+    return saveSettings(error);
 }
 
 void Engine::play(int channel)
@@ -1195,6 +1320,7 @@ void Engine::goLive(ChannelRuntime& runtime)
 {
     runtime.liveMode = true;
     runtime.black = false;
+    runtime.idle = false;
     runtime.scheduler.playing = false;
     if (runtime.scheduler.camera == kLibraryCamera)
     {
@@ -1634,6 +1760,7 @@ void Engine::cueClip(int channel, ClipRef const& clip, PlaylistEntry const* entr
     auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
     runtime.liveMode = false;
     runtime.black = false;
+    runtime.idle = false;
     runtime.clipId = clip.id;
     runtime.hasIn = true;
     runtime.hasOut = true;
@@ -1715,13 +1842,14 @@ ShotState Engine::shotClick(int channel, std::string const& id)
     return runtime.shot.state;
 }
 
-std::string Engine::createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries)
+std::string Engine::createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries, bool loop)
 {
     std::lock_guard lock{mutex_};
     Catalog::Playlist playlist;
     playlist.id = "playlist-" + std::to_string(clipSerial_++);
     playlist.name = name.empty() ? playlist.id : name;
     playlist.entries = entries;
+    playlist.loop = loop;
     catalog_.upsertPlaylist(playlist);
     return playlist.id;
 }
@@ -1774,6 +1902,27 @@ bool Engine::deletePlaylist(std::string const& id)
         return false;
     }
     catalog_.deletePlaylist(id);
+    // A channel whose idle playlist it was has none any more.
+    bool changed = false;
+    for (std::size_t i = 0; i < channels_.size(); ++i)
+    {
+        auto& cfg = config_.channelList[i];
+        if (cfg.idlePlaylist == id)
+        {
+            cfg.idlePlaylist.clear();
+            settings_.erase("CH" + std::to_string(i + 1) + "_IDLE_PLAYLIST");
+            changed = true;
+        }
+        if (channels_[i].playlistId == id)
+        {
+            channels_[i].idle = false;
+        }
+    }
+    std::string problem;
+    if (changed && !saveSettings(problem))
+    {
+        logWarn("settings_not_saved", {{"error", problem}});
+    }
     return true;
 }
 
@@ -2096,7 +2245,8 @@ std::string Engine::exportConfigJson() const
             out << ',';
         }
         first = false;
-        out << "{\"id\":\"" << jsonEscape(playlist.id) << "\",\"name\":\"" << jsonEscape(playlist.name) << "\",\"entries\":[";
+        out << "{\"id\":\"" << jsonEscape(playlist.id) << "\",\"name\":\"" << jsonEscape(playlist.name) << "\",\"loop\":" << (playlist.loop ? "true" : "false")
+            << ",\"entries\":[";
         bool entryFirst = true;
         for (auto const& entry : playlist.entries)
         {
@@ -2179,6 +2329,7 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
                 config_.channelList[i].idle = loaded.config.channelList[i].idle;
                 config_.channelList[i].timecode = loaded.config.channelList[i].timecode;
                 config_.channelList[i].playOnTally = loaded.config.channelList[i].playOnTally;
+                config_.channelList[i].idlePlaylist = loaded.config.channelList[i].idlePlaylist;
             }
         }
         config_.tslScreen = loaded.config.tslScreen;
@@ -2245,6 +2396,8 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             {
                 continue;
             }
+            auto const* loop = item.get("loop");
+            playlist.loop = loop != nullptr && jsonBool(*loop).value_or(false);
             auto const* entries = item.get("entries");
             for (auto const& entryItem : entries != nullptr ? entries->items : std::vector<Json>{})
             {
@@ -2567,7 +2720,38 @@ std::string Engine::statusJson() const
             << ",\"playlist_index\":" << channel.playlistIndex << ",\"play_on_tally\":" << (cfg.playOnTally ? "true" : "false")
             << ",\"tsl_lh\":" << channel.tslLh << ",\"tsl_rh\":" << channel.tslRh << ",\"tsl_text_tally\":" << channel.tslText
             << ",\"tally\":" << effectiveTally(channel.tslLh, channel.tslRh, channel.tslText) << ",\"tally_play_ns\":" << channel.tallyPlayNs
-            << '}';
+            << ",\"idle_playlist\":" << jsonString(cfg.idlePlaylist) << ",\"idle\":" << (channel.idle ? "true" : "false");
+        // Shotbox countdowns (SPECIFICATION.md §8.1): playing time to OUT and to the playlist's end at the speed set; null
+        // without a clip, or when the speed never gets there.
+        std::int64_t clipLeft = -1;
+        std::int64_t listLeft = -1;
+        bool const onClip = !channel.liveMode && !channel.clipId.empty() && channel.hasOut;
+        if (onClip)
+        {
+            clipLeft = channel.shot.state == ShotState::Ended || channel.black ? 0
+                                                                                 : remainingNs(channel.scheduler.positionNs, channel.outNs, channel.scheduler.targetSpeed);
+        }
+        auto const list = onClip && !channel.playlistId.empty() ? findPlaylist(catalog_, channel.playlistId) : Catalog::Playlist{};
+        if (!list.id.empty())
+        {
+            auto entries = list.entries;
+            std::vector<std::int64_t> lengths;
+            for (auto& entry : entries)
+            {
+                // The idle playlist plays every entry on.
+                if (channel.idle)
+                {
+                    entry.end = EndAction::Next;
+                }
+                auto const clip = catalog_.clip(entry.clipId);
+                lengths.push_back(clip.id.empty() ? -1 : remainingNs(static_cast<std::int64_t>(clip.inNs), clip.outNs, entry.speed));
+            }
+            // An ended shot (stopped, or the playlist's last clip at its end) has nothing left.
+            listLeft = clipLeft == 0 && channel.shot.state == ShotState::Ended ? 0 : playlistRemainingNs(entries, lengths, channel.playlistIndex, clipLeft);
+        }
+        auto const nsOrNull = [](std::int64_t ns) { return ns < 0 ? std::string("null") : std::to_string(ns); };
+        out << ",\"clip_remaining_ns\":" << nsOrNull(clipLeft) << ",\"playlist_remaining_ns\":" << nsOrNull(listLeft)
+            << ",\"playlist_loop\":" << (list.loop ? "true" : "false") << '}';
     }
     out << "],\"preview\":" << previewStatusJson(config_, previewStatus_ ? previewStatus_() : PreviewStatus{}) << '}';
     return out.str();

@@ -30,6 +30,8 @@ public:
         std::string id;
         std::string name;
         std::vector<PlaylistEntry> entries;
+        // After its last entry the playlist starts again at its first (SPECIFICATION.md §7).
+        bool loop = false;
     };
     void upsertPlaylist(Playlist const& playlist);
     void deletePlaylist(std::string const& id);

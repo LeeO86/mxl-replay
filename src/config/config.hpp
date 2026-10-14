@@ -76,6 +76,8 @@ struct ChannelConfig
     bool lockToFirst = false;
     // A rising red tally (TSL) plays the channel's Cued or Paused shot (CH<n>_PLAY_ON_TALLY).
     bool playOnTally = true;
+    // The playlist the channel loops when nothing else plays (CH<n>_IDLE_PLAYLIST; empty: none).
+    std::string idlePlaylist;
 };
 
 struct Config
