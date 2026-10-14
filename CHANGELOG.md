@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Slow motion on the GPU: the two JPEG frames of an interpolated or blended grain (and of an optical flow) are decoded with one nvJPEG state, and the second decode could refill its staging buffers while the first one's copies were still queued, so parts of frame B could show in frame A. Between consecutive frames of one camera this is hardly visible (they look alike), but it is wrong. The decoder now waits for A before it decodes B, only when both are decoded in the same call (the start of a play, a jump, an angle change). Found while testing playlist mixes, where two different cameras made it obvious.
+
 ## 1.5.0
 
 - Audio: a channel that stands still is silent. Paused, cued, at a clip's end (*freeze*, the default, or *black*) or at speed 0, the replay sent the samples of the frame it stood on every grain, a buzz; in every audio mode (`mute` only acted below 99.9 % speed, and a pause keeps the last speed). Now the audio fades out over two frames to silence (over the audio that follows the last grain, so the fade starts without a splice) and fades in over two frames when the channel plays again or goes live. Live is unchanged.
