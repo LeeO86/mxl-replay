@@ -4,7 +4,9 @@
 #include "media/mosaic.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace replay
 {
@@ -61,6 +63,30 @@ struct PreviewStatus
 [[nodiscard]] std::string previewStatusJson(Config const& cfg, PreviewStatus const& status);
 // GET /api/v1/preview/map: the mode, the canvas, where the page plays it, and every tile.
 [[nodiscard]] std::string previewMapJson(Config const& cfg);
+// One query parameter of a widget (SPECIFICATION.md §8.7): `channel` (1..REPLAY_CHANNELS), a `boolean`
+// (true, false, 1 or 0) or a `playlist` id.
+struct WidgetParam
+{
+    std::string name;
+    std::string kind; // "channel", "boolean" or "playlist"
+    std::string title;
+    bool required = false;
+    bool defaultTrue = false; // a boolean's default
+};
+// The one list of widgets that GET /widgets answers and GET /widget/<id> accepts.
+struct WidgetSpec
+{
+    std::string id;
+    std::string title;
+    int minW = 0;
+    int minH = 0;
+    std::vector<WidgetParam> params;
+};
+[[nodiscard]] std::vector<WidgetSpec> const& widgetSpecs();
+// Null for an unknown widget.
+[[nodiscard]] WidgetSpec const* findWidget(std::string const& id);
+// The query of /widget/<id> (`value` gives a parameter's decoded value, empty when absent): an error, or empty when valid.
+[[nodiscard]] std::string widgetQueryError(Config const& cfg, WidgetSpec const& widget, std::function<std::string(std::string const&)> const& value);
 // GET /widgets: the operator-screen widgets and their query parameters (JSON schema).
 [[nodiscard]] std::string widgetsJson(Config const& cfg);
 // True when the WIDGET_FRAME_ANCESTORS source list names this Origin (or holds `*`).

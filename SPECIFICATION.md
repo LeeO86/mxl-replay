@@ -399,7 +399,8 @@ playlists, library, uploads, exports, config) and WebSocket `/api/v1/events`
 (positions, states, thumbnails at low rate, alarms) so several UIs stay in sync and
 other systems (e.g. a control surface or a vision mixer macro) can drive the replay.
 Clips are edited with `PATCH /api/v1/clips/{id}` and playlists read, replaced and
-deleted at `/api/v1/playlists/{id}`. Low-rate JPEG previews are served per channel,
+deleted at `/api/v1/playlists/{id}`; `POST /api/v1/playlists/{id}/play {"channel"}` plays one
+and `…/cue` cues its first clip, paused (a shotbox click on it then plays). Low-rate JPEG previews are served per channel,
 per camera and per clip (`…/preview.jpg`, `/api/v1/clips/{id}/thumbnail.jpg`; in the
 WebRTC mode of §8.6 only the clip thumbnails, and `/api/v1/preview/map`); the
 status carries the timecodes the UI shows (§5.5), formatted by the server.
@@ -460,13 +461,36 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
 - `GET /widgets` answers `[{id, title, params, min_size: {w, h}, version}]` (`params` a
   JSON schema of the query). It carries `Access-Control-Allow-Origin` for an `Origin`
   that `WIDGET_FRAME_ANCESTORS` lists (or `*`), and `Vary: Origin`; GET only.
-- `transport` (`channel`, required, 1..`REPLAY_CHANNELS`; `min_size` 480×180, 480×160
-  before 1.6.0): one channel's label, state and timecode, the countdowns (§8.1), Cue (to its
-  IN, paused), Play / Pause, Stop (§7), Live (E2E),
-  the speed fader 0–200 % and the presets.
+- One list of widgets serves both routes: `/widgets` answers it and `/widget/<id>` accepts
+  only its ids and checks the query against its `params`. A `channel` is an integer
+  1..`REPLAY_CHANNELS`, a boolean `true`, `false`, `1` or `0` (schema `"type":"boolean"` with
+  its `default`), a `playlist` a playlist id (`^[A-Za-z0-9._-]{1,64}$`; one that does not
+  exist is shown as such, it may be deleted later).
+- `transport` (`channel`, required; `clip`, default false; `presets`, default true;
+  `min_size` 480×180, 480×160 before 1.6.0): one channel's label, state and timecode, the
+  countdowns (§8.1), Cue (to its IN, paused), Play / Pause, Stop (§7), Live (E2E), the speed
+  fader 0–200 % and, with `presets`, the presets. With `clip`: IN, OUT, Go IN, Go OUT, the
+  marks and their length, and Create clip (IN to OUT on the channel's camera with the
+  automatic name; at the protection cap, 409, the operator confirms and it is sent with
+  `force`). Without the new params it looks as before.
 - `clip-list` (`channel`, optional; `min_size` 400×300): every clip, newest first, with its
   shotbox button on the channel (Load cues it; then Play, Pause). Without `channel` the
   widget has a channel picker.
+- `playlist-editor` (`playlist`, optional; `min_size` 480×320): one playlist's entries, each
+  with its clip, length, speed (1–200 %), end action, up, down and remove, and *Add a
+  clip* (newest first; a new entry ends with `next` and auto-advances). Every change is
+  saved at once (`PUT /api/v1/playlists/{id}` with the entries). Without `playlist` the
+  widget has a playlist picker. A channel on the playlist marks its entry.
+- `playlist-player` (`channel`, required; `playlist`, optional: a picker; `min_size`
+  420×200): the channel's label, state and timecode; the countdown to the playlist's end
+  (§8.1, red under 5 s while it plays), the entry playing; Cue (the first clip, paused:
+  `POST /api/v1/playlists/{id}/cue {"channel"}`), Play / Pause (on this playlist: play or
+  pause the channel; else `…/play`), Stop (§7) and Loop (the playlist's `loop`, saved at
+  once).
+- `timeline` (`channel`, required; `min_size` 600×180): the LSM tab's timeline (§8.2) for
+  the channel: its camera's buffer, the clips as marks, IN/OUT and the position; drag to
+  seek, the wheel ±1 frame (Shift ±1 s), the zoom; IN, OUT, Go IN, Go OUT, ±1 frame and
+  Play / Pause, with the marks' timecodes and length.
 - `GET /widget/<id>?<params>[&theme=dark|light|transparent]` is the embedded page with only
   that widget, no app chrome, on the replay's own API (same origin). An invalid parameter
   answers 400, an unknown widget 404. These routes carry `Content-Security-Policy:

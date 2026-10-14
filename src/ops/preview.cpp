@@ -139,17 +139,123 @@ std::string previewMapJson(Config const& cfg)
     return out.str();
 }
 
+std::vector<WidgetSpec> const& widgetSpecs()
+{
+    static std::vector<WidgetSpec> const specs{
+        {"transport",
+         "Replay transport",
+         480,
+         180,
+         {{"channel", "channel", "Channel", true, false},
+          {"clip", "boolean", "IN / OUT, Go IN / Go OUT and Create clip", false, false},
+          {"presets", "boolean", "Speed presets", false, true}}},
+        {"clip-list", "Replay clips", 400, 300, {{"channel", "channel", "Channel to load into (empty: a channel picker)", false, false}}},
+        {"playlist-editor", "Replay playlist editor", 480, 320, {{"playlist", "playlist", "Playlist (empty: a playlist picker)", false, false}}},
+        {"playlist-player",
+         "Replay playlist player",
+         420,
+         200,
+         {{"channel", "channel", "Channel", true, false}, {"playlist", "playlist", "Playlist (empty: a playlist picker)", false, false}}},
+        {"timeline", "Replay timeline", 600, 180, {{"channel", "channel", "Channel", true, false}}},
+    };
+    return specs;
+}
+
+WidgetSpec const* findWidget(std::string const& id)
+{
+    for (auto const& spec : widgetSpecs())
+    {
+        if (spec.id == id)
+        {
+            return &spec;
+        }
+    }
+    return nullptr;
+}
+
+std::string widgetQueryError(Config const& cfg, WidgetSpec const& widget, std::function<std::string(std::string const&)> const& value)
+{
+    for (auto const& param : widget.params)
+    {
+        auto const text = value(param.name);
+        if (text.empty())
+        {
+            if (param.required)
+            {
+                return param.kind == "channel" ? "channel must be a channel 1.." + std::to_string(cfg.channels) : param.name + " is required";
+            }
+            continue;
+        }
+        if (param.kind == "channel")
+        {
+            bool const valid = text.size() <= 2 && text.find_first_not_of("0123456789") == std::string::npos && std::stoi(text) >= 1 &&
+                               std::stoi(text) <= cfg.channels;
+            if (!valid)
+            {
+                return "channel must be a channel 1.." + std::to_string(cfg.channels);
+            }
+        }
+        else if (param.kind == "boolean")
+        {
+            if (text != "true" && text != "false" && text != "1" && text != "0")
+            {
+                return param.name + " must be true or false";
+            }
+        }
+        else if (param.kind == "playlist")
+        {
+            if (text.size() > 64 || text.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") != std::string::npos)
+            {
+                return "playlist must be a playlist id";
+            }
+        }
+    }
+    auto const theme = value("theme");
+    if (!theme.empty() && theme != "dark" && theme != "light" && theme != "transparent")
+    {
+        return "theme must be dark, light or transparent";
+    }
+    return {};
+}
+
 std::string widgetsJson(Config const& cfg)
 {
-    auto const channel = [&](bool required) {
-        return std::string(R"("params":{"type":"object","properties":{"channel":{"type":"integer","minimum":1,"maximum":)") + std::to_string(cfg.channels) +
-               R"(,"title":")" + (required ? "Channel" : "Channel to load into (empty: a channel picker)") + R"("}})" +
-               (required ? R"(,"required":["channel"]})" : "}");
-    };
     std::ostringstream out;
-    out << R"([{"id":"transport","title":"Replay transport",)" << channel(true) << R"(,"min_size":{"w":480,"h":180},"version":)" << quote(REPLAY_VERSION)
-        << R"(},{"id":"clip-list","title":"Replay clips",)" << channel(false) << R"(,"min_size":{"w":400,"h":300},"version":)" << quote(REPLAY_VERSION)
-        << "}]";
+    out << "[";
+    for (auto const& spec : widgetSpecs())
+    {
+        out << (&spec == &widgetSpecs().front() ? "" : ",") << R"({"id":)" << quote(spec.id) << R"(,"title":)" << quote(spec.title)
+            << R"(,"params":{"type":"object","properties":{)";
+        std::string required;
+        for (auto const& param : spec.params)
+        {
+            out << (&param == &spec.params.front() ? "" : ",") << quote(param.name) << ":{";
+            if (param.kind == "channel")
+            {
+                out << R"("type":"integer","minimum":1,"maximum":)" << cfg.channels;
+            }
+            else if (param.kind == "boolean")
+            {
+                out << R"("type":"boolean","default":)" << (param.defaultTrue ? "true" : "false");
+            }
+            else
+            {
+                out << R"("type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$")";
+            }
+            out << R"(,"title":)" << quote(param.title) << "}";
+            if (param.required)
+            {
+                required += (required.empty() ? "" : ",") + quote(param.name);
+            }
+        }
+        out << "}";
+        if (!required.empty())
+        {
+            out << R"(,"required":[)" << required << "]";
+        }
+        out << R"(},"min_size":{"w":)" << spec.minW << R"(,"h":)" << spec.minH << R"(},"version":)" << quote(REPLAY_VERSION) << "}";
+    }
+    out << "]";
     return out.str();
 }
 

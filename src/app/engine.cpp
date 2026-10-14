@@ -1969,7 +1969,7 @@ Catalog::Playlist Engine::playlist(std::string const& id) const
     return findPlaylist(catalog_, id);
 }
 
-void Engine::playPlaylist(int channel, std::string const& id)
+void Engine::playPlaylist(int channel, std::string const& id, bool play)
 {
     std::lock_guard lock{mutex_};
     if (channel < 1 || channel > static_cast<int>(channels_.size()))
@@ -1987,9 +1987,9 @@ void Engine::playPlaylist(int channel, std::string const& id)
     runtime.playlistId = id;
     runtime.playlistIndex = first;
     cueClip(channel, clip, &list.entries[static_cast<std::size_t>(first)]);
-    runtime.scheduler.playing = true;
+    runtime.scheduler.playing = play;
     runtime.shot.clipId = id;
-    runtime.shot.state = ShotState::Playing;
+    runtime.shot.state = play ? ShotState::Playing : ShotState::Cued;
 }
 
 std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::string const& name, std::string& error)
