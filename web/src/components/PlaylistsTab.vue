@@ -128,8 +128,8 @@ async function play(id) {
       </h3>
       <label for="pl-name">Name</label>
       <input id="pl-name" v-model="draft.name" maxlength="120" />
-      <label class="row" style="gap: 0.4rem; margin-top: 0.5rem; align-items: center">
-        <input v-model="draft.loop" type="checkbox" style="width: auto" /> Loop: after the last clip, start again at the first
+      <label style="display: flex; gap: 0.5rem; align-items: center; justify-content: flex-start; margin-top: 0.6rem; text-transform: none; letter-spacing: 0; font-size: 0.9rem">
+        <input v-model="draft.loop" type="checkbox" style="width: auto; flex: none; margin: 0" /> <span>Loop: after the last clip, start again at the first</span>
       </label>
       <table style="margin-top: 0.8rem">
         <thead>
