@@ -1128,7 +1128,23 @@ void Engine::finishClip(int channel)
     {
         entry = &list.entries[static_cast<std::size_t>(runtime.playlistIndex)];
     }
-    auto const action = entry != nullptr ? entry->end : clip.id.empty() ? runtime.shot.end : clip.end;
+    auto action = entry != nullptr ? entry->end : clip.id.empty() ? runtime.shot.end : clip.end;
+    // A looped playlist plays over and over: its last playable entry's freeze or black wraps to the
+    // first entry and plays on. An entry's own loop and return-to-live still win (SPECIFICATION §7).
+    bool wraps = false;
+    if (entry != nullptr && list.loop && (action == EndAction::Freeze || action == EndAction::Black))
+    {
+        int later = playlistNext(list.entries, runtime.playlistIndex);
+        while (later >= 0 && catalog_.clip(list.entries[static_cast<std::size_t>(later)].clipId).id.empty())
+        {
+            later = playlistNext(list.entries, later);
+        }
+        if (later < 0)
+        {
+            action = EndAction::Next;
+            wraps = true;
+        }
+    }
     runtime.shot.end = action;
     runtime.shot.finished();
     // The clip or the playlist ends here: the idle playlist plays, else the end action (freeze or black) stays.
@@ -1165,7 +1181,7 @@ void Engine::finishClip(int channel)
     {
         // The next entry whose clip still exists; auto-advance plays it, otherwise it is cued. A looped
         // playlist starts again at its first.
-        bool const autoAdvance = entry->autoAdvance;
+        bool const autoAdvance = entry->autoAdvance || wraps;
         int next = playlistNext(list.entries, runtime.playlistIndex);
         ClipRef nextClip;
         while (next >= 0 && (nextClip = catalog_.clip(list.entries[static_cast<std::size_t>(next)].clipId)).id.empty())

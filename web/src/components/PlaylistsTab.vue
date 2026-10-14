@@ -159,6 +159,7 @@ async function play(id) {
               <select v-model="e.end" :aria-label="`End action of entry ${i + 1}`">
                 <option v-for="a in END_ACTIONS" :key="a.value" :value="a.value">{{ a.label }}</option>
               </select>
+              <div v-if="draft.loop && i === draft.entries.length - 1 && (e.end === 'freeze' || e.end === 'black')" class="muted small">↻ Loop: wraps to the first clip</div>
             </td>
             <td><input v-model="e.auto_advance" type="checkbox" :aria-label="`Auto-advance after entry ${i + 1}`" /></td>
             <td class="actions-cell">
@@ -179,6 +180,7 @@ async function play(id) {
       </div>
       <div class="note">
         Total {{ fmtNs(draftLength) }}. At the end: <em>Next</em> goes to the next clip; with auto-advance it plays at once, otherwise it waits cued.
+        With <em>Loop</em> on, the last clip's <em>Freeze</em> or <em>Black</em> wraps to the first clip; its own <em>Loop</em> or <em>Return to live</em> still apply.
         As a channel's idle playlist (Settings) every clip plays on and the playlist loops.
       </div>
       <div v-if="!entriesOk" class="msg err">Each speed is 1 to 200 %.</div>
