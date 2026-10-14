@@ -1,9 +1,10 @@
 <script setup>
-// The transport widget (SPECIFICATION.md §8.7): one channel's state and timecode, Cue (back to its IN,
-// paused), Play / Pause, Live (E2E), and its speed (fader 0–200 % and the presets).
+// The transport widget (SPECIFICATION.md §8.7): one channel's state and timecode, the countdowns to the clip's
+// OUT and the playlist's end, Cue (back to its IN, paused), Play / Pause, Stop (the idle playlist), Live (E2E),
+// and its speed (fader 0–200 % and the presets).
 import { computed, onUnmounted, ref } from "vue";
 import Segmented from "./Segmented.vue";
-import { fmtSpeed, SPEED_PRESETS } from "../api.js";
+import { fmtNs, fmtSpeed, SPEED_PRESETS } from "../api.js";
 import { channels, channelState, marks, setSpeed, transport } from "../store.js";
 
 const props = defineProps({ channel: { type: Number, required: true } });
@@ -44,9 +45,15 @@ const preset = computed(() => SPEED_PRESETS.find((s) => Math.abs(s - Math.abs(ta
       <span class="tc">{{ ch.timecode || "--:--:--:--" }}</span>
       <span class="num">{{ fmtSpeed(ch.speed) }}</span>
     </div>
-    <div class="btn-grid three">
+    <div class="widget-cd muted small">
+      <span>Clip <span class="num">{{ ch.clip_remaining_ns == null ? "–" : `−${fmtNs(ch.clip_remaining_ns)}` }}</span></span>
+      <span>Playlist <span class="num">{{ ch.playlist_remaining_ns == null ? "–" : `−${fmtNs(ch.playlist_remaining_ns)}` }}</span></span>
+      <span v-if="ch.idle">idle</span>
+    </div>
+    <div class="btn-grid four">
       <button class="btn secondary" :disabled="!ch.has_in" title="Back to IN, paused" @click="marks('goto-in', ch.index)">Cue</button>
       <button class="btn" :aria-pressed="ch.playing" @click="transport(ch.playing ? 'pause' : 'play', ch.index)">{{ ch.playing ? "Pause" : "Play" }}</button>
+      <button class="btn secondary" :title="ch.idle_playlist ? 'Stop: the idle playlist plays' : 'Stop: the shot ends where it stands'" @click="transport('stop', ch.index)">Stop</button>
       <button class="btn live" :aria-pressed="ch.live" title="Back to live (E2E)" @click="transport('live', ch.index)">Live</button>
     </div>
     <div class="speedrow">

@@ -96,6 +96,12 @@ public:
     void play(int channel);
     void pause(int channel);
     void live(int channel);
+    // Stop (SPECIFICATION.md §7): the channel's idle playlist plays (a paused one resumes); without one the shot
+    // ends where it stands (Ended, paused). A live channel without an idle playlist stays live.
+    void stop(int channel);
+    // CH<n>_IDLE_PLAYLIST, kept in the state directory's config.json; empty: none. A playlist set plays at once,
+    // looped, on an ended channel; a busy one plays it at its next clip end, stop or playlist end. False with `error` "unknown playlist" or when it cannot be written.
+    bool setIdlePlaylist(int channel, std::string const& id, std::string& error);
     void setSpeed(int channel, double speed);
     void scrubFrames(int channel, int frames);
     void scrubSeconds(int channel, double seconds);
@@ -133,7 +139,7 @@ public:
     ShotState shotClick(int channel, std::string const& id);
     void playClip(int channel, std::string const& clipId);
 
-    std::string createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries);
+    std::string createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries, bool loop = false);
     // False when the id is unknown. A channel playing the playlist stays on its entry.
     bool updatePlaylist(Catalog::Playlist const& playlist);
     bool deletePlaylist(std::string const& id);
@@ -234,6 +240,8 @@ private:
         int tslRh = 0;
         int tslText = 0;
         std::uint64_t tallyPlayNs = 0;
+        // The channel plays its idle playlist (looped, every entry plays on).
+        bool idle = false;
     };
 
     // Encode into `pending`; pushFrames() writes them after the engine lock is released.
@@ -250,6 +258,8 @@ private:
     // whether a frame exists; false with found set means it is not in the house format.
     bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found) const;
     void finishClip(int channel);
+    // Plays the channel's idle playlist from its first entry (lock held). False when it has none or no clip of it exists.
+    bool startIdle(int channel);
     // Posts the pairs the channel's next grains interpolate to its flow worker. Lock held.
     void planFlows(int channel);
     // A pair's flow for the channel's worker: on the GPU when there is one (its GPU time is observed), else on the CPU.

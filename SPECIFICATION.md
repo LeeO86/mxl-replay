@@ -314,8 +314,28 @@ The flow step (1–5) is a module behind one interface:
   format and stored as JPEG frame sequence + PCM, so they behave exactly like buffer
   clips (any speed, interpolation, frame-accurate).
 - **Playlists**: ordered clips with per-entry speed, end action, auto-advance;
-  next clip preloaded; cut transitions in v1.
+  next clip preloaded; cut transitions in v1. A playlist can **loop** (1.6.0): after its
+  last entry it starts again at its first (`loop` in the API, the catalog and the config
+  export). With `loop` on, the last playable entry's `freeze` or `black` acts as `next`
+  (the list wraps and plays on); that entry's own `loop` (the clip repeats) and
+  `return-to-live` still apply.
 - End action per clip: `freeze` (default), `black`, `loop`, `next`, `return-to-live`.
+- **Idle playlist** (1.6.0): per channel `CH<n>_IDLE_PLAYLIST` (a playlist id; Settings;
+  `POST /api/v1/channels/{n}/idle-playlist {"playlist": id}`, `""` clears it; kept in the
+  state directory and the config export; deleting the playlist clears it). It plays, looped:
+  - when it is set on an idle channel: stopped, ended or black, or playing its idle playlist.
+    A live, scrubbed, playing, cued or paused channel keeps its shot; the idle playlist is armed and
+    starts at the next clip end, stop or playlist end. Also at start, once the buffer is indexed;
+  - when the channel is **stopped** (`stop`: `POST /api/v1/control {"action":"stop"}`,
+    transport command `stop`, *Stop* in the shotbox and the transport widget; a paused idle
+    playlist plays on). Without an idle playlist, `stop` ends the shot where it stands
+    (`ended`, paused); a live channel stays live;
+  - when a clip or a playlist ends: in place of `freeze` and `black`, and of the end of a
+    playlist (`next` after the last entry, not looped). `loop` and `return-to-live` keep
+    their behaviour; an entry without auto-advance still waits cued.
+  In the idle playlist every entry plays on (end actions and auto-advance are not used) and
+  it starts again after its last entry. A cue, a play, live or a pause take the channel as
+  before. Status per channel: `idle_playlist`, `idle` (it plays now); log `idle_playlist`.
 - Library search by name/tag/camera/time; thumbnails per clip.
 
 ---
@@ -331,9 +351,19 @@ The flow step (1–5) is a module behind one interface:
 - One click on a button **cues** the clip (button turns yellow), a second click
   **plays** (green, with progress bar); while playing, a click **pauses**. When it
   ends: grey with the end action applied. Option "play on first click".
-- Nothing else on this screen except: big **Back to live** button, speed preset
-  buttons, and a small status line (recording OK, storage, GPU).
+- Nothing else on this screen except: big **Back to live** and **Stop** buttons, speed preset
+  buttons, the countdowns, the filter, and a small status line (recording OK, storage, GPU).
 - Keyboard: number keys select buttons, Space play/pause, Enter cue/play.
+- **Countdowns** (1.6.0) for every channel: the playing time to the clip's OUT and to the
+  playlist's end at the speed set (status `clip_remaining_ns`, `playlist_remaining_ns`; null
+  when there is nothing to count or the speed never gets there: 0, or an entry that loops).
+  The playlist ends after the first entry that does not end with `next`, else after its last
+  (looped or idle: the end of this pass); the time an entry waits cued is not counted. The
+  countdown turns red under 5 s while the channel plays. Also in the transport widget.
+- **Filter** (1.6.0): all, clips, or playlists (kept in the browser).
+- A playlist's button stacks the thumbnails of its first three clips (1.6.0;
+  `GET /api/v1/playlists` gives each playlist's `clip_ids`).
+- **Stop** (1.6.0) next to *Back to live*: the idle playlist (§7).
 
 ### 8.2 LSM / edit screen
 
@@ -430,8 +460,9 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
 - `GET /widgets` answers `[{id, title, params, min_size: {w, h}, version}]` (`params` a
   JSON schema of the query). It carries `Access-Control-Allow-Origin` for an `Origin`
   that `WIDGET_FRAME_ANCESTORS` lists (or `*`), and `Vary: Origin`; GET only.
-- `transport` (`channel`, required, 1..`REPLAY_CHANNELS`; `min_size` 480×160): one
-  channel's label, state and timecode, Cue (to its IN, paused), Play / Pause, Live (E2E),
+- `transport` (`channel`, required, 1..`REPLAY_CHANNELS`; `min_size` 480×180, 480×160
+  before 1.6.0): one channel's label, state and timecode, the countdowns (§8.1), Cue (to its
+  IN, paused), Play / Pause, Stop (§7), Live (E2E),
   the speed fader 0–200 % and the presets.
 - `clip-list` (`channel`, optional; `min_size` 400×300): every clip, newest first, with its
   shotbox button on the channel (Load cues it; then Play, Pause). Without `channel` the
@@ -511,6 +542,7 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
 | `TSL_ENABLE` / `TSL_UDP_PORT` / `TSL_TCP_PORT` | false / 8914 / 8915 (§8.8) |
 | `TSL_SCREEN` / `TSL_MAP` | -1 / empty (display `i` is channel `i+1`) |
 | `CH<n>_PLAY_ON_TALLY` | true |
+| `CH<n>_IDLE_PLAYLIST` | empty (none; §7) |
 
 Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`
 (grains the source wrote that were not recorded; grains it never wrote, before it

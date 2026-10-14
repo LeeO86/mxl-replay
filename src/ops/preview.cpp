@@ -147,7 +147,7 @@ std::string widgetsJson(Config const& cfg)
                (required ? R"(,"required":["channel"]})" : "}");
     };
     std::ostringstream out;
-    out << R"([{"id":"transport","title":"Replay transport",)" << channel(true) << R"(,"min_size":{"w":480,"h":160},"version":)" << quote(REPLAY_VERSION)
+    out << R"([{"id":"transport","title":"Replay transport",)" << channel(true) << R"(,"min_size":{"w":480,"h":180},"version":)" << quote(REPLAY_VERSION)
         << R"(},{"id":"clip-list","title":"Replay clips",)" << channel(false) << R"(,"min_size":{"w":400,"h":300},"version":)" << quote(REPLAY_VERSION)
         << "}]";
     return out.str();
