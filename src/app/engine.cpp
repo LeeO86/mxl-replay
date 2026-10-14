@@ -1285,7 +1285,12 @@ bool Engine::setIdlePlaylist(int channel, std::string const& id, std::string& er
     else
     {
         settings_[key] = id;
-        if (!(runtime.idle && runtime.playlistId == id))
+        // It takes over only an idle channel: one that plays its idle playlist, or one stopped,
+        // ended or black. A live, playing, cued or paused channel arms it: it starts at the next
+        // clip end, stop or playlist end.
+        bool const idle = runtime.idle || (!runtime.liveMode && !runtime.scheduler.playing &&
+                                           (runtime.shot.state == ShotState::Ended || runtime.shot.state == ShotState::Idle));
+        if (idle && !(runtime.idle && runtime.playlistId == id))
         {
             startIdle(channel);
         }

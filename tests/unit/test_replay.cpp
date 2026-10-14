@@ -1536,7 +1536,7 @@ TEST_CASE("a playlist keeps deleted clips as skipped entries and a playing chann
     std::filesystem::remove_all(dir);
 }
 
-TEST_CASE("an idle playlist plays when set, at a clip's end and on stop, and loops; a looped playlist starts again")
+TEST_CASE("an idle playlist plays when set on an idle channel, at a clip's end and on stop, and loops; a looped playlist starts again")
 {
     auto const dir = freshDir("mxl-replay-idle");
     auto engine = recordedEngine(dir, 20);
@@ -1622,6 +1622,18 @@ TEST_CASE("an idle playlist plays when set, at a clip's end and on stop, and loo
     // Kept in the state directory and the export.
     CHECK(engine->exportConfigJson().find("\"CH1_IDLE_PLAYLIST\":\"" + idle + "\"") != std::string::npos);
 
+    // Set on a live channel it is armed: live stays, the end of the next clip starts it.
+    engine->live(1);
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"" + idle + "\"}").status == 200);
+    CHECK(has("\"idle\":false"));
+    CHECK(has("\"live\":true"));
+    engine->playClip(1, shot);
+    for (int i = 0; i < 6; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    CHECK(has("\"idle\":true"));
+
     // A looped playlist starts again at its first entry; its playlist countdown is the end of the pass.
     auto const looped = engine->createPlaylist("looped", {PlaylistEntry{idleA, 1, EndAction::Next, true}, PlaylistEntry{idleB, 1, EndAction::Next, true}});
     auto const body = call(*engine, "PUT", "/api/v1/playlists/" + looped, "{\"loop\":true}");
@@ -1646,7 +1658,12 @@ TEST_CASE("an idle playlist plays when set, at a clip's end and on stop, and loo
     CHECK(has("\"idle_playlist\":\"\""));
     CHECK(engine->exportConfigJson().find("CH1_IDLE_PLAYLIST") == std::string::npos);
     // Cleared with "": the channel keeps playing what it plays.
+    // Set on a playing channel it is armed: the channel plays on, a stop starts it.
     CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"" + looped + "\"}").status == 200);
+    CHECK(has("\"idle_playlist\":\"" + looped + "\""));
+    CHECK(has("\"idle\":false"));
+    CHECK(has("\"playing\":true"));
+    engine->stop(1);
     CHECK(has("\"idle\":true"));
     CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"\"}").status == 200);
     CHECK(has("\"idle\":false"));
