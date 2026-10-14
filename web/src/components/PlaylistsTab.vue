@@ -84,7 +84,7 @@ function add() {
   addClip.value = "";
 }
 // The clips at their speeds; a transition into an auto-advanced clip overlaps the two by its length (as the server).
-const overlapFrames = (e) => Math.max(e.transition === "mix" ? e.transition_frames : 0, e.audio_frames >= 0 ? e.audio_frames : e.transition === "mix" ? e.transition_frames : 0);
+const overlapFrames = (e) => Math.max(e.transition === "mix" ? e.transition_frames : 0, e.audio_frames >= 0 ? e.audio_frames : e.transition === "mix" ? e.transition_frames : 2);
 const draftLength = computed(() =>
   (draft.value?.entries || []).reduce((sum, e, i, list) => {
     const clip = clipsById.value[e.clip_id];
@@ -240,10 +240,10 @@ async function play(id) {
                 type="number"
                 min="0"
                 max="250"
-                :placeholder="e.transition === 'mix' ? `♪ ${e.transition_frames}` : '♪ 0'"
+                :placeholder="e.transition === 'mix' ? `♪ ${e.transition_frames}` : '♪ 2'"
                 :class="{ invalid: e.audio_frames !== -1 && !framesOk(e.audio_frames, 0) }"
                 :aria-label="`Audio crossfade frames of entry ${i + 1}`"
-                title="audio crossfade frames (empty: as the video)"
+                title="audio crossfade frames (empty: as the mix, 2 on a cut; 0: hard audio cut)"
                 @input="setAudioFrames(e, $event.target.value)"
               />
               <div v-if="i === 0 && e.transition === 'mix' && !draft.loop" class="muted small">only on a loop wrap</div>

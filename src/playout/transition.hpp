@@ -13,7 +13,8 @@
 namespace replay
 {
 // The lengths of a transition into an entry, in output frames: the video mix (0: a cut), the audio crossfade
-// (0: a hard audio cut) and the overlap of the two entries, the longer of both.
+// (0: a hard audio cut; by default the mix's length, 2 frames on a cut) and the overlap of the two entries, the
+// longer of both.
 struct TransitionPlan
 {
     int videoFrames = 0;

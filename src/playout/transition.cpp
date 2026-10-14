@@ -30,7 +30,7 @@ TransitionPlan transitionPlan(PlaylistEntry const& incoming)
     {
         plan.videoFrames = std::clamp(incoming.transitionFrames > 0 ? incoming.transitionFrames : kDefaultMixFrames, 1, kMaxTransitionFrames);
     }
-    plan.audioFrames = std::clamp(incoming.audioFrames < 0 ? plan.videoFrames : incoming.audioFrames, 0, kMaxTransitionFrames);
+    plan.audioFrames = std::clamp(incoming.audioFrames >= 0 ? incoming.audioFrames : incoming.transition == Transition::Mix ? plan.videoFrames : kDefaultCutAudioFrames, 0, kMaxTransitionFrames);
     return plan;
 }
 

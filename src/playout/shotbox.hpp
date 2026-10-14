@@ -59,6 +59,8 @@ enum class Transition
 constexpr int kMaxTransitionFrames = 250;
 // A mix without a length.
 constexpr int kDefaultMixFrames = 25;
+// The audio crossfade of a cut without `audioFrames`: no click at the join.
+constexpr int kDefaultCutAudioFrames = 2;
 
 struct PlaylistEntry
 {
@@ -67,7 +69,7 @@ struct PlaylistEntry
     EndAction end = EndAction::Next;
     bool autoAdvance = true;
     // Into this entry: `cut` or a `mix` of `transitionFrames` output frames, and an audio crossfade of
-    // `audioFrames` (-1: the video's; 0: a hard audio cut).
+    // `audioFrames` (-1: the mix's length, 2 on a cut; 0: a hard audio cut).
     Transition transition = Transition::Cut;
     int transitionFrames = 0;
     int audioFrames = -1;

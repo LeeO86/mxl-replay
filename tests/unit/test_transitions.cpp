@@ -111,10 +111,16 @@ TEST_CASE("mix weights run (k+1)/(n+1) and the CPU blend is (a·(1024−w) + b·
     CHECK(blendSample(1023, 0, 39) == 984);
 }
 
-TEST_CASE("transition plans: cut, mix with its default, audio frames of the video's or their own")
+TEST_CASE("transition plans: cut with its 2-frame audio crossfade, mix with its default, audio frames of the video's or their own")
 {
     PlaylistEntry entry;
+    // A cut crossfades the audio over 2 frames by default; 0 is a hard audio cut.
+    CHECK(transitionPlan(entry).videoFrames == 0);
+    CHECK(transitionPlan(entry).audioFrames == kDefaultCutAudioFrames);
+    CHECK(transitionPlan(entry).length() == 2);
+    entry.audioFrames = 0;
     CHECK(transitionPlan(entry).length() == 0);
+    entry.audioFrames = -1;
     entry.transition = Transition::Mix;
     CHECK(transitionPlan(entry).videoFrames == kDefaultMixFrames);
     entry.transitionFrames = 10;

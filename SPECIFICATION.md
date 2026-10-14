@@ -347,7 +347,8 @@ The flow step (1–5) is a module behind one interface:
 - **Transitions** (1.7.0). Each entry has a transition **into** it from the entry before (the
   edit-list convention; the first entry's applies when a looped or idle playlist wraps to it):
   `transition` `cut` (default) or `mix`, `transition_frames` (a mix: 1–250, default 25),
-  `audio_frames` (the audio crossfade, 0–250; −1, the default, is the video's: 0 for a cut)
+  `audio_frames` (the audio crossfade, 0–250; −1, the default, is the mix's length, 2 frames on a
+  cut, so a cut does not click; 0 is a hard audio cut)
   and `own_audio` (default true). A transition takes `L = max(transition_frames, audio_frames)`
   frames and starts on the grain where the outgoing entry has `L` grains left to its OUT at
   its speed, when that entry continues into the next one with *next* and auto-advance (or the
