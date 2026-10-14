@@ -8,6 +8,7 @@
 - Stop: `POST /api/v1/control {"action":"stop"}`, transport command `stop`, *Stop* in the shotbox and the transport widget. It plays the idle playlist; without one the shot ends where it stands (ended, paused).
 - Playlists can loop: `loop` in `POST`/`PUT /api/v1/playlists`, the playlist answers, the catalog (a column added to an existing catalog) and the config export; *Loop* on the Playlists page.
 - Shotbox filter: all, clips or playlists (kept in the browser). A playlist's button stacks the thumbnails of its first three clips; `GET /api/v1/playlists` lists each playlist's `clip_ids`.
+- Slow motion on the GPU: the two JPEG frames of an interpolated or blended grain (and of an optical flow) are decoded with one nvJPEG state, and the second decode could refill its staging buffers while the first one's copies were still queued, so parts of frame B could show in frame A. Between consecutive frames of one camera this is hardly visible (they look alike), but it is wrong. The decoder now waits for A before it decodes B, only when both are decoded in the same call (the start of a play, a jump, an angle change). Found while testing playlist mixes, where two different cameras made it obvious.
 
 ## 1.5.0
 
