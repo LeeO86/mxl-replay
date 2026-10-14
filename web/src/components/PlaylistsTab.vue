@@ -235,6 +235,7 @@ async function play(id) {
                 title="mix frames"
               />
               <input
+                class="audio-frames"
                 :value="audioFramesText(e)"
                 type="number"
                 min="0"

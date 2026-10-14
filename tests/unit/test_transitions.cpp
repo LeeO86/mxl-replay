@@ -498,3 +498,53 @@ TEST_CASE("an uploaded WAV is an audio item; the aux track plays at its level, d
     engine.reset();
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("a clip's audio as the aux track loops with edge fades and pauses with the channel")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-aux-clip";
+    auto engine = twoToneEngine(dir);
+    auto const a = clipOf(*engine, 10, 20); // 11 frames of 0.5: 10560 samples
+    auto const b = clipOf(*engine, 40, 59);
+    PlaylistEntry only{b, 1, EndAction::Freeze, true};
+    only.ownAudio = false;
+    AuxTrack aux;
+    aux.source = a;
+    aux.fadeOutFrames = 0;
+    auto const list = engine->createPlaylist("bed", {only}, false, aux);
+    engine->playPlaylist(1, list);
+    std::uint64_t out = at(400);
+    std::vector<float> left;
+    for (int i = 0; i < 16; ++i)
+    {
+        auto const frame = engine->render(1, out);
+        out += kPeriod;
+        for (std::size_t s = 0; s < frame.audio.size(); s += 2)
+        {
+            left.push_back(frame.audio[s]);
+        }
+    }
+    // After its 2-grain fade in the aux is the clip's 0.5; at its loop point (sample 10560) the edges dip to 0.
+    CHECK(left[3 * 960] == doctest::Approx(0.5F));
+    CHECK(left[10560 - 1] < 0.01F);
+    CHECK(left[10560] < 0.01F);
+    CHECK(left[10560 + 480] == doctest::Approx(0.5F));
+    float maxStep = 0;
+    for (std::size_t i = 1; i < left.size(); ++i)
+    {
+        maxStep = std::max(maxStep, std::fabs(left[i] - left[i - 1]));
+    }
+    CHECK(maxStep < 0.003F);
+    CHECK(engine->statusJson().find("\"aux\":{\"source\":\"" + a + "\"") != std::string::npos);
+    // Paused, the aux fades out over two grains and is silent; it resumes where it was.
+    engine->pause(1);
+    (void)engine->render(1, out);
+    out += kPeriod;
+    (void)engine->render(1, out);
+    out += kPeriod;
+    auto const paused = engine->render(1, out);
+    out += kPeriod;
+    CHECK(std::all_of(paused.audio.begin(), paused.audio.end(), [](float s) { return s == 0.F; }));
+    CHECK(engine->statusJson().find("\"aux\":null") != std::string::npos);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
