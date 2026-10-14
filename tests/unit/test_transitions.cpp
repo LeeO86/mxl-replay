@@ -569,11 +569,40 @@ TEST_CASE("aux on a looped playlist does not fade at the wrap; a short entry get
                           "\",\"transition\":\"mix\",\"transition_frames\":8},{\"clip_id\":\"" + c + "\",\"end\":\"freeze\"}]}";
         auto const created = request(*engine, "POST", "/api/v1/playlists", body);
         REQUIRE(created.status == 201);
-        auto const left = play(idOf(created.body), 24);
+        engine->playPlaylist(1, idOf(created.body));
+        std::vector<float> left;
+        std::vector<std::string> states;
+        std::uint64_t out = at(400);
+        for (int i = 0; i < 24; ++i)
+        {
+            auto const frame = engine->render(1, out);
+            out += kPeriod;
+            for (std::size_t s = 0; s < frame.audio.size(); s += 2)
+            {
+                left.push_back(frame.audio[s]);
+            }
+            auto const status = engine->statusJson();
+            auto const t = status.find("\"transition\":");
+            auto const clip = status.find("\"clip\":");
+            states.push_back(status.substr(clip, 20) + " " + status.substr(t, 70) + " luma " + std::to_string(lumaOf(frame)));
+        }
         float maxStep = 0;
+        std::size_t where = 0;
         for (std::size_t i = 2 * 960; i < left.size(); ++i)
         {
-            maxStep = std::max(maxStep, std::fabs(left[i] - left[i - 1]));
+            if (std::fabs(left[i] - left[i - 1]) > maxStep)
+            {
+                maxStep = std::fabs(left[i] - left[i - 1]);
+                where = i;
+            }
+        }
+        if (maxStep >= 0.01F)
+        {
+            for (std::size_t g = 0; g < states.size(); ++g)
+            {
+                MESSAGE("grain " << g << ": " << left[g * 960] << " … " << left[g * 960 + 959] << " " << states[g]);
+            }
+            MESSAGE("step at sample " << where << " (grain " << where / 960 << ")");
         }
         CHECK(maxStep < 0.01F);
         // Both joins happened: the mix into the short entry and the cut out of it.
