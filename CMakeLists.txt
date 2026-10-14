@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(mxl-replay VERSION 1.5.0 LANGUAGES CXX)
+project(mxl-replay VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,7 @@ add_library(replay-core STATIC
     src/playout/scheduler.cpp
     src/playout/flowahead.cpp
     src/playout/shotbox.cpp
+    src/playout/transition.cpp
     src/tally/tsl.cpp
     src/library/catalog.cpp
     src/config/config.cpp
@@ -78,6 +79,7 @@ if(REPLAY_BUILD_TESTS)
         tests/unit/test_preview.cpp
         tests/unit/test_flowahead.cpp
         tests/unit/test_tally.cpp
+        tests/unit/test_transitions.cpp
     )
     target_link_libraries(unit-tests PRIVATE replay-core)
     target_compile_options(unit-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)

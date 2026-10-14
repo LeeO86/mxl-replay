@@ -45,12 +45,52 @@ struct ClipRef
     bool library = false;
 };
 
+// The transition into a playlist entry from the one before (SPECIFICATION.md §7, 1.6.0).
+enum class Transition
+{
+    Cut,
+    Mix
+};
+
+[[nodiscard]] char const* transitionName(Transition transition);
+[[nodiscard]] Transition parseTransition(std::string const& text, bool* ok = nullptr);
+
+// A mix and an audio crossfade are 1–250 frames (10 s at 25p).
+constexpr int kMaxTransitionFrames = 250;
+// A mix without a length.
+constexpr int kDefaultMixFrames = 25;
+// The audio crossfade of a cut without `audioFrames`: no click at the join.
+constexpr int kDefaultCutAudioFrames = 2;
+
 struct PlaylistEntry
 {
     std::string clipId;
     double speed = 1;
     EndAction end = EndAction::Next;
     bool autoAdvance = true;
+    // Into this entry: `cut` or a `mix` of `transitionFrames` output frames, and an audio crossfade of
+    // `audioFrames` (-1: the mix's length, 2 on a cut; 0: a hard audio cut).
+    Transition transition = Transition::Cut;
+    int transitionFrames = 0;
+    int audioFrames = -1;
+    // The entry's own (clip) audio plays; off: only the playlist's aux track.
+    bool ownAudio = true;
+};
+
+// A playlist's audio aux track (SPECIFICATION.md §5.4, 1.6.0): a clip's audio or an audio item, under the
+// entries, ducked while an entry's own audio plays.
+struct AuxTrack
+{
+    // A clip id or an audio item id ("audio-N"); empty: none.
+    std::string source;
+    double levelDb = 0;
+    bool loop = true;
+    // Linear fade to silence over the playlist's last frames (0: none).
+    int fadeOutFrames = 50;
+    // The duck depth (0: none) and its ramps.
+    double duckDb = -12;
+    int attackMs = 200;
+    int releaseMs = 500;
 };
 
 struct Shotbox
@@ -77,9 +117,10 @@ struct Shotbox
 // `lengthsNs[i]` is entry i's playing time at its speed, -1 for a deleted clip (skipped). The playlist ends after
 // the first entry whose end action is not `next` (freeze, black, return to live), else after the last entry (a
 // looped playlist: the end of this pass); the time an entry waits cued (no auto-advance) is not counted. -1 when it
-// never ends (a `loop` entry).
+// never ends (a `loop` entry). With `framePeriodNs`, a transition into an auto-advanced entry takes its overlap off
+// (1.6.0).
 [[nodiscard]] std::int64_t playlistRemainingNs(std::vector<PlaylistEntry> const& entries, std::vector<std::int64_t> const& lengthsNs, int index,
-    std::int64_t clipRemainingNs);
+    std::int64_t clipRemainingNs, std::int64_t framePeriodNs = 0);
 
 // The next entry an idle playlist plays after `index` (SPECIFICATION.md §7): the next one whose clip exists
 // (`present[i]`), from the first again after the last. -1 when no clip exists.

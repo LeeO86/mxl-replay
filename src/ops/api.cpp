@@ -4,6 +4,7 @@
 #include "media/timebase.hpp"
 #include "ops/httpserver.hpp"
 #include "ops/preview.hpp"
+#include "playout/transition.hpp"
 #include "util/json.hpp"
 #include "util/logging.hpp"
 #include "version.hpp"
@@ -194,19 +195,40 @@ std::string clipJson(ClipRef const& clip, Config const& cfg)
     return out.str();
 }
 
-// `entries`: the entry list, or only their count (the list of all playlists).
-std::string playlistJson(Catalog::Playlist const& playlist, std::vector<ClipRef> const& clips, bool entries)
+std::string audioItemJson(Catalog::AudioItem const& item)
 {
-    // Each entry plays its clip at the entry's speed.
+    std::ostringstream out;
+    out << "{\"id\":\"" << jsonEscape(item.id) << "\",\"name\":\"" << jsonEscape(item.name) << "\",\"samples\":" << item.samples
+        << ",\"duration_ns\":" << item.samples * 1000000000 / 48000 << '}';
+    return out.str();
+}
+
+// `entries`: the entry list, or only their count (the list of all playlists).
+std::string playlistJson(Catalog::Playlist const& playlist, std::vector<ClipRef> const& clips, bool entries, std::int64_t framePeriod)
+{
+    // Each entry plays its clip at the entry's speed; a transition into an auto-advanced entry overlaps the two.
     double duration = 0;
-    for (auto const& entry : playlist.entries)
+    for (std::size_t i = 0; i < playlist.entries.size(); ++i)
     {
+        auto const& entry = playlist.entries[i];
         for (auto const& clip : clips)
         {
             if (clip.id == entry.clipId)
             {
                 double const speed = std::fabs(entry.speed);
-                duration += static_cast<double>(clip.outNs > clip.inNs ? clip.outNs - clip.inNs : 0) / (speed > 0.001 ? speed : 1.0);
+                double const length = static_cast<double>(clip.outNs > clip.inNs ? clip.outNs - clip.inNs : 0) / (speed > 0.001 ? speed : 1.0);
+                double overlap = 0;
+                if (i > 0 && framePeriod > 0 && playlist.entries[i - 1].autoAdvance && playlist.entries[i - 1].end == EndAction::Next)
+                {
+                    // At most the entry's length less the default cut crossfade (as the engine clamps it).
+                    double const planned = static_cast<double>(transitionPlan(entry).length()) * static_cast<double>(framePeriod);
+                    if (planned > 0)
+                    {
+                        double const fp = static_cast<double>(framePeriod);
+                        overlap = std::min(planned, std::max(fp, length - kDefaultCutAudioFrames * fp));
+                    }
+                }
+                duration += length - overlap;
             }
         }
     }
@@ -221,7 +243,7 @@ std::string playlistJson(Catalog::Playlist const& playlist, std::vector<ClipRef>
         {
             out << (i > 0 ? "," : "") << '"' << jsonEscape(playlist.entries[i].clipId) << '"';
         }
-        out << ']';
+        out << "],\"aux_source\":\"" << jsonEscape(playlist.aux.source) << '"';
     }
     else
     {
@@ -230,9 +252,10 @@ std::string playlistJson(Catalog::Playlist const& playlist, std::vector<ClipRef>
         {
             auto const& entry = playlist.entries[i];
             out << (i > 0 ? "," : "") << "{\"clip_id\":\"" << jsonEscape(entry.clipId) << "\",\"speed\":" << entry.speed << ",\"end\":\""
-                << endActionName(entry.end) << "\",\"auto_advance\":" << (entry.autoAdvance ? "true" : "false") << '}';
+                << endActionName(entry.end) << "\",\"auto_advance\":" << (entry.autoAdvance ? "true" : "false") << ',' << entryTransitionJson(entry)
+                << '}';
         }
-        out << ']';
+        out << "],\"aux\":" << auxJson(playlist.aux);
     }
     out << ",\"duration_ns\":" << static_cast<std::uint64_t>(duration) << '}';
     return out.str();
@@ -272,6 +295,10 @@ bool readEntries(Json const& body, std::vector<PlaylistEntry>& entries, std::str
             if (!fields.error().empty())
             {
                 problem = fields.error();
+                return false;
+            }
+            if (!readEntryTransition(item, entry, problem))
+            {
                 return false;
             }
             if (entry.speed < kMinClipSpeed || entry.speed > kMaxClipSpeed)
@@ -668,6 +695,7 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
 {
     auto const& path = request.path;
     auto const& method = request.method;
+    auto const period = framePeriodNs(engine.config().format.rateNum, engine.config().format.rateDen);
     if (path == "/livez")
     {
         return json(200, "{\"status\":\"ok\"}");
@@ -818,7 +846,8 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         {
             return error(400, problem);
         }
-        return json(201, std::string("{\"id\":\"") + jsonEscape(id) + "\"}");
+        // An audio-only file is an audio item (1.6.0).
+        return json(201, std::string("{\"id\":\"") + jsonEscape(id) + "\",\"kind\":\"" + (id.rfind(kAudioItemPrefix, 0) == 0 ? "audio" : "clip") + "\"}");
     }
 
     // Everything below takes a JSON object (or nothing) as its body.
@@ -935,13 +964,50 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         auto const state = engine.shotClick(channel, id);
         return json(200, std::string("{\"state\":\"") + shotStateName(state) + "\"}");
     }
+    if (path == "/api/v1/audio" && method == "GET")
+    {
+        std::string out = "[";
+        for (auto const& item : engine.audioItems())
+        {
+            out += (out.size() > 1 ? "," : "") + audioItemJson(item);
+        }
+        return json(200, out + "]");
+    }
+    if (path.rfind("/api/v1/audio/", 0) == 0)
+    {
+        auto const id = pathId(path, "/api/v1/audio/");
+        auto item = engine.audioItem(id);
+        if (item.id.empty())
+        {
+            return error(404, "unknown audio item");
+        }
+        if (method == "GET")
+        {
+            return json(200, audioItemJson(item));
+        }
+        if (method == "PUT")
+        {
+            std::string name;
+            if (!fields.string("name", name) || name.empty())
+            {
+                return missing(fields, "name");
+            }
+            engine.renameAudioItem(id, name);
+            return json(200, audioItemJson(engine.audioItem(id)));
+        }
+        if (method == "DELETE")
+        {
+            return engine.deleteAudioItem(id) ? json(200, "{\"deleted\":true}") : error(404, "unknown audio item");
+        }
+        return error(404, "not found");
+    }
     if (path == "/api/v1/playlists" && method == "GET")
     {
         auto const clips = engine.clips();
         std::string out = "[";
         for (auto const& playlist : engine.playlists())
         {
-            out += (out.size() > 1 ? "," : "") + playlistJson(playlist, clips, false);
+            out += (out.size() > 1 ? "," : "") + playlistJson(playlist, clips, false, period);
         }
         return json(200, out + "]");
     }
@@ -964,7 +1030,16 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         {
             return error(400, fields.error());
         }
-        auto const id = engine.createPlaylist(name, entries, loop);
+        AuxTrack aux;
+        if (auto const* item = body.get("aux"); item != nullptr && !readAux(*item, aux, problem))
+        {
+            return error(400, problem);
+        }
+        if (!engine.auxSourceExists(aux.source))
+        {
+            return error(400, "unknown aux source " + aux.source);
+        }
+        auto const id = engine.createPlaylist(name, entries, loop, aux);
         return json(201, std::string("{\"id\":\"") + jsonEscape(id) + "\"}");
     }
     if (path.rfind("/api/v1/playlists/", 0) == 0)
@@ -978,7 +1053,7 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         }
         if (action.empty() && method == "GET")
         {
-            return json(200, playlistJson(playlist, engine.clips(), true));
+            return json(200, playlistJson(playlist, engine.clips(), true, period));
         }
         if (action.empty() && method == "PUT")
         {
@@ -1003,11 +1078,24 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
             {
                 playlist.entries = entries;
             }
+            // A partial aux object changes only its fields; a source that is not the stored one must exist.
+            if (auto const* item = body.get("aux"))
+            {
+                auto const before = playlist.aux.source;
+                if (!readAux(*item, playlist.aux, problem))
+                {
+                    return error(400, problem);
+                }
+                if (playlist.aux.source != before && !engine.auxSourceExists(playlist.aux.source))
+                {
+                    return error(400, "unknown aux source " + playlist.aux.source);
+                }
+            }
             if (!engine.updatePlaylist(playlist))
             {
                 return error(404, "unknown playlist");
             }
-            return json(200, playlistJson(engine.playlist(id), clips, true));
+            return json(200, playlistJson(engine.playlist(id), clips, true, period));
         }
         if (action.empty() && method == "DELETE")
         {

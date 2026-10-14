@@ -344,3 +344,18 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-bottom-wi
 .widget-timeline { display: flex; flex-direction: column; gap: .4rem; }
 .widget-timeline .timeline-head .small { display: none; }
 .widget-timeline .btn-grid button.btn { padding: .4rem .3rem; }
+/* Playlists (1.6.0): small IN thumbnails, the transition cell and the aux track. */
+.thumb-cell.small-thumb img, .thumb-cell.small-thumb .noimg { width: 64px; height: 36px; }
+.transition-cell { white-space: nowrap; }
+.transition-cell select { width: auto; }
+.transition-cell input { width: 3.6rem; margin-left: .25rem; }
+.transition-cell input.audio-frames { display: block; width: 6.5rem; margin: .25rem 0 0; }
+fieldset.aux { margin-top: .9rem; border: 1px solid var(--border); border-radius: 6px; padding: .4rem .7rem .7rem; }
+fieldset.aux legend { padding: 0 .3rem; font-weight: 600; }
+fieldset.aux label.check { display: flex; gap: .4rem; align-items: center; text-transform: none; letter-spacing: 0; font-size: .9rem; }
+fieldset.aux label.check input { width: auto; flex: none; margin: 0; }
+.widget-entry .wthumb { width: 48px; height: 27px; object-fit: cover; border-radius: 3px; background: #000; flex: none; }
+.widget-entry .own { min-width: 1.6rem; }
+.widget-entry .own.off { opacity: .45; text-decoration: line-through; }
+input.narrow { width: 4.6rem; }
+select.end-select { min-width: 7rem; }

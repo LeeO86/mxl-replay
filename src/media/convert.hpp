@@ -14,6 +14,8 @@ struct ConvertedMedia
     std::vector<Frame10> frames;
     std::vector<float> audio;
     int channels = 2;
+    // A file with an audio stream and no video stream (1.6.0: an audio item); `audio` is 48 kHz stereo float.
+    bool audioOnly = false;
     std::string error;
 };
 

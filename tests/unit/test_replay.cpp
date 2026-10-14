@@ -1551,7 +1551,8 @@ TEST_CASE("an idle playlist plays when set on an idle channel, at a clip's end a
     auto const shot = clipFrom(0, 4);
     auto const idleA = clipFrom(10, 12);
     auto const idleB = clipFrom(15, 17);
-    auto const idle = engine->createPlaylist("idle", {PlaylistEntry{idleA, 1, EndAction::Freeze, false}, PlaylistEntry{idleB, 1, EndAction::Black, true}});
+    // Hard cuts (audio_frames 0): the 2-frame clips would vanish in the default 2-frame audio overlap.
+    auto const idle = engine->createPlaylist("idle", {PlaylistEntry{idleA, 1, EndAction::Freeze, false, Transition::Cut, 0, 0}, PlaylistEntry{idleB, 1, EndAction::Black, true, Transition::Cut, 0, 0}});
     auto const has = [&](std::string const& text) { return engine->statusJson().find(text) != std::string::npos; };
 
     // The countdowns of a clip: 4 frames to OUT at 100 %, 8 at 50 %; no playlist.
@@ -1641,7 +1642,7 @@ TEST_CASE("an idle playlist plays when set on an idle channel, at a clip's end a
     CHECK(has("\"idle\":true"));
 
     // A looped playlist starts again at its first entry; its playlist countdown is the end of the pass.
-    auto const looped = engine->createPlaylist("looped", {PlaylistEntry{idleA, 1, EndAction::Next, true}, PlaylistEntry{idleB, 1, EndAction::Next, true}});
+    auto const looped = engine->createPlaylist("looped", {PlaylistEntry{idleA, 1, EndAction::Next, true, Transition::Cut, 0, 0}, PlaylistEntry{idleB, 1, EndAction::Next, true, Transition::Cut, 0, 0}});
     auto const body = call(*engine, "PUT", "/api/v1/playlists/" + looped, "{\"loop\":true}");
     CHECK(body.status == 200);
     CHECK(body.body.find("\"loop\":true") != std::string::npos);
@@ -1695,7 +1696,7 @@ TEST_CASE("a looped playlist wraps at its last entry's freeze or black; return-t
     auto const has = [&](std::string const& text) { return engine->statusJson().find(text) != std::string::npos; };
 
     // Last entry ends on freeze, without auto-advance: with loop on, the list wraps and plays on.
-    auto const wrapped = engine->createPlaylist("wrapped", {PlaylistEntry{a, 1, EndAction::Next, true}, PlaylistEntry{b, 1, EndAction::Freeze, false}});
+    auto const wrapped = engine->createPlaylist("wrapped", {PlaylistEntry{a, 1, EndAction::Next, true, Transition::Cut, 0, 0}, PlaylistEntry{b, 1, EndAction::Freeze, false, Transition::Cut, 0, 0}});
     CHECK(call(*engine, "PUT", "/api/v1/playlists/" + wrapped, "{\"loop\":true}").status == 200);
     engine->playPlaylist(1, wrapped);
     for (int i = 0; i < 5; ++i)
@@ -1716,7 +1717,7 @@ TEST_CASE("a looped playlist wraps at its last entry's freeze or black; return-t
     CHECK(has("\"playing\":false"));
 
     // An explicit return-to-live on the last entry still goes live with loop on.
-    auto const toLive = engine->createPlaylist("to-live", {PlaylistEntry{a, 1, EndAction::Next, true}, PlaylistEntry{b, 1, EndAction::ReturnToLive, false}});
+    auto const toLive = engine->createPlaylist("to-live", {PlaylistEntry{a, 1, EndAction::Next, true, Transition::Cut, 0, 0}, PlaylistEntry{b, 1, EndAction::ReturnToLive, false, Transition::Cut, 0, 0}});
     CHECK(call(*engine, "PUT", "/api/v1/playlists/" + toLive, "{\"loop\":true}").status == 200);
     engine->playPlaylist(1, toLive);
     for (int i = 0; i < 5; ++i)
