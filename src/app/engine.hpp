@@ -100,7 +100,7 @@ public:
     // ends where it stands (Ended, paused). A live channel without an idle playlist stays live.
     void stop(int channel);
     // CH<n>_IDLE_PLAYLIST, kept in the state directory's config.json; empty: none. A playlist set plays at once,
-    // looped. False with `error` "unknown playlist" or when it cannot be written.
+    // looped, on an ended channel; a busy one plays it at its next clip end, stop or playlist end. False with `error` "unknown playlist" or when it cannot be written.
     bool setIdlePlaylist(int channel, std::string const& id, std::string& error);
     void setSpeed(int channel, double speed);
     void scrubFrames(int channel, int frames);
