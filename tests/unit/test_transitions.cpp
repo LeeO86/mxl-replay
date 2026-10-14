@@ -401,6 +401,19 @@ TEST_CASE("an audio crossfade on a cut, a hard audio cut on a mix, and own audio
                                                     0.25F * std::sin(std::numbers::pi / 4 * (3 * 960 + 0.5) / (3 * 960))).epsilon(1e-4));
         CHECK(left[s0 + 6 * 960] == doctest::Approx(-0.25F));
     }
+    // A plain cut (audio_frames -1): the audio crosses over 2 frames from where the picture cuts.
+    {
+        PlaylistEntry first{a, 1, EndAction::Next, true};
+        PlaylistEntry second{b, 1, EndAction::Freeze, true};
+        std::vector<int> luma;
+        auto const left = run(first, second, luma);
+        auto const cut = std::adjacent_find(luma.begin(), luma.end(), std::not_equal_to<>()) - luma.begin() + 1;
+        std::size_t const s0 = static_cast<std::size_t>(cut) * 960;
+        CHECK(left[s0 - 1] == doctest::Approx(0.5F));
+        CHECK(left[s0 + 960] == doctest::Approx(0.5F * std::cos(std::numbers::pi / 4 * (960 + 0.5) / 960) -
+                                                0.25F * std::sin(std::numbers::pi / 4 * (960 + 0.5) / 960)).epsilon(1e-4));
+        CHECK(left[s0 + 2 * 960] == doctest::Approx(-0.25F));
+    }
     // A mix with audio_frames 0: the audio cuts at the start of the mix.
     {
         PlaylistEntry first{a, 1, EndAction::Next, true};
