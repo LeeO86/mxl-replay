@@ -1096,7 +1096,19 @@ int loadPair(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& ke
     {
         a = needB && holding(keyB) == 0 ? 1 : 0;
     }
-    if (!load(a, jpegA, sizeA, keyA) || (needB && !load(1 - a, jpegB, sizeB, keyB)))
+    bool const decodeA = keyA.empty() || state.slotKey[a] != keyA;
+    if (!load(a, jpegA, sizeA, keyA))
+    {
+        return -1;
+    }
+    // One nvJPEG state decodes both frames: its staging buffers are refilled by the next decode's host phase while
+    // the previous decode's copies may still be queued on the stream. Two different pictures (a mix of two cameras,
+    // 1.7.0) showed parts of B in A; wait for A before decoding B.
+    if (needB && decodeA && state.slotKey[1 - a] != keyB && cudaStreamSynchronize(state.stream) != cudaSuccess)
+    {
+        return -1;
+    }
+    if (needB && !load(1 - a, jpegB, sizeB, keyB))
     {
         return -1;
     }
