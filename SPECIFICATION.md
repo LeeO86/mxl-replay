@@ -247,8 +247,8 @@ Per channel (and stored per clip), `motion_mode`:
   −12) over `attack_ms` (200) while the current entry's own audio is audible (own audio on, not
   muted by slow motion or a stop; the outgoing entry's during a crossfade) and back over
   `release_ms` (500); the **end fade** is linear to silence over the playlist's last
-  `fade_out_frames` (50; from the countdown `playlist_remaining_ns`, so a looped playlist does not
-  fade); the **edges** are 5 ms fades at the source's start, end and loop point. Paused, cued or
+  `fade_out_frames` (50; from the countdown `playlist_remaining_ns`; a looped or idle playlist does
+  not end, so it does not fade); the **edges** are 5 ms fades at the source's start, end and loop point. Paused, cued or
   stopped the aux pauses with the channel (2-frame fades). CPU only: per grain one read (a ring
   frame's audio or a `pread` of the item's file) and a few operations per sample.
 
@@ -352,7 +352,9 @@ The flow step (1–5) is a module behind one interface:
   and `own_audio` (default true). A transition takes `L = max(transition_frames, audio_frames)`
   frames and starts on the grain where the outgoing entry has `L` grains left to its OUT at
   its speed, when that entry continues into the next one with *next* and auto-advance (or the
-  loop wrap, or the idle playlist); otherwise the join is a cut as before. At that grain the
+  loop wrap, or the idle playlist); otherwise the join is a cut as before. `L` is at most the
+  incoming entry's length less 2 frames (so its own join still gets the default crossfade), and
+  at most the outgoing grains left when it starts: a transition always completes. At that grain the
   channel **moves to the incoming entry** (clip, index, speed, modes, status, countdowns) and
   keeps the outgoing side as it plays on to its OUT (and holds there). The two entries overlap
   by `L`: the countdowns and `duration_ns` take it off. Grain `k` of an `N`-frame mix shows

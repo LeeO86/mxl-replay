@@ -162,7 +162,12 @@ std::int64_t playlistRemainingNs(std::vector<PlaylistEntry> const& entries, std:
             auto const& before = entries[static_cast<std::size_t>(i - 1)];
             if (framePeriodNs > 0 && before.autoAdvance)
             {
-                total -= std::min<std::int64_t>(length, transitionPlan(entry).length() * framePeriodNs);
+                // At most the incoming entry's length less the default cut crossfade (as the engine clamps it).
+                auto const overlap = transitionPlan(entry).length() * framePeriodNs;
+                if (overlap > 0)
+                {
+                    total -= std::min<std::int64_t>(overlap, std::max<std::int64_t>(framePeriodNs, length - kDefaultCutAudioFrames * framePeriodNs));
+                }
             }
         }
         if (entry.end == EndAction::Loop)

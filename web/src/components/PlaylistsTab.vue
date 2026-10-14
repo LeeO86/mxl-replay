@@ -84,6 +84,8 @@ function add() {
   addClip.value = "";
 }
 // The clips at their speeds; a transition into an auto-advanced clip overlaps the two by its length (as the server).
+// As the engine: at most the entry's length less the 2-frame default cut crossfade.
+const clampOverlap = (overlap, length, frame) => (overlap > 0 ? Math.min(overlap, Math.max(frame, length - 2 * frame)) : 0);
 const overlapFrames = (e) => Math.max(e.transition === "mix" ? e.transition_frames : 0, e.audio_frames >= 0 ? e.audio_frames : e.transition === "mix" ? e.transition_frames : 2);
 const draftLength = computed(() =>
   (draft.value?.entries || []).reduce((sum, e, i, list) => {
@@ -91,7 +93,7 @@ const draftLength = computed(() =>
     if (!clip) return sum;
     const length = playNs(clip, e.speed / 100);
     const before = list[i - 1];
-    const overlap = i > 0 && before.end === "next" && before.auto_advance ? Math.min(length, overlapFrames(e) * (state.status?.frame_ns || 0)) : 0;
+    const overlap = i > 0 && before.end === "next" && before.auto_advance ? clampOverlap(overlapFrames(e) * (state.status?.frame_ns || 0), length, state.status?.frame_ns || 0) : 0;
     return sum + length - overlap;
   }, 0),
 );

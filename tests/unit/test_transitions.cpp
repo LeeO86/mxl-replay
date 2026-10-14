@@ -45,10 +45,13 @@ HttpResponse request(Engine& engine, std::string method, std::string path, std::
 }
 
 // One camera, 64×32p50, `CH1_MOTION=repeat`: frames 0–29 grey 200 with audio at 0.5, frames 30–59 grey 800 with
-// audio at −0.25 (both channels).
-std::unique_ptr<Engine> twoToneEngine(std::filesystem::path const& dir)
+// audio at −0.25 (both channels). `reopen`: the same directory again, as after a restart (nothing ingested).
+std::unique_ptr<Engine> twoToneEngine(std::filesystem::path const& dir, bool reopen = false)
 {
-    std::filesystem::remove_all(dir);
+    if (!reopen)
+    {
+        std::filesystem::remove_all(dir);
+    }
     auto const loaded = loadConfig({{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
                                        {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()},
                                        {"REPLAY_STORAGE_MIN_MBPS", "0"}, {"REPLAY_PROTECT_MAX_PCT", "90"}, {"CH1_MOTION", "repeat"},
@@ -56,7 +59,7 @@ std::unique_ptr<Engine> twoToneEngine(std::filesystem::path const& dir)
         {});
     auto engine = std::make_unique<Engine>(loaded.config, loaded.flat);
     engine->openBuffer();
-    for (int i = 0; i < 60; ++i)
+    for (int i = 0; i < (reopen ? 0 : 60); ++i)
     {
         bool const first = i < 30;
         engine->ingestAudio(1, at(i), std::vector<float>(960 * 2, first ? 0.5F : -0.25F), 2);
@@ -506,7 +509,7 @@ TEST_CASE("an uploaded WAV is an audio item; the aux track plays at its level, d
     {
         maxStep = std::max(maxStep, std::fabs(left[i] - left[i - 1]));
     }
-    // The cut from entry 1 to 2 brings in −0.25 at once (a cut has no crossfade): the only step that large.
+    // The cut from entry 1 to 2 brings in −0.25 (over its 2-frame crossfade): no step larger.
     CHECK(maxStep < 0.26F);
     CHECK(engine->statusJson().find("\"own_audio\":true") != std::string::npos);
 
@@ -514,6 +517,82 @@ TEST_CASE("an uploaded WAV is an audio item; the aux track plays at its level, d
     CHECK(request(*engine, "DELETE", "/api/v1/audio/" + item.id).status == 200);
     CHECK(engine->playlist(id).aux.source.empty());
     CHECK(request(*engine, "GET", "/api/v1/audio/" + item.id).status == 404);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("aux on a looped playlist does not fade at the wrap; a short entry gets a whole mix; audio ids continue after a restart")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-review";
+    auto engine = twoToneEngine(dir);
+    auto const a = clipOf(*engine, 10, 20);
+    auto const b = clipOf(*engine, 40, 44);
+    auto const c = clipOf(*engine, 20, 29);
+    auto const idOf = [](std::string const& body) {
+        auto const at = body.find("\"id\":\"") + 6;
+        return body.substr(at, body.find('"', at) - at);
+    };
+    auto const play = [&](std::string const& id, int grains) {
+        engine->playPlaylist(1, id);
+        std::vector<float> left;
+        std::uint64_t out = at(400);
+        for (int i = 0; i < grains; ++i)
+        {
+            auto const frame = engine->render(1, out);
+            out += kPeriod;
+            for (std::size_t s = 0; s < frame.audio.size(); s += 2)
+            {
+                left.push_back(frame.audio[s]);
+            }
+        }
+        return left;
+    };
+    std::vector<float> tone(44100 * 2 * 2, 0.4F);
+    auto const wav = writeWav(tone, 2, 44100);
+    REQUIRE(request(*engine, "POST", "/api/v1/uploads", std::string(wav.begin(), wav.end()), "name=bed").status == 201);
+    auto const bed = engine->audioItems().at(0).id;
+
+    // Looped, both entries silent (own audio off), aux at 0 dB with a 3-frame end fade: the bed plays on at 0.4 over
+    // two passes (about 18 grains each), it neither fades before the wrap nor jumps back after it.
+    {
+        auto const body = "{\"name\":\"looped bed\",\"loop\":true,\"entries\":[{\"clip_id\":\"" + a + "\",\"own_audio\":false},{\"clip_id\":\"" + c +
+                          "\",\"own_audio\":false,\"end\":\"freeze\"}],\"aux\":{\"source\":\"" + bed + "\",\"fade_out_frames\":3}}";
+        auto const created = request(*engine, "POST", "/api/v1/playlists", body);
+        REQUIRE(created.status == 201);
+        auto const left = play(idOf(created.body), 45);
+        CHECK(*std::min_element(left.begin() + 3 * 960, left.end()) > 0.39F);
+    }
+    // A 4-frame entry after an 8-frame mix: the mix is clamped to 2 frames (its length less the 2-frame cut
+    // crossfade), so it completes and the cut after it still crossfades: no click anywhere.
+    {
+        auto const body = "{\"name\":\"short\",\"entries\":[{\"clip_id\":\"" + a + "\"},{\"clip_id\":\"" + b +
+                          "\",\"transition\":\"mix\",\"transition_frames\":8},{\"clip_id\":\"" + c + "\",\"end\":\"freeze\"}]}";
+        auto const created = request(*engine, "POST", "/api/v1/playlists", body);
+        REQUIRE(created.status == 201);
+        auto const left = play(idOf(created.body), 24);
+        float maxStep = 0;
+        for (std::size_t i = 2 * 960; i < left.size(); ++i)
+        {
+            maxStep = std::max(maxStep, std::fabs(left[i] - left[i - 1]));
+        }
+        CHECK(maxStep < 0.01F);
+        // Both joins happened: the mix into the short entry and the cut out of it.
+        auto const metrics = request(*engine, "GET", "/metrics").body;
+        CHECK(metrics.find("mxl_replay_transitions_total{channel=\"1\",kind=\"mix\"} 1") != std::string::npos);
+    }
+    // After a restart a new upload takes a new id: the old item keeps its file.
+    engine.reset();
+    engine = twoToneEngine(dir, true);
+    std::vector<float> shorter(44100 * 2, 0.1F);
+    auto const wav2 = writeWav(shorter, 2, 44100);
+    REQUIRE(request(*engine, "POST", "/api/v1/uploads", std::string(wav2.begin(), wav2.end()), "name=sting").status == 201);
+    auto const items = engine->audioItems();
+    REQUIRE(items.size() == 2);
+    CHECK(items[0].id != items[1].id);
+    for (auto const& item : items)
+    {
+        CHECK(item.samples == doctest::Approx(item.name == "bed" ? 96000 : 48000).epsilon(0.01));
+    }
     engine.reset();
     std::filesystem::remove_all(dir);
 }

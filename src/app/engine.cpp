@@ -259,6 +259,8 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
             [] { gpuPrepareThread(GpuPriority::Flow); });
         metrics_.inc("interpolation_fallbacks_total", {{"channel", std::to_string(index)}}, 0);
         metrics_.inc("tally_plays_total", {{"channel", std::to_string(index)}}, 0);
+        metrics_.inc("transitions_total", {{"channel", std::to_string(index)}, {"kind", "cut"}}, 0);
+        metrics_.inc("transitions_total", {{"channel", std::to_string(index)}, {"kind", "mix"}}, 0);
         (void)channel;
         channels_.push_back(std::move(runtime));
     }
@@ -348,7 +350,7 @@ FrameRing* Engine::ringOf(int camera)
 
 void Engine::continueSerial()
 {
-    // Ids end in "-<serial>" (clip-, upload-, group-, playlist-). Continue after the catalog's:
+    // Ids end in "-<serial>" (clip-, upload-, group-, playlist-, audio-). Continue after the catalog's:
     // starting at 1 again after a restart replaced the clips that already had those ids.
     auto const serialOf = [](std::string const& id) -> std::uint64_t {
         auto const dash = id.rfind('-');
@@ -365,6 +367,11 @@ void Engine::continueSerial()
     for (auto const& playlist : catalog_.playlists())
     {
         clipSerial_ = std::max(clipSerial_, serialOf(playlist.id) + 1);
+    }
+    // Audio items too: a new upload must not take an existing item's id (and replace its file).
+    for (auto const& item : catalog_.audioItems())
+    {
+        clipSerial_ = std::max(clipSerial_, serialOf(item.id) + 1);
     }
 }
 
@@ -1391,6 +1398,8 @@ void Engine::stop(int channel)
     {
         return;
     }
+    // A transition in progress ends with the stop (no blend held on the output).
+    runtime.mix.active = false;
     runtime.scheduler.playing = false;
     runtime.shot.state = ShotState::Ended;
 }
@@ -3040,7 +3049,19 @@ void Engine::maybeStartTransition(int channel)
     {
         return;
     }
-    auto const plan = transitionPlan(list.entries[static_cast<std::size_t>(next)]);
+    auto const& incoming = list.entries[static_cast<std::size_t>(next)];
+    auto plan = transitionPlan(incoming);
+    // A transition must complete before the incoming entry reaches its own OUT (finishClip there would cut the
+    // mix off mid-crossfade): it takes at most the incoming entry's length less the default cut crossfade (so the
+    // join after it still gets one), and at most the outgoing grains left when it starts late.
+    if (auto const nextClip = catalog_.clip(incoming.clipId); !nextClip.id.empty() && nextClip.outNs > nextClip.inNs)
+    {
+        double const nextSpeed = std::max(kMinClipSpeed, incoming.speed);
+        auto const frames = static_cast<int>(std::floor(static_cast<double>(nextClip.outNs - nextClip.inNs) / (nextSpeed * static_cast<double>(period))));
+        int const most = std::max(1, std::min(frames - kDefaultCutAudioFrames, static_cast<int>(left)));
+        plan.videoFrames = std::min(plan.videoFrames, most);
+        plan.audioFrames = std::min(plan.audioFrames, most);
+    }
     if (plan.length() == 0 || left > plan.length())
     {
         return;
@@ -3186,9 +3207,10 @@ void Engine::mixAux(int channel, std::unique_lock<std::recursive_mutex>& lock, s
     auto const aux = runtime.aux;
     auto const length = aux.source == list.aux.source ? runtime.planAuxLength : auxLength(aux.source);
     auto const clip = aux.source.rfind(kAudioItemPrefix, 0) == 0 ? ClipRef{} : catalog_.clip(aux.source);
-    // The time to the playlist's end (its countdown) for the end fade: none when it does not end.
+    // The time to the playlist's end (its countdown) for the end fade: none when it does not end. A looped or
+    // idle playlist does not end: its countdown is only the end of this pass (no fade, no jump back at the wrap).
     std::int64_t remaining = -1;
-    if (aux.fadeOutFrames > 0 && onList)
+    if (aux.fadeOutFrames > 0 && onList && !list.loop && !runtime.idle)
     {
         std::int64_t clipLeft = -1;
         remaining = countdowns(runtime, list, runtime.planLengths, clipLeft);

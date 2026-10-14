@@ -220,7 +220,13 @@ std::string playlistJson(Catalog::Playlist const& playlist, std::vector<ClipRef>
                 double overlap = 0;
                 if (i > 0 && framePeriod > 0 && playlist.entries[i - 1].autoAdvance && playlist.entries[i - 1].end == EndAction::Next)
                 {
-                    overlap = std::min(length, static_cast<double>(transitionPlan(entry).length()) * static_cast<double>(framePeriod));
+                    // At most the entry's length less the default cut crossfade (as the engine clamps it).
+                    double const planned = static_cast<double>(transitionPlan(entry).length()) * static_cast<double>(framePeriod);
+                    if (planned > 0)
+                    {
+                        double const fp = static_cast<double>(framePeriod);
+                        overlap = std::min(planned, std::max(fp, length - kDefaultCutAudioFrames * fp));
+                    }
                 }
                 duration += length - overlap;
             }
