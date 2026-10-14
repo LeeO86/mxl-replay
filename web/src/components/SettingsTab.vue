@@ -21,8 +21,8 @@ async function setPlayOnTally(channel, enable) {
   await channelPost("play-on-tally", { enable }, channel);
   loadExport();
 }
-// The idle playlist (CH<n>_IDLE_PLAYLIST, kept in the state directory) plays at once, looped, and whenever the
-// channel stops or its clip or playlist ends.
+// The idle playlist (CH<n>_IDLE_PLAYLIST, kept in the state directory) plays looped whenever the channel stops or
+// its clip or playlist ends; set on an idle channel it plays at once, on a busy one it waits for that.
 async function setIdlePlaylist(channel, playlist) {
   await channelPost("idle-playlist", { playlist }, channel);
   loadExport();
@@ -126,7 +126,7 @@ const ACTION_LABELS = { ...Object.fromEntries(ACTIONS.map((a) => [a.id, a.label]
           </button>
         </template>
         <span>Idle playlist</span>
-        <select :value="c.idle_playlist" aria-label="Idle playlist" @change="setIdlePlaylist(c.index, $event.target.value)">
+        <select :value="c.idle_playlist" aria-label="Idle playlist" title="Plays when the channel stops or its clip or playlist ends; on an idle channel at once" @change="setIdlePlaylist(c.index, $event.target.value)">
           <option value="">None</option>
           <option v-for="p in state.playlists" :key="p.id" :value="p.id">{{ p.name }}</option>
         </select>
