@@ -1623,6 +1623,12 @@ TEST_CASE("an idle playlist plays when set on an idle channel, at a clip's end a
     // Kept in the state directory and the export.
     CHECK(engine->exportConfigJson().find("\"CH1_IDLE_PLAYLIST\":\"" + idle + "\"") != std::string::npos);
 
+    // Set on a scrubbed channel (marking a clip) it is armed too.
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"\"}").status == 200);
+    engine->live(1);
+    engine->setPosition(1, frameTime(5));
+    CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"" + idle + "\"}").status == 200);
+    CHECK(has("\"idle\":false"));
     // Set on a live channel it is armed: live stays, the end of the next clip starts it.
     engine->live(1);
     CHECK(call(*engine, "POST", "/api/v1/channels/1/idle-playlist", "{\"playlist\":\"" + idle + "\"}").status == 200);

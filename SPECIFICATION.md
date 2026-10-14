@@ -373,7 +373,7 @@ The flow step (1–5) is a module behind one interface:
   `POST /api/v1/channels/{n}/idle-playlist {"playlist": id}`, `""` clears it; kept in the
   state directory and the config export; deleting the playlist clears it). It plays, looped:
   - when it is set on an idle channel: stopped, ended or black, or playing its idle playlist.
-    A live, playing, cued or paused channel keeps its shot; the idle playlist is armed and
+    A live, scrubbed, playing, cued or paused channel keeps its shot; the idle playlist is armed and
     starts at the next clip end, stop or playlist end. Also at start, once the buffer is indexed;
   - when the channel is **stopped** (`stop`: `POST /api/v1/control {"action":"stop"}`,
     transport command `stop`, *Stop* in the shotbox and the transport widget; a paused idle
