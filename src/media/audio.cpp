@@ -364,19 +364,37 @@ std::vector<float> resampleLinear(std::vector<float> const& interleaved, int cha
     return out;
 }
 
+namespace
+{
+// Scales the block by a gain going linearly from `start` to `end`.
+void applyGainRamp(std::vector<float>& interleaved, float start, float end)
+{
+    for (std::size_t i = 0; i < interleaved.size(); ++i)
+    {
+        float const t = interleaved.size() == 1 ? 0.f : static_cast<float>(i) / static_cast<float>(interleaved.size() - 1);
+        interleaved[i] *= start + (end - start) * t;
+    }
+}
+} // namespace
+
 void applyMuteFade(std::vector<float>& interleaved, int frameInFade, int fadeFrames)
 {
     if (fadeFrames <= 0 || interleaved.empty())
     {
         return;
     }
-    float const start = 1.f - static_cast<float>(frameInFade) / static_cast<float>(fadeFrames);
-    float const end = 1.f - static_cast<float>(frameInFade + 1) / static_cast<float>(fadeFrames);
-    for (std::size_t i = 0; i < interleaved.size(); ++i)
+    applyGainRamp(interleaved, 1.f - static_cast<float>(frameInFade) / static_cast<float>(fadeFrames),
+        1.f - static_cast<float>(frameInFade + 1) / static_cast<float>(fadeFrames));
+}
+
+void applyFadeIn(std::vector<float>& interleaved, int frameInFade, int fadeFrames)
+{
+    if (fadeFrames <= 0 || interleaved.empty())
     {
-        float const t = interleaved.size() == 1 ? 0.f : static_cast<float>(i) / static_cast<float>(interleaved.size() - 1);
-        interleaved[i] *= start + (end - start) * t;
+        return;
     }
+    applyGainRamp(interleaved, static_cast<float>(frameInFade) / static_cast<float>(fadeFrames),
+        static_cast<float>(frameInFade + 1) / static_cast<float>(fadeFrames));
 }
 
 std::vector<std::uint8_t> writeWav(std::vector<float> const& interleaved, int channels, int sampleRate)

@@ -256,8 +256,14 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         runtime.ahead = std::make_unique<FlowAhead>([this, index](FlowAhead::Pair const& pair) { return computeFlow(pair, index); },
             [] { gpuPrepareThread(GpuPriority::Flow); });
         metrics_.inc("interpolation_fallbacks_total", {{"channel", std::to_string(index)}}, 0);
+        metrics_.inc("tally_plays_total", {{"channel", std::to_string(index)}}, 0);
         (void)channel;
         channels_.push_back(std::move(runtime));
+    }
+    if (config_.tslEnable)
+    {
+        metrics_.inc("tsl_packets_total", {}, 0);
+        metrics_.inc("tsl_errors_total", {}, 0);
     }
     if (settings_.empty())
     {
@@ -939,12 +945,24 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     int const samples = audioSamplesForFrame(timestampToIndex(config_.format.rateNum, config_.format.rateDen, outputTaiNs), config_.format.rateNum,
         config_.format.rateDen, 48000);
     int const audioCamera = cfg.atmosCamera > 0 ? cfg.atmosCamera : camera;
+    double const speed = std::fabs(runtime.scheduler.speed);
+    // A channel that stands still (paused, cued, at a clip's end, black, or at speed 0) is silent: its position
+    // does not move, and its frame's samples repeated every grain are a buzz. Slow motion in `mute` is silent too.
+    bool const still = !runtime.liveMode && (!runtime.scheduler.playing || runtime.black || speed <= 0.01);
+    bool const silent = still || (!runtime.liveMode && speed < 0.999 && cfg.audio == AudioMode::Mute);
     std::vector<float> pcm(static_cast<std::size_t>(samples) * 2, 0.f);
     if (auto const* ring = ringOf(audioCamera))
     {
         // Audio is stored with the frames on house times (phase 1 of an HFR camera).
         auto const house = static_cast<std::uint64_t>(std::max<std::int64_t>(1, period));
-        auto const at = (position + house / 2) / house * house;
+        auto at = (position + house / 2) / house * house;
+        // A channel that just stopped fades out over the audio after the grain it played last (no splice, no click),
+        // not over its frame again.
+        if (still && runtime.fadeFramesLeft < 2 && runtime.audioNs != 0)
+        {
+            at = runtime.audioNs + house;
+        }
+        runtime.audioNs = at;
         lock.unlock();
         auto audio = ring->findNearestAudio(at);
         lock.lock();
@@ -954,35 +972,36 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             pcm = std::move(audio);
         }
     }
-    double const speed = std::fabs(runtime.scheduler.speed);
-    if (!runtime.liveMode && speed < 0.999)
+    if (!silent && !runtime.liveMode && speed < 0.999)
     {
-        if (cfg.audio == AudioMode::Mute)
-        {
-            if (runtime.fadeFramesLeft < 2)
-            {
-                applyMuteFade(pcm, runtime.fadeFramesLeft, 2);
-                ++runtime.fadeFramesLeft;
-            }
-            else
-            {
-                std::fill(pcm.begin(), pcm.end(), 0.f);
-            }
-        }
-        else if (cfg.audio == AudioMode::Stretch && speed > 0.01)
+        if (cfg.audio == AudioMode::Stretch)
         {
             pcm = timeStretch(pcm, 2, speed).samples;
             pcm.resize(static_cast<std::size_t>(samples) * 2, 0.f);
         }
-        else if (cfg.audio == AudioMode::Follow && speed > 0.01)
+        else if (cfg.audio == AudioMode::Follow)
         {
             pcm = resampleLinear(pcm, 2, speed);
             pcm.resize(static_cast<std::size_t>(samples) * 2, 0.f);
         }
     }
-    else
+    // Two-grain fades: out into silence, in when the channel plays (or goes live) again.
+    if (silent)
     {
-        runtime.fadeFramesLeft = 0;
+        if (runtime.fadeFramesLeft < 2)
+        {
+            applyMuteFade(pcm, runtime.fadeFramesLeft, 2);
+            ++runtime.fadeFramesLeft;
+        }
+        else
+        {
+            std::fill(pcm.begin(), pcm.end(), 0.f);
+        }
+    }
+    else if (runtime.fadeFramesLeft > 0)
+    {
+        applyFadeIn(pcm, 2 - runtime.fadeFramesLeft, 2);
+        --runtime.fadeFramesLeft;
     }
     rendered.audio = std::move(pcm);
     metrics_.set("channel_speed", {{"channel", std::to_string(channel)}}, runtime.scheduler.speed);
@@ -1358,6 +1377,103 @@ void Engine::setLock(int channel, bool enabled)
     config_.channelList[static_cast<std::size_t>(channel - 1)].lockToFirst = enabled;
 }
 
+bool Engine::setPlayOnTally(int channel, bool enabled, std::string& error)
+{
+    std::lock_guard lock{mutex_};
+    if (channel < 1 || channel > static_cast<int>(config_.channelList.size()))
+    {
+        error = "unknown channel";
+        return false;
+    }
+    config_.channelList[static_cast<std::size_t>(channel - 1)].playOnTally = enabled;
+    settings_["CH" + std::to_string(channel) + "_PLAY_ON_TALLY"] = enabled ? "true" : "false";
+    return saveSettings(error);
+}
+
+bool Engine::saveSettings(std::string& error) const
+{
+    // Written next to it and renamed over it: a crash mid-write leaves the old file, not half a file.
+    auto const path = config_.stateDir + "/config.json";
+    auto const temp = path + ".tmp";
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    if (!out)
+    {
+        error = "cannot write " + path;
+        return false;
+    }
+    out << "{\n";
+    bool first = true;
+    for (auto const& [key, value] : settings_)
+    {
+        if (!first)
+        {
+            out << ",\n";
+        }
+        first = false;
+        out << "  \"" << jsonEscape(key) << "\": \"" << jsonEscape(value) << '"';
+    }
+    out << "\n}\n";
+    out.close();
+    std::error_code ec;
+    if (!out || (std::filesystem::rename(temp, path, ec), ec))
+    {
+        error = "cannot write " + path;
+        std::filesystem::remove(temp, ec);
+        return false;
+    }
+    return true;
+}
+
+void Engine::applyTally(TslMessage const& message)
+{
+    metrics_.inc("tsl_packets_total");
+    if (!message.error.empty())
+    {
+        metrics_.inc("tsl_errors_total");
+        return;
+    }
+    bool played = false;
+    {
+        std::lock_guard lock{mutex_};
+        for (auto const& display : message.displays)
+        {
+            if (config_.tslScreen >= 0 && display.screen != config_.tslScreen)
+            {
+                continue;
+            }
+            int const channel = channelForDisplay(config_.tslMap, display.index);
+            if (channel < 1 || channel > static_cast<int>(channels_.size()))
+            {
+                continue;
+            }
+            auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+            auto const& cfg = config_.channelList[static_cast<std::size_t>(channel - 1)];
+            bool const wasRed = runtime.tslLh == 1 || runtime.tslText == 1;
+            runtime.tslLh = display.lh;
+            runtime.tslRh = display.rh;
+            runtime.tslText = display.text;
+            bool const red = display.lh == 1 || display.text == 1;
+            auto const shot = runtime.shot.state;
+            // Only the rising edge: a red that stays on (the controller repeats it) never plays again.
+            if (!red || wasRed || !cfg.playOnTally || runtime.liveMode || (shot != ShotState::Cued && shot != ShotState::Paused))
+            {
+                continue;
+            }
+            play(channel);
+            runtime.tallyPlayNs = taiNowNs();
+            metrics_.inc("tally_plays_total", {{"channel", std::to_string(channel)}});
+            logInfo("tally_play", {{"channel", std::to_string(channel)}, {"label", cfg.label}, {"display", std::to_string(display.index)},
+                                      {"shot", shotStateName(shot)}, {"clip", runtime.shot.clipId}});
+            played = true;
+        }
+    }
+    // As after an API command: the flows of the next grains start now.
+    if (played && bufferReady_)
+    {
+        planFlows();
+    }
+}
+
 std::string Engine::createClip(int channel, std::string const& name, bool allAngles, bool force, std::string& error, std::string const& colour,
     std::string const& tags)
 {
@@ -1539,7 +1655,6 @@ void Engine::cueClip(int channel, ClipRef const& clip, PlaylistEntry const* entr
     runtime.scheduler.setTargetSpeed(entry != nullptr ? entry->speed : clip.speed, 0);
     runtime.scheduler.playing = false;
     runtime.shot.end = entry != nullptr ? entry->end : clip.end;
-    runtime.fadeFramesLeft = 0;
     bool ok = false;
     config_.channelList[static_cast<std::size_t>(channel - 1)].motion = parseMotion(clip.motion, &ok);
     config_.channelList[static_cast<std::size_t>(channel - 1)].audio = parseAudioMode(clip.audio, &ok);
@@ -2045,7 +2160,7 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             "NMOS_PORT", "NMOS_SEED", "NMOS_LABEL", "NMOS_HOST_ADDRESS", "MXL_OUTPUT_DOMAIN_DIR", "MXL_OUTPUT_DOMAIN_ID", "NMOS_REGISTRY_ADDRESS",
             "NMOS_REGISTRY_PORT", "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "REPLAY_PREVIEW_MODE", "PREVIEW_PUBLISH_URL", "PREVIEW_PATH_PREFIX",
             "PREVIEW_WHEP_URL", "PREVIEW_HLS_URL", "MEDIAMTX_RTSP_PORT", "MEDIAMTX_WHEP_PORT", "MEDIAMTX_HLS_PORT", "MEDIAMTX_ICE_UDP_PORT",
-            "WIDGET_FRAME_ANCESTORS"};
+            "WIDGET_FRAME_ANCESTORS", "TSL_ENABLE", "TSL_UDP_PORT", "TSL_TCP_PORT"};
         for (auto const* key : restartKeys)
         {
             auto const before = settings_.count(key) ? settings_.at(key) : std::string{};
@@ -2074,26 +2189,15 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
                 config_.channelList[i].audio = loaded.config.channelList[i].audio;
                 config_.channelList[i].idle = loaded.config.channelList[i].idle;
                 config_.channelList[i].timecode = loaded.config.channelList[i].timecode;
+                config_.channelList[i].playOnTally = loaded.config.channelList[i].playOnTally;
             }
         }
-        std::ofstream out(config_.stateDir + "/config.json");
-        if (!out)
+        config_.tslScreen = loaded.config.tslScreen;
+        config_.tslMap = loaded.config.tslMap;
+        if (!saveSettings(result.error))
         {
-            result.error = "cannot write " + config_.stateDir + "/config.json";
             return result;
         }
-        out << "{\n";
-        bool first = true;
-        for (auto const& [key, value] : settings_)
-        {
-            if (!first)
-            {
-                out << ",\n";
-            }
-            first = false;
-            out << "  \"" << jsonEscape(key) << "\": \"" << jsonEscape(value) << '"';
-        }
-        out << "\n}\n";
         auto const text = [](Json const& item, char const* key) {
             auto const* field = item.get(key);
             return field != nullptr ? jsonText(*field).value_or(std::string{}) : std::string{};
@@ -2423,7 +2527,7 @@ std::string Engine::statusJson() const
         << ",\"format\":" << jsonString(config_.format.token()) << ",\"gpu\":" << (gpuInterpolate() ? "true" : "false")
         << ",\"flow\":" << jsonString(flowModuleName(config_.flowModule)) << ",\"preset\":" << jsonString(presetName(config_.preset))
         << ",\"storage_bps\":" << storageBps_ << ",\"free_bytes\":" << freeBytes() << ",\"jpeg\":\"" << jpegRuntimeBackend()
-        << "\",\"jpeg_bit_depth\":" << jpegStorageBitDepth()
+        << "\",\"jpeg_bit_depth\":" << jpegStorageBitDepth() << ",\"tsl_enable\":" << (config_.tslEnable ? "true" : "false")
         << ",\"cameras\":[";
     for (std::size_t i = 0; i < cameras_.size(); ++i)
     {
@@ -2471,7 +2575,10 @@ std::string Engine::statusJson() const
             << ",\"tc_mode\":" << jsonString(tcModeName(cfg.timecode)) << ",\"position_tc\":" << tc(channel.scheduler.positionNs)
             << ",\"in_tc\":" << tc(static_cast<std::int64_t>(channel.inNs)) << ",\"out_tc\":" << tc(static_cast<std::int64_t>(channel.outNs))
             << ",\"shot_id\":" << jsonString(channel.shot.clipId) << ",\"playlist\":" << jsonString(channel.playlistId)
-            << ",\"playlist_index\":" << channel.playlistIndex << '}';
+            << ",\"playlist_index\":" << channel.playlistIndex << ",\"play_on_tally\":" << (cfg.playOnTally ? "true" : "false")
+            << ",\"tsl_lh\":" << channel.tslLh << ",\"tsl_rh\":" << channel.tslRh << ",\"tsl_text_tally\":" << channel.tslText
+            << ",\"tally\":" << effectiveTally(channel.tslLh, channel.tslRh, channel.tslText) << ",\"tally_play_ns\":" << channel.tallyPlayNs
+            << '}';
     }
     out << "],\"preview\":" << previewStatusJson(config_, previewStatus_ ? previewStatus_() : PreviewStatus{}) << '}';
     return out.str();

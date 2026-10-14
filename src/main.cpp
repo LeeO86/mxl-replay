@@ -11,6 +11,7 @@
 #include "ops/httpserver.hpp"
 #include "ops/preview.hpp"
 #include "ops/publisher.hpp"
+#include "tally/tsl.hpp"
 #include "util/logging.hpp"
 #include "version.hpp"
 
@@ -159,6 +160,18 @@ int main(int argc, char** argv)
             replay::logInfo("web_listen", {{"port", std::to_string(server.port())}});
         }
         engine.openBuffer();
+        // TSL UMD 5.0 tally (SPECIFICATION.md §8.8): a rising red plays a Cued or Paused channel.
+        replay::TslListener tsl;
+        if (engine.config().tslEnable)
+        {
+            auto const udp = engine.config().tslUdpPort;
+            auto const tcp = engine.config().tslTcpPort;
+            if (!tsl.start(udp, tcp, [&engine](replay::TslMessage const& message) { engine.applyTally(message); }))
+            {
+                throw replay::StartupError(75, "cannot bind the TSL ports " + std::to_string(udp) + "/udp and " + std::to_string(tcp) + "/tcp");
+            }
+            replay::logInfo("tsl_listening", {{"udp", std::to_string(udp)}, {"tcp", std::to_string(tcp)}});
+        }
         replay::NmosNode node(engine.config(), engine);
         node.start();
         replay::MxlBridge bridge(engine);
@@ -238,6 +251,7 @@ int main(int argc, char** argv)
         {
             thread.join();
         }
+        tsl.stop();
         bridge.stop();
         bool const nmosStopped = node.stop();
         if (engine.config().cleanupOnExit)

@@ -12,6 +12,7 @@
 #include "playout/scheduler.hpp"
 #include "playout/shotbox.hpp"
 #include "record/ring.hpp"
+#include "tally/tsl.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -108,6 +109,12 @@ public:
     void setAudioMode(int channel, AudioMode mode);
     void setTimecodeMode(int channel, TcMode mode);
     void setLock(int channel, bool enabled);
+    // CH<n>_PLAY_ON_TALLY, kept in the state directory's config.json. False with `error` when it cannot be written.
+    bool setPlayOnTally(int channel, bool enabled, std::string& error);
+    // A TSL UMD 5.0 message (SPECIFICATION.md §8.8): the displays of TSL_SCREEN set the tally of the channels TSL_MAP
+    // gives them. A rising red (LH or the text tally) on a channel with CH<n>_PLAY_ON_TALLY plays its Cued or Paused
+    // shot, as POST /api/v1/control {"action":"play"} does. Counts the packet and its errors.
+    void applyTally(TslMessage const& message);
 
     // Empty id and a message in error when protection would exceed the cap. An empty colour
     // keeps the camera's colour.
@@ -210,7 +217,10 @@ private:
         std::string clipId;
         std::string playlistId;
         int playlistIndex = -1;
+        // The audio fade: 0 audible, 2 silent; each grain moves one step (render).
         int fadeFramesLeft = 0;
+        // The house time of the audio the last grain read (0: none yet).
+        std::uint64_t audioNs = 0;
         Frame10 last;
         std::vector<std::uint8_t> lastV210;
         std::string timecode; // of the last output grain (its ANC)
@@ -219,6 +229,11 @@ private:
         // The flows of the next grains (SPECIFICATION.md §5.3) and the grains blended without one.
         std::unique_ptr<FlowAhead> ahead;
         LogLimit fallbackLog;
+        // The last TSL tally (0 off, 1 red, 2 green, 3 amber) and when red last played the channel (TAI ns).
+        int tslLh = 0;
+        int tslRh = 0;
+        int tslText = 0;
+        std::uint64_t tallyPlayNs = 0;
     };
 
     // Encode into `pending`; pushFrames() writes them after the engine lock is released.
@@ -259,6 +274,8 @@ private:
     [[nodiscard]] bool mosaicDue(std::uint64_t taiNs) const;
     void loadRoutes();
     void saveRoutes() const;
+    // Writes settings_ to the state directory's config.json (lock held). False with `error` when it cannot.
+    bool saveSettings(std::string& error) const;
     [[nodiscard]] std::string routesPath() const;
 
     Config config_;

@@ -154,7 +154,9 @@ of sequences beyond playlists, compressed outputs, HDR.
 
 ### 5.1 Channels
 
-- `REPLAY_CHANNELS` playout channels (default 2: e.g. "PGM" and "PVW/second LSM").
+- `REPLAY_CHANNELS` playout channels (default 2), labelled `LSM A`, `LSM B`, `LSM C` … unless
+  `CH<n>_LABEL` is set (1.5.0; before `PGM`, `PVW`, `CH3` …; the NMOS senders follow:
+  `LSM A Video`, `LSM A Audio`, `LSM A Data`).
   Each is one video sender, one audio sender and one ANC (timecode) sender, grouped,
   writing into the replay's own domain (stable ID, never a mirror domain).
 - Output format = house format (`REPLAY_FORMAT`, default 1080p50); all channels and
@@ -224,6 +226,9 @@ Per channel (and stored per clip), `motion_mode`:
   `mute` (default), `stretch` (pitch-preserving time-stretch, phase vocoder with WSOLA
   fallback), `follow` (plain resample, pitch changes — for effect only).
 - Above 100 %: `mute` or `stretch`.
+- A channel that stands still (paused, cued, ended with *freeze* or *black*, speed 0) is
+  silent in every mode: its audio fades out over 2 frames and fades in over 2 frames when
+  it plays or goes live (1.5.0; it repeated the frame's samples before). Live is unchanged.
 - Audio comes from the camera being played (angle switch switches audio), or from a
   fixed "atmos" camera (configurable per channel).
 
@@ -339,15 +344,16 @@ The flow step (1–5) is a module behind one interface:
 - Timeline of the buffer with markers for clips; scrubbing by drag, mouse wheel
   (frame/second), keyboard (←/→ frame, shift = second).
 - Buttons: IN, OUT, Go IN, Go OUT, Play, Pause, Live, Create clip, speed fader with
-  presets, motion mode, audio mode.
+  presets. The channel modes are in Settings (§8.3, 1.5.0).
 - Clip inspector: edit IN/OUT frame-accurately, speed, modes, end action, name,
   colour, tags.
 
 ### 8.3 Other pages
 
 Library (clips, uploads, conversion queue, export), Playlists, Cameras (inputs,
-phase groups, buffer settings, storage status), NMOS, Settings (config
-import/export as one JSON document) — like the siblings.
+phase groups, buffer settings, storage status), NMOS, Settings (per channel: motion,
+audio and timecode mode, lock to the first channel, play on red light (§8.8) and the
+tally; config import/export as one JSON document) — like the siblings.
 
 ### 8.4 Controllers
 
@@ -438,6 +444,24 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
 - The page posts `{type: "widget-ready"}` once it shows the replay's status, and
   `{type: "widget-size", w, h}` then and on every resize, to `window.parent`.
 
+### 8.8 Tally (TSL UMD 5.0, 1.5.0)
+
+- The receiver of mxl-webrtc-monitor 1.2.0 (a port of mxl-multiviewer's): `TSL_ENABLE`
+  (default false), UDP on `TSL_UDP_PORT` (8914) and TCP with DLE/STX framing on
+  `TSL_TCP_PORT` (8915), UTF-16 or ASCII text, `TSL_SCREEN` (-1: every screen) and
+  `TSL_MAP` (`display:channel,…`; empty: display `i` is channel `i+1`). The ports sit next
+  to the multiviewer's (8910/8911) and the monitor's (8912/8913). A port that cannot be
+  bound exits 75. The source is the platform's tally controller.
+- On the rising edge of red (LH, or the text tally) on a channel whose shot is cued or
+  paused, the channel plays (the path of `POST /api/v1/control {"action":"play"}`), when
+  `CH<n>_PLAY_ON_TALLY` is true (default; Settings, `POST
+  /api/v1/channels/{n}/play-on-tally {"enable": bool}`, kept in the state directory and
+  the config export). A steady red does not play again; live, playing, ended and idle
+  channels are not touched. Each play logs `tally_play`.
+- Status: `tsl_enable`; per channel `play_on_tally`, `tsl_lh`, `tsl_rh`, `tsl_text_tally`,
+  `tally` (text, else RH, else LH) and `tally_play_ns` (TAI of the last red-light play).
+  Metrics: `tsl_packets_total`, `tsl_errors_total`, `tally_plays_total{channel}`.
+
 ## 9. NMOS
 
 - One Node, one Device; deterministic UUIDv5 IDs from `NMOS_SEED`, including the
@@ -484,6 +508,9 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
 | `PREVIEW_WHEP_URL` / `PREVIEW_HLS_URL` | empty (the own MediaMTX) |
 | `MEDIAMTX_RTSP_PORT` / `_WHEP_PORT` / `_HLS_PORT` / `_ICE_UDP_PORT` | 8854 / 8689 / 8688 / 8489 |
 | `WIDGET_FRAME_ANCESTORS` | `'self'` |
+| `TSL_ENABLE` / `TSL_UDP_PORT` / `TSL_TCP_PORT` | false / 8914 / 8915 (§8.8) |
+| `TSL_SCREEN` / `TSL_MAP` | -1 / empty (display `i` is channel `i+1`) |
+| `CH<n>_PLAY_ON_TALLY` | true |
 
 Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`
 (grains the source wrote that were not recorded; grains it never wrote, before it
@@ -503,7 +530,8 @@ utilisation; per channel `output_resyncs_total` (§5.1) and `interpolation_fallb
 and in WebRTC mode `preview_publish_mode{mode}` (own, shared),
 `preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`,
 `preview_encode_seconds` (histogram: copy, encode, send of one picture) and in own mode
-`preview_mediamtx_restarts_total`. Grafana dashboard in `deploy/grafana/`.
+`preview_mediamtx_restarts_total`; tally `tsl_packets_total`, `tsl_errors_total` and per
+channel `tally_plays_total` (§8.8). Grafana dashboard in `deploy/grafana/`.
 
 Deployment:
 - Pod network; MXL root `hostPath`; **node-pinned** with local NVMe `hostPath` for

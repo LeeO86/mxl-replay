@@ -1,27 +1,25 @@
 <script setup>
-// LSM / edit screen (SPECIFICATION.md §8.2): monitor and cameras on the left, transport, speed
-// and modes on the right, the buffer timeline below.
+// LSM / edit screen (SPECIFICATION.md §8.2): monitor and cameras on the left, transport and speed
+// on the right, the buffer timeline below. The channel modes are in Settings.
 import { computed, onUnmounted, ref, watch } from "vue";
 import ChannelPicker from "./ChannelPicker.vue";
 import CreateClipDialog from "./CreateClipDialog.vue";
 import LivePicture from "./LivePicture.vue";
 import Segmented from "./Segmented.vue";
 import Timeline from "./Timeline.vue";
-import { AUDIO_MODES, fmtNs, fmtSpeed, MOTION_MODES, SPEED_PRESETS } from "../api.js";
+import { fmtNs, fmtSpeed, SPEED_PRESETS } from "../api.js";
 import { keyLabel, keymap } from "../keys.js";
 import {
   active,
   cameraColour,
   cameraLabel,
   cameras,
-  channelPost,
   channelState,
   clipsById,
   marks,
   scrubFrames,
   scrubSeconds,
   setAngle,
-  setMode,
   setSpeed,
   state,
   transport,
@@ -76,13 +74,6 @@ onUnmounted(() => clearTimeout(faderTimer));
 
 const presetOptions = SPEED_PRESETS.map((s) => ({ value: s, label: fmtSpeed(s) }));
 const preset = computed(() => SPEED_PRESETS.find((s) => Math.abs(s - Math.abs(targetSpeed.value)) < 0.005) ?? null);
-const motionOptions = computed(() =>
-  MOTION_MODES.map((m) => ({ ...m, disabled: m.value === "interpolate" && !state.status?.gpu, title: m.value === "interpolate" && !state.status?.gpu ? "needs a GPU: the channel blends instead" : "" })),
-);
-const tcOptions = [
-  { value: "source", label: "Source", title: "the recording time of the frame shown" },
-  { value: "output", label: "Output", title: "the time of day of the output" },
-];
 
 function onMonitorWheel(event) {
   const d = event.deltaY || event.deltaX;
@@ -201,24 +192,6 @@ const recordText = (cam) => (!cam.record ? "OFF" : cam.recording ? "REC" : "NO S
         </div>
         <div style="margin-top: 0.5rem">
           <Segmented :options="presetOptions" :model-value="preset" fullwidth label="Speed preset" @update:model-value="(s) => setSpeed(reverse ? -s : s)" />
-        </div>
-      </div>
-
-      <div class="panel">
-        <h3>Modes</h3>
-        <div class="modes">
-          <span>Motion</span>
-          <Segmented :options="motionOptions" :model-value="active.motion" fullwidth label="Motion" @update:model-value="(motion) => setMode({ motion })" />
-          <span>Audio</span>
-          <Segmented :options="AUDIO_MODES" :model-value="active.audio" fullwidth label="Audio" @update:model-value="(audio) => setMode({ audio })" />
-          <span>Timecode</span>
-          <Segmented :options="tcOptions" :model-value="active.tc_mode" fullwidth label="Timecode" @update:model-value="(timecode) => setMode({ timecode })" />
-          <template v-if="active.index > 1">
-            <span>Lock</span>
-            <button class="btn secondary" :aria-pressed="active.lock" @click="channelPost('lock', { enable: !active.lock })">
-              {{ active.lock ? "Following" : "Follow" }} {{ state.status.channels[0].label }} position
-            </button>
-          </template>
         </div>
       </div>
 

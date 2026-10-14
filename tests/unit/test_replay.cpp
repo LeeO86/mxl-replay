@@ -494,6 +494,17 @@ TEST_CASE("config env overrides the file and unknown env keys are ignored")
     CHECK_THROWS_AS(loadConfig({}, file), ConfigError);
 }
 
+TEST_CASE("default channel labels are LSM A, LSM B, LSM C …")
+{
+    auto const config = loadConfig({{"REPLAY_CHANNELS", "8"}, {"CH4_LABEL", "EVS"}, {"NMOS_HOST_ADDRESS", "10.1.2.3"}}, {}).config;
+    std::vector<std::string> labels;
+    for (auto const& channel : config.channelList)
+    {
+        labels.push_back(channel.label);
+    }
+    CHECK(labels == std::vector<std::string>{"LSM A", "LSM B", "LSM C", "EVS", "LSM E", "LSM F", "LSM G", "LSM H"});
+}
+
 TEST_CASE("nmos ids are deterministic uuid v5 and flows follow the format")
 {
     auto const a = makeNmosIds("host-replay");
@@ -752,6 +763,142 @@ TEST_CASE("engine plays camera audio and an upload made after recording")
     picture.allocate(64, 32);
     unpackV210(played.v210.data(), static_cast<int>(v210RowBytes(64)), picture);
     CHECK(std::abs(static_cast<int>(picture.y[0]) - 700) < 16);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("pause, a clip's end and black fade the audio out to silence, play and live fade it in")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-silence";
+    std::filesystem::remove_all(dir);
+    auto const loaded = loadConfig(
+        {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+            {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+            {"REPLAY_PROTECT_MAX_PCT", "90"}, {"CH1_MOTION", "repeat"}, {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    Engine engine(loaded.config, loaded.flat);
+    engine.openBuffer();
+    std::uint64_t const period = 20000000ull;
+    std::uint64_t const base = 1000 * period;
+    for (int i = 0; i < 60; ++i)
+    {
+        auto const tai = base + static_cast<std::uint64_t>(i) * period;
+        engine.ingestAudio(1, tai, std::vector<float>(960 * 2, 0.5F), 2);
+        Frame10 frame;
+        frame.allocate(64, 32);
+        frame.fill(300, 512, 512);
+        engine.ingestVideo(1, 1, tai, std::move(frame));
+    }
+    // A clip of frames 20–30 (Freeze at its end, the default).
+    engine.setPosition(1, base + 20 * period);
+    engine.markIn(1);
+    engine.setPosition(1, base + 30 * period);
+    engine.markOut(1);
+    std::string error;
+    auto const id = engine.createClip(1, "goal", false, false, error);
+    REQUIRE(error.empty());
+    engine.live(1);
+
+    std::uint64_t at = base + 10 * period;
+    auto next = [&] {
+        auto const out = engine.render(1, at);
+        at += period;
+        REQUIRE(out.audio.size() == 960 * 2);
+        return out.audio;
+    };
+    auto const steady = [](std::vector<float> const& pcm, float level) {
+        return std::all_of(pcm.begin(), pcm.end(), [level](float s) { return s == doctest::Approx(level); });
+    };
+    // The first grain of a fade out runs 1 → 0.5, the next 0.5 → 0, then silence.
+    auto fadesOut = [&](std::vector<float> const& first) {
+        CHECK(first.front() == doctest::Approx(0.5F));
+        CHECK(first.back() == doctest::Approx(0.25F));
+        auto const second = next();
+        CHECK(second.front() == doctest::Approx(0.25F));
+        CHECK(second.back() == doctest::Approx(0.F));
+        CHECK(steady(next(), 0.F));
+        CHECK(steady(next(), 0.F));
+    };
+    auto fadesIn = [&] {
+        auto const first = next();
+        CHECK(first.front() == doctest::Approx(0.F));
+        CHECK(first.back() == doctest::Approx(0.25F));
+        auto const second = next();
+        CHECK(second.front() == doctest::Approx(0.25F));
+        CHECK(second.back() == doctest::Approx(0.5F));
+    };
+    // Renders until a fade out starts (the clip reached OUT).
+    auto untilFadeOut = [&] {
+        for (int i = 0; i < 20; ++i)
+        {
+            auto pcm = next();
+            if (pcm.back() < 0.4F)
+            {
+                return pcm;
+            }
+            CHECK(steady(pcm, 0.5F));
+        }
+        FAIL("the clip did not end");
+        return std::vector<float>{};
+    };
+
+    // Live is unchanged.
+    CHECK(steady(next(), 0.5F));
+    CHECK(steady(next(), 0.5F));
+    // Pause: the frozen frame's samples would repeat; silence after the fade, play fades in.
+    engine.pause(1);
+    fadesOut(next());
+    engine.play(1);
+    fadesIn();
+    CHECK(steady(next(), 0.5F));
+    // A clip that ends on Freeze.
+    engine.playClip(1, id);
+    fadesOut(untilFadeOut());
+    // A clip that ends on Black.
+    auto clip = engine.clip(id);
+    clip.end = EndAction::Black;
+    REQUIRE(engine.updateClip(clip) == ClipEdit::Ok);
+    engine.playClip(1, id);
+    fadesIn();
+    fadesOut(untilFadeOut());
+    // Back to live fades in, then live is the source again.
+    engine.live(1);
+    fadesIn();
+    CHECK(steady(next(), 0.5F));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a pause fades out over the audio that follows the last grain, not over the paused frame again")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-silence-splice";
+    std::filesystem::remove_all(dir);
+    auto const loaded = loadConfig(
+        {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+            {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+            {"CH1_MOTION", "repeat"}, {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    Engine engine(loaded.config, loaded.flat);
+    engine.openBuffer();
+    std::uint64_t const period = 20000000ull;
+    std::uint64_t const base = 1000 * period;
+    for (int i = 0; i < 20; ++i)
+    {
+        auto const tai = base + static_cast<std::uint64_t>(i) * period;
+        engine.ingestAudio(1, tai, std::vector<float>(960 * 2, 0.1F + 0.01F * static_cast<float>(i)), 2);
+        Frame10 frame;
+        frame.allocate(64, 32);
+        frame.fill(300, 512, 512);
+        engine.ingestVideo(1, 1, tai, std::move(frame));
+    }
+    // Live, two frames behind: frame 8. Paused there, the fade reads frames 9 and 10.
+    CHECK(engine.render(1, base + 10 * period).audio.front() == doctest::Approx(0.18F));
+    engine.pause(1);
+    auto const first = engine.render(1, base + 11 * period).audio;
+    CHECK(first.front() == doctest::Approx(0.19F));
+    CHECK(first.back() == doctest::Approx(0.095F));
+    auto const second = engine.render(1, base + 12 * period).audio;
+    CHECK(second.front() == doctest::Approx(0.10F));
+    CHECK(second.back() == doctest::Approx(0.F));
+    CHECK(engine.render(1, base + 13 * period).audio.front() == doctest::Approx(0.F));
     std::filesystem::remove_all(dir);
 }
 

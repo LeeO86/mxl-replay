@@ -31,6 +31,8 @@ struct StretchResult
 
 // Fade from full scale to silence across `fadeFrames` frames. `frameInFade` is 0-based.
 void applyMuteFade(std::vector<float>& interleaved, int frameInFade, int fadeFrames);
+// Fade from silence to full scale across `fadeFrames` frames. `frameInFade` is 0-based.
+void applyFadeIn(std::vector<float>& interleaved, int frameInFade, int fadeFrames);
 
 [[nodiscard]] std::vector<std::uint8_t> writeWav(std::vector<float> const& interleaved, int channels, int sampleRate);
 } // namespace replay

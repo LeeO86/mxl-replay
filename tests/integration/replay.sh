@@ -10,6 +10,8 @@ PORT=${REPLAY_TEST_PORT:-18150}
 NMOS_PORT_VALUE=${REPLAY_TEST_NMOS_PORT:-18152}
 REG_PORT=${REPLAY_TEST_REG_PORT:-18160}
 QUERY_PORT=${REPLAY_TEST_QUERY_PORT:-18161}
+TSL_UDP=${REPLAY_TEST_TSL_UDP_PORT:-18914}
+TSL_TCP=${REPLAY_TEST_TSL_TCP_PORT:-18915}
 PID=""
 REGPID=""
 cleanup() {
@@ -65,6 +67,9 @@ MXL_OUTPUT_DOMAIN_ID=44444444-4444-4444-4444-444444444444 \
 MXL_CLEANUP_ON_EXIT=true \
 SHUTDOWN_TIMEOUT_S=10 \
 HOST_ID=ci-replay \
+TSL_ENABLE=true \
+TSL_UDP_PORT="$TSL_UDP" \
+TSL_TCP_PORT="$TSL_TCP" \
 "$BIN" >"$DIR/log.txt" 2>&1 &
 PID=$!
 
@@ -93,6 +98,40 @@ curl -sf "http://127.0.0.1:${PORT}/api/v1/status" | grep -q cameras
 curl -sf "http://127.0.0.1:${PORT}/api/v1/nmos" | grep -q "$HOST_ADDRESS"
 curl -sf -X POST "http://127.0.0.1:${PORT}/api/v1/channels/1/transport" \
   -H 'content-type: application/json' -d '{"command":"pause"}' | grep -q channels
+# TSL: LH red on display 0 (channel 1) plays the paused channel over UDP; off, pause and red again over TCP.
+tsl() {
+  python3 - "$@" <<'EOF'
+import socket, struct, sys
+proto, port, control = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+packet = struct.pack("<HBBHHHH", 10, 0, 0, 0, 0, control, 0)
+if proto == "udp":
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(packet, ("127.0.0.1", port))
+else:
+    with socket.create_connection(("127.0.0.1", port)) as s:
+        s.sendall(b"\xfe\x02" + packet + b"\xfe\x03")
+EOF
+}
+shot_is() {
+  for _ in $(seq 1 40); do
+    if curl -sf "http://127.0.0.1:${PORT}/api/v1/status" | grep -q "\"shot\":\"$1\""; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  echo "channel 1 is not $1"
+  cat "$DIR/log.txt"
+  return 1
+}
+shot_is paused
+tsl udp "$TSL_UDP" 16
+shot_is playing
+tsl tcp "$TSL_TCP" 0
+curl -sf -X POST "http://127.0.0.1:${PORT}/api/v1/channels/1/transport" \
+  -H 'content-type: application/json' -d '{"command":"pause"}' | grep -q channels
+tsl tcp "$TSL_TCP" 16
+shot_is playing
+curl -sf "http://127.0.0.1:${PORT}/metrics" | grep -q 'mxl_replay_tally_plays_total{channel="1"} 2'
+test "$(grep -c '"tally_play"' "$DIR/log.txt")" = 2
 NODE_ID=$(curl -sf "http://127.0.0.1:${PORT}/api/v1/nmos" | sed -n 's/.*"node_id":"\([^"]*\)".*/\1/p')
 test -n "$NODE_ID"
 if ! grep -q mxl_disabled "$DIR/log.txt"; then

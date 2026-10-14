@@ -11,7 +11,7 @@ The published image also contains the [MediaMTX](https://github.com/bluenviron/m
 ## What it does
 
 - Records up to 12 cameras (default 4) of one house raster (default 1080p50) into a local NVMe ring.
-- Plays one or more channels (default PGM and PVW): scrub, mark in/out, speed ramp, angle switch at the same TAI time, back to live.
+- Plays one or more channels (default labels `LSM A`, `LSM B`): scrub, mark in/out, speed ramp, angle switch at the same TAI time, back to live.
 - Slow motion by `repeat`, `blend`, or `interpolate`.
 - Native high frame rate and phased high frame rate (for example 3 × 50p). Missing phases repeat a neighbour and are counted.
 - Clips, a shotbox, playlists, upload (FFmpeg), and export (JPEG sequence + WAV).
@@ -116,22 +116,28 @@ Process state (the SQLite catalog, imported settings, and IS-05 routes) lives in
 | `MEDIAMTX_WHEP_PORT` / `MEDIAMTX_HLS_PORT` | 8689 / 8688 (own MediaMTX) |
 | `MEDIAMTX_ICE_UDP_PORT` | 8489, WebRTC ICE of the own MediaMTX, UDP and TCP |
 | `WIDGET_FRAME_ANCESTORS` | `'self'`. CSP `frame-ancestors` of the widget pages; `/widgets` answers these origins with CORS |
+| `TSL_ENABLE` | `false`. The TSL UMD 5.0 tally receiver ("Tally" below) |
+| `TSL_UDP_PORT` / `TSL_TCP_PORT` | 8914 / 8915 |
+| `TSL_SCREEN` | -1 (every screen), else only that screen's messages |
+| `TSL_MAP` | empty: display `i` is channel `i+1`. Otherwise `display:channel,…` (channel 1..`REPLAY_CHANNELS`) |
 | `LOG_LEVEL` | `info` |
 | `LOG_FORMAT` | `json` |
 
-Per-camera keys are `CAM1_LABEL`, `CAM1_COLOUR` (alias `CAM1_COLOR`), `CAM1_RECORD`, `CAM1_AUDIO`, `CAM1_PHASES`, `CAM1_HFR_FPS`, `CAM1_BUFFER_HOURS`. Per-channel keys are `CH1_LABEL` (default `PGM`, `PVW`, then `CH3`, `CH4` …), `CH1_IDLE` (`last`, `black`, `e2e`), `CH1_MOTION`, `CH1_AUDIO`, `CH1_TC` (`source` or `output`), `CH1_FLOW`, `CH1_ATMOS`, `CH1_LOCK`.
+Per-camera keys are `CAM1_LABEL`, `CAM1_COLOUR` (alias `CAM1_COLOR`), `CAM1_RECORD`, `CAM1_AUDIO`, `CAM1_PHASES`, `CAM1_HFR_FPS`, `CAM1_BUFFER_HOURS`. Per-channel keys are `CH1_LABEL` (default `LSM A`, `LSM B`, `LSM C` …; until 1.4.1 `PGM`, `PVW`, `CH3` …), `CH1_IDLE` (`last`, `black`, `e2e`), `CH1_MOTION`, `CH1_AUDIO`, `CH1_TC` (`source` or `output`), `CH1_FLOW`, `CH1_ATMOS`, `CH1_LOCK`, `CH1_PLAY_ON_TALLY` (`true`: a red light plays the channel, "Tally" below).
 
-`GET /api/v1/config/export` returns one JSON document (`version`, `settings`, `clips`, `playlists`). `POST /api/v1/config/import` accepts that document. Channel and camera labels and modes apply immediately. Ports, format, counts, the seed, and the domain are stored and take effect on the next start (`restart_required` in the response). IS-05 activations are kept in `REPLAY_STATE_DIR/routes.json` and restored after a restart.
+`GET /api/v1/config/export` returns one JSON document (`version`, `settings`, `clips`, `playlists`). `POST /api/v1/config/import` accepts that document. Channel and camera labels and modes, `CH<n>_PLAY_ON_TALLY`, `TSL_SCREEN` and `TSL_MAP` apply immediately. Ports (`TSL_*` too, and `TSL_ENABLE`), format, counts, the seed, and the domain are stored and take effect on the next start (`restart_required` in the response). IS-05 activations are kept in `REPLAY_STATE_DIR/routes.json` and restored after a restart.
 
 ## Operation
 
 The UI is served on `/`. The pages are tabs with their own address (`/#shotbox`, `#lsm`, `#library`, `#playlists`, `#cameras`, `#nmos`, `#settings`):
 
 - **Shotbox**: one button per clip and playlist. One click cues it (yellow), the next plays it (green, with progress), the next pauses, the next resumes; an ended shot is grey. *Back to live*, speed presets, and the target channel at the top. Keys: 1–9 and 0 select a button of the bank, Enter cues/plays it, Space is play/pause, PgUp/PgDn change the bank.
-- **LSM**: the channel monitor (a JPEG preview five times a second, or the full-motion mosaic in WebRTC mode; full motion is also the WebRTC monitor on the channel output), the cameras (click or 1–9 switches the angle), IN/OUT, Go IN/OUT, frame and second steps, Play/Pause/Live, the speed fader with presets and reverse, motion, audio and timecode mode, lock to the first channel, and the buffer timeline (drag to scrub, wheel ±1 frame, Shift ±1 s). *Create clip* asks for name, all angles, colour and tags.
+- **LSM**: the channel monitor (a JPEG preview five times a second, or the full-motion mosaic in WebRTC mode; full motion is also the WebRTC monitor on the channel output), the cameras (click or 1–9 switches the angle), IN/OUT, Go IN/OUT, frame and second steps, Play/Pause/Live, the speed fader with presets and reverse, and the buffer timeline (drag to scrub, wheel ±1 frame, Shift ±1 s). *Create clip* asks for name, all angles, colour and tags.
 - **Library**: search, the clip inspector (IN/OUT frame by frame, speed, modes, end action, name, colour, tags), export, consolidate, delete, upload.
 - **Playlists**: entries with their own speed, end action and auto-advance; play on the selected channel. When an entry ends with *next*, auto-advance plays the next clip at once, otherwise it is cued and waits for Play.
-- **Cameras**, **NMOS**, **Settings** (configuration export and import, the keyboard map, a WebHID jog/shuttle).
+- **Cameras**, **NMOS**, **Settings** (per channel the motion, audio and timecode mode, lock to the first channel, *Play on red light* and the tally; configuration export and import, the keyboard map, a WebHID jog/shuttle). The modes apply at once and are not kept over a restart (`CH<n>_MOTION`, `CH<n>_AUDIO`, `CH<n>_TC` set them at start); *Play on red light* is kept in `REPLAY_STATE_DIR/config.json`.
+
+A channel that stands still (paused, cued, at a clip's end with *freeze* or *black*, or at speed 0) is silent: its audio fades out over two frames, and fades in over two frames when it plays again or goes live. Before 1.5.0 it repeated the samples of the frame it stood on (a buzz).
 
 The default keys are Space play/pause, I/O mark IN/OUT, Shift+I/O go to IN/OUT, ←/→ one frame, Shift+←/→ one second, ↑/↓ speed ±5 %, L live, C create clip; the Settings page changes them (kept in the browser). WebHID works with a Contour ShuttleXpress, ShuttlePRO or ShuttlePRO v2 in Chrome or Edge, on a secure page (https or localhost): the ring sets the speed and plays, the jog wheel steps frames.
 
@@ -207,9 +213,15 @@ Operator screens (the platform's production designer) frame single controls of t
 
 `GET /widgets` lists them with a JSON schema of their parameters; it answers an `Origin` that `WIDGET_FRAME_ANCESTORS` names (or `*`) with `Access-Control-Allow-Origin`. `GET /widget/<id>?…[&theme=dark|light|transparent]` is the page without the app around it, on the replay's own API; a bad parameter answers 400, an unknown widget 404. Only these routes carry `Content-Security-Policy: frame-ancestors <WIDGET_FRAME_ANCESTORS>` (default `'self'`), and none carries `X-Frame-Options`. The page posts `{type: "widget-ready"}` and `{type: "widget-size", w, h}` to its parent.
 
+## Tally (TSL)
+
+With `TSL_ENABLE=true` the replay receives TSL UMD 5.0 on `TSL_UDP_PORT` (UDP) and `TSL_TCP_PORT` (TCP, DLE/STX framing), as mxl-webrtc-monitor (1.2.0) and mxl-multiviewer do; the platform's tally controller sends it. The ports 8914/8915 are next to the multiviewer's 8910/8911 and the monitor's 8912/8913, so the three can share a host network. A port that cannot be bound exits 75. `TSL_SCREEN` filters the screen; display `i` is channel `i+1` unless `TSL_MAP` maps it (`display:channel,…`).
+
+When a channel's red light comes on (LH or the text tally turns red; RH alone does not) and its shot is *cued* or *paused*, the channel plays, as `POST /api/v1/control {"action":"play"}` does, and `tally_play` is logged. Only the rising edge counts: a red that stays on (the controller repeats it) does not play again after a pause. A live, playing, ended or idle channel is not touched, nor one with `CH<n>_PLAY_ON_TALLY=false` (Settings: *Play on red light*; `POST /api/v1/channels/{n}/play-on-tally {"enable": false}` keeps it in `REPLAY_STATE_DIR/config.json`). The status has `tsl_enable` and per channel `play_on_tally`, `tsl_lh`, `tsl_rh`, `tsl_text_tally`, `tally` (text, else RH, else LH: 0 off, 1 red, 2 green, 3 amber) and `tally_play_ns` (TAI of the last red-light play, 0 never).
+
 ## Metrics
 
-Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, `disk_bytes`, and `record_last_frame_age_seconds`: seconds since the camera's newest recorded frame, counted from the process start at most. It stays below 0.1 s while the camera records and grows when it does not (also when it is not connected or `CAM<n>_RECORD` is off); the status has it per camera as `last_frame_age_s`. Channels report state, speed, and late grains. `frame_gpu_seconds{channel,stage}` is a histogram of GPU time; only `stage="flow"` (one flow computed ahead) is measured. Storage reports `write_bytes_per_second` (what the recorder wrote since the previous scrape, over at least a second: 0 when nothing records), `storage_measured_bytes_per_second` (the write test at start, `storage_bps` in the status), free bytes, and protected bytes. Channels also report `output_resyncs_total`, `flow_cache_hits_total` (grains interpolated with their flow) and `interpolation_fallbacks_total` (grains blended because their flow was not ready, 0 from the start). Previews: `preview_mode{mode}` (jpeg, webrtc) and in WebRTC mode `preview_publish_mode{mode}` (own, shared), `preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`, `preview_encode_seconds` (histogram of one picture's copy, encode and send) and `preview_mediamtx_restarts_total` (own mode). A Grafana dashboard is in `deploy/grafana/`.
+Prefix `mxl_replay_`. Cameras (label `camera`) report `record_frames_total`, `record_dropped_total`, `phase_missing_total`, `storage_write_failed_total`, `protected_bytes`, `disk_bytes`, and `record_last_frame_age_seconds`: seconds since the camera's newest recorded frame, counted from the process start at most. It stays below 0.1 s while the camera records and grows when it does not (also when it is not connected or `CAM<n>_RECORD` is off); the status has it per camera as `last_frame_age_s`. Channels report state, speed, and late grains. `frame_gpu_seconds{channel,stage}` is a histogram of GPU time; only `stage="flow"` (one flow computed ahead) is measured. Storage reports `write_bytes_per_second` (what the recorder wrote since the previous scrape, over at least a second: 0 when nothing records), `storage_measured_bytes_per_second` (the write test at start, `storage_bps` in the status), free bytes, and protected bytes. Channels also report `output_resyncs_total`, `flow_cache_hits_total` (grains interpolated with their flow) and `interpolation_fallbacks_total` (grains blended because their flow was not ready, 0 from the start). Previews: `preview_mode{mode}` (jpeg, webrtc) and in WebRTC mode `preview_publish_mode{mode}` (own, shared), `preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`, `preview_encode_seconds` (histogram of one picture's copy, encode and send) and `preview_mediamtx_restarts_total` (own mode). Tally: `tsl_packets_total`, `tsl_errors_total` (malformed packets; both 0 from the start with `TSL_ENABLE`) and per channel `tally_plays_total` (red-light plays, 0 from the start). A Grafana dashboard is in `deploy/grafana/`.
 
 ## Deploy
 
@@ -238,7 +250,7 @@ docker run --gpus all \
   -v /data/replay:/data/replay \
   -v replay-config:/config \
   -p 8150:8150 -p 3302:3302 -p 3303:3303 \
-  ghcr.io/leeo86/mxl-replay:1.4.1
+  ghcr.io/leeo86/mxl-replay:1.5.0
 ```
 
 The Kubernetes deployment pins the pod to a node with a local NVMe `hostPath` and requests `nvidia.com/gpu: 1` with `runtimeClassName: nvidia`. GPU access uses the NVIDIA runtime class, so the container does not run as root and does not set `hostIPC`. Add `graphics` to `NVIDIA_DRIVER_CAPABILITIES` only if the OFA Vulkan path is enabled later.
@@ -252,6 +264,6 @@ GPU performance targets (concurrent 1080p50 interpolate channels, 2160p50, one h
 | Code | Meaning |
 | --- | --- |
 | 0 | clean shutdown |
-| 75 | temporary failure (storage or state directory, a port that cannot be bound, unexpected error) |
+| 75 | temporary failure (storage or state directory, a port that cannot be bound (TSL ports too), unexpected error) |
 | 78 | configuration, including a buffer that does not fit |
 | 143 | SIGTERM |

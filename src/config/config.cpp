@@ -217,7 +217,7 @@ bool knownIndexed(std::string const& key)
     }
     if (isIndexedKey(key, "CH", &index, &field))
     {
-        static std::vector<std::string> const fields = {"LABEL", "IDLE", "MOTION", "AUDIO", "TC", "FLOW", "ATMOS", "LOCK"};
+        static std::vector<std::string> const fields = {"LABEL", "IDLE", "MOTION", "AUDIO", "TC", "FLOW", "ATMOS", "LOCK", "PLAY_ON_TALLY"};
         return std::find(fields.begin(), fields.end(), field) != fields.end();
     }
     return false;
@@ -361,7 +361,7 @@ std::vector<std::string> configKeys()
         "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "NMOS_DNS_SD", "NMOS_PORT", "NMOS_SEED", "NMOS_LABEL", "NMOS_TAGS", "NMOS_HOST_ADDRESS", "WEB_ENABLE",
         "WEB_PORT", "LOG_LEVEL", "LOG_FORMAT", "REPLAY_CONFIG_FILE", "REPLAY_PREVIEW_MODE", "PREVIEW_PUBLISH_URL", "PREVIEW_PATH_PREFIX",
         "PREVIEW_WHEP_URL", "PREVIEW_HLS_URL", "MEDIAMTX_RTSP_PORT", "MEDIAMTX_WHEP_PORT", "MEDIAMTX_HLS_PORT", "MEDIAMTX_ICE_UDP_PORT",
-        "WIDGET_FRAME_ANCESTORS"};
+        "WIDGET_FRAME_ANCESTORS", "TSL_ENABLE", "TSL_UDP_PORT", "TSL_TCP_PORT", "TSL_SCREEN", "TSL_MAP"};
 }
 
 std::string hostnameString()
@@ -788,7 +788,8 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     {
         ChannelConfig channel;
         channel.index = i;
-        channel.label = take(values, "CH" + std::to_string(i) + "_LABEL", i == 1 ? "PGM" : i == 2 ? "PVW" : "CH" + std::to_string(i));
+        // LSM A, LSM B … (REPLAY_CHANNELS is at most 8).
+        channel.label = take(values, "CH" + std::to_string(i) + "_LABEL", std::string("LSM ") + static_cast<char>('A' + i - 1));
         auto const idle = lower(take(values, "CH" + std::to_string(i) + "_IDLE", "last"));
         if (idle == "black")
         {
@@ -848,7 +849,32 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
         {
             throw ConfigError("CH lock must be a boolean");
         }
+        if (!parseBool(take(values, "CH" + std::to_string(i) + "_PLAY_ON_TALLY", "true"), &channel.playOnTally))
+        {
+            throw ConfigError("CH play on tally must be a boolean");
+        }
         cfg.channelList.push_back(channel);
+    }
+    if (!parseBool(take(values, "TSL_ENABLE", "false"), &cfg.tslEnable))
+    {
+        throw ConfigError("TSL_ENABLE must be a boolean");
+    }
+    cfg.tslUdpPort = parseInt("TSL_UDP_PORT", take(values, "TSL_UDP_PORT", "8914"), 1, 65535);
+    cfg.tslTcpPort = parseInt("TSL_TCP_PORT", take(values, "TSL_TCP_PORT", "8915"), 1, 65535);
+    cfg.tslScreen = parseInt("TSL_SCREEN", take(values, "TSL_SCREEN", "-1"), -1, 65535);
+    cfg.tslMap = take(values, "TSL_MAP", "");
+    // display:channel pairs, display 0..65535, channel 1..REPLAY_CHANNELS.
+    std::stringstream map(cfg.tslMap);
+    std::string item;
+    while (std::getline(map, item, ','))
+    {
+        auto const colon = item.find(':');
+        if (colon == std::string::npos)
+        {
+            throw ConfigError("TSL_MAP entries must look like display:channel");
+        }
+        parseInt("TSL_MAP display", item.substr(0, colon), 0, 65535);
+        parseInt("TSL_MAP channel", item.substr(colon + 1), 1, cfg.channels);
     }
     loaded.flat = values;
     return loaded;
