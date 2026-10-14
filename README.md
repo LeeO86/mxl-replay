@@ -17,7 +17,7 @@ The published image also contains the [MediaMTX](https://github.com/bluenviron/m
 - Clips, a shotbox, playlists, upload (FFmpeg), and export (JPEG sequence + WAV).
 - NMOS IS-04/IS-05 node, REST, WebSocket, and Prometheus metrics on `WEB_PORT` (default 8150).
 - UI previews as JPEG pictures, or as one WebRTC mosaic of every camera and channel encoded once (`REPLAY_PREVIEW_MODE=webrtc`, see "Previews").
-- Operator-screen widgets: `transport` and `clip-list` (see "Widgets").
+- Operator-screen widgets: `transport`, `clip-list`, `playlist-editor`, `playlist-player` and `timeline` (see "Widgets").
 
 ## Storage
 
@@ -149,10 +149,10 @@ HTTP on `WEB_PORT`:
 | GET | `/livez`, `/readyz`, `/statusz`, `/metrics`, `/` |
 | GET | `/api/v1/status`, `/api/v1/config`, `/api/v1/config/export`, `/api/v1/nmos`, `/api/v1/clips`, `/api/v1/playlists`, `/api/v1/playlists/{id}` |
 | GET | `/api/v1/channels/{n}/preview.jpg`, `/api/v1/cameras/{n}/preview.jpg` (JPEG mode), `/api/v1/clips/{id}/thumbnail.jpg`, `/api/v1/preview/map` |
-| GET | `/widgets`, `/widget/transport?channel=<n>`, `/widget/clip-list[?channel=<n>]` (with `&theme=dark\|light\|transparent`) |
+| GET | `/widgets`, `/widget/transport?channel=<n>[&clip=true][&presets=false]`, `/widget/clip-list[?channel=<n>]`, `/widget/playlist-editor[?playlist=<id>]`, `/widget/playlist-player?channel=<n>[&playlist=<id>]`, `/widget/timeline?channel=<n>` (with `&theme=dark\|light\|transparent`) |
 | POST | `/api/v1/channels/{n}/transport` (`command`: `play`, `pause`, `stop`, `live`), `/idle-playlist` (`playlist`: an id, `""` for none), `/speed` (`speed`, −1…2), `/position` (`frames`, `seconds` or `tai_ns`), `/marks` (`which`: `in`, `out`, `goto-in`, `goto-out`), `/angle` (`camera`), `/mode` (`motion`, `audio`, `timecode`: `source` or `output`), `/lock` (`enable`) |
 | POST | `/api/v1/clips` (`channel`, `name`, `all_angles`, `force`, `colour`, `tags`), `/api/v1/clips/{id}/export`, `/api/v1/clips/{id}/consolidate`, `/api/v1/shotbox/{id}` (a clip or playlist; `channel`) |
-| POST | `/api/v1/playlists` (`name`, `clips` or `entries`, `loop`), `/api/v1/playlists/{id}/play` (`channel`), `/api/v1/uploads?name=…` (the file is the body), `/api/v1/config/import`, `/api/v1/control` (`action`: `play`, `pause`, `stop`, `live`, `in`, `out`, `scrub`, `speed`; `channel`) |
+| POST | `/api/v1/playlists` (`name`, `clips` or `entries`, `loop`), `/api/v1/playlists/{id}/play` and `/cue` (`channel`), `/api/v1/uploads?name=…` (the file is the body), `/api/v1/config/import`, `/api/v1/control` (`action`: `play`, `pause`, `stop`, `live`, `in`, `out`, `scrub`, `speed`; `channel`) |
 | PATCH | `/api/v1/clips/{id}` (`name`, `in_ns`, `out_ns`, `speed`, `motion`, `audio`, `end`, `colour`, `tags`, `force`) |
 | PUT | `/api/v1/playlists/{id}` (`name`, `loop`, `entries`: `clip_id`, `speed`, `end`, `auto_advance`) |
 | DELETE | `/api/v1/clips/{id}`, `/api/v1/playlists/{id}` |
@@ -211,8 +211,13 @@ Operator screens (the platform's production designer) frame single controls of t
 | --- | --- | --- | --- |
 | `transport` | `channel` (required) | 480×180 | label, state, timecode; the countdowns to the clip's OUT and the playlist's end; Cue (back to IN, paused), Play/Pause, Stop (the idle playlist), Live (E2E); speed fader 0–200 % and presets |
 | `clip-list` | `channel` (optional: without it a channel picker) | 400×300 | every clip, newest first, with Load (cues it on the channel; then Play, Pause) |
+| `playlist-editor` | `playlist` (optional: without it a playlist picker) | 480×320 | the playlist's entries with speed, end action, up/down and remove; *Add a clip*; every change saved at once |
+| `playlist-player` | `channel` (required), `playlist` (optional: a picker) | 420×200 | the countdown to the playlist's end and the entry playing; Cue (first clip, paused), Play/Pause, Stop, Loop on/off |
+| `timeline` | `channel` (required) | 600×180 | the LSM tab's timeline for the channel (buffer, clip marks, IN/OUT; drag to seek, zoom); IN, OUT, Go IN, Go OUT, ±1 frame, Play/Pause |
 
-`GET /widgets` lists them with a JSON schema of their parameters; it answers an `Origin` that `WIDGET_FRAME_ANCESTORS` names (or `*`) with `Access-Control-Allow-Origin`. `GET /widget/<id>?…[&theme=dark|light|transparent]` is the page without the app around it, on the replay's own API; a bad parameter answers 400, an unknown widget 404. Only these routes carry `Content-Security-Policy: frame-ancestors <WIDGET_FRAME_ANCESTORS>` (default `'self'`), and none carries `X-Frame-Options`. The page posts `{type: "widget-ready"}` and `{type: "widget-size", w, h}` to its parent.
+`transport` takes `clip=true` (IN, OUT, Go IN, Go OUT and Create clip with the automatic name) and `presets=false` (no speed presets); without them it looks as before.
+
+`GET /widgets` lists them with a JSON schema of their parameters (the same list `/widget/<id>` checks); it answers an `Origin` that `WIDGET_FRAME_ANCESTORS` names (or `*`) with `Access-Control-Allow-Origin`. `GET /widget/<id>?…[&theme=dark|light|transparent]` is the page without the app around it, on the replay's own API; a bad parameter answers 400, an unknown widget 404. Only these routes carry `Content-Security-Policy: frame-ancestors <WIDGET_FRAME_ANCESTORS>` (default `'self'`), and none carries `X-Frame-Options`. The page posts `{type: "widget-ready"}` and `{type: "widget-size", w, h}` to its parent.
 
 ## Tally (TSL)
 

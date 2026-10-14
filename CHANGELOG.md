@@ -13,6 +13,9 @@
 - Playlists can loop: `loop` in `POST`/`PUT /api/v1/playlists`, the playlist answers, the catalog (a column added to an existing catalog) and the config export; *Loop* on the Playlists page.
 - Shotbox filter: all, clips or playlists (kept in the browser). A playlist's button stacks the thumbnails of its first three clips; `GET /api/v1/playlists` lists each playlist's `clip_ids`.
 
+- Widgets: `playlist-editor` (a playlist's entries: add a clip, reorder, speed, end action, remove; saved at once; `playlist` or a picker), `playlist-player` (`channel`; pick a playlist or `playlist`; Cue, Play/Pause, Stop, the countdown to its end, Loop on/off) and `timeline` (`channel`; the LSM tab's timeline with seek, clip marks, IN/OUT, Go IN/OUT, ±1 frame). `transport` takes `clip=true` (IN, OUT, Go IN, Go OUT, Create clip) and `presets=false`; its defaults look as before. One list of widgets serves `/widgets` and `/widget/<id>`, which checks every param of it (400) and answers an id not in it with 404.
+- `POST /api/v1/playlists/{id}/cue {"channel"}` cues a playlist's first clip, paused (as `/play` without playing).
+
 ## 1.4.1
 
 - Slow motion in `interpolate` no longer makes a channel late when the GPU is busy. On the platform the replay shared its RTX A4000 with another process, and channel 1 resynced about 24 times a minute (3 grains each, visible downstream): each new pair of source frames had its optical flow computed inside the playout, and one flow took more than two grains. Flows are now computed ahead, by a worker per channel, for the pairs the next 8 grains need (a paused channel: its own pair, and the first pairs of a play); a command (cue, play, speed, angle, mode) starts them at once. The playout never waits for a flow: a grain whose flow is not ready yet is blended. The same flows as before (same kernels, same cache keys); without load steady play at 25 % and 50 % interpolates every grain.
