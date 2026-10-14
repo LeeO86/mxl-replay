@@ -1655,6 +1655,56 @@ TEST_CASE("an idle playlist plays when set, at a clip's end and on stop, and loo
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("a looped playlist wraps at its last entry's freeze or black; return-to-live still wins")
+{
+    auto const dir = freshDir("mxl-replay-loopwrap");
+    auto engine = recordedEngine(dir, 20);
+    auto const clipFrom = [&](int in, int out) {
+        engine->setPosition(1, frameTime(in));
+        engine->markIn(1);
+        engine->setPosition(1, frameTime(out));
+        engine->markOut(1);
+        std::string error;
+        return engine->createClip(1, "", false, false, error);
+    };
+    auto const a = clipFrom(10, 12);
+    auto const b = clipFrom(15, 17);
+    auto const has = [&](std::string const& text) { return engine->statusJson().find(text) != std::string::npos; };
+
+    // Last entry ends on freeze, without auto-advance: with loop on, the list wraps and plays on.
+    auto const wrapped = engine->createPlaylist("wrapped", {PlaylistEntry{a, 1, EndAction::Next, true}, PlaylistEntry{b, 1, EndAction::Freeze, false}});
+    CHECK(call(*engine, "PUT", "/api/v1/playlists/" + wrapped, "{\"loop\":true}").status == 200);
+    engine->playPlaylist(1, wrapped);
+    for (int i = 0; i < 5; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    CHECK(has("\"playlist_index\":0"));
+    CHECK(has("\"playing\":true"));
+
+    // Without loop the same list stops on the freeze.
+    CHECK(call(*engine, "PUT", "/api/v1/playlists/" + wrapped, "{\"loop\":false}").status == 200);
+    engine->playPlaylist(1, wrapped);
+    for (int i = 0; i < 5; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    CHECK(has("\"playlist_index\":1"));
+    CHECK(has("\"playing\":false"));
+
+    // An explicit return-to-live on the last entry still goes live with loop on.
+    auto const toLive = engine->createPlaylist("to-live", {PlaylistEntry{a, 1, EndAction::Next, true}, PlaylistEntry{b, 1, EndAction::ReturnToLive, false}});
+    CHECK(call(*engine, "PUT", "/api/v1/playlists/" + toLive, "{\"loop\":true}").status == 200);
+    engine->playPlaylist(1, toLive);
+    for (int i = 0; i < 5; ++i)
+    {
+        (void)engine->render(1, 0);
+    }
+    CHECK(has("\"live\":true"));
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("a channel with an idle playlist starts with it")
 {
     auto const dir = freshDir("mxl-replay-idle-start");

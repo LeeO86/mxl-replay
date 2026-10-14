@@ -124,6 +124,7 @@ function add() {
           <button class="btn small secondary" :disabled="i === 0" title="Move up" @click="move(i, -1)">↑</button>
           <button class="btn small secondary" :disabled="i === entries.length - 1" title="Move down" @click="move(i, 1)">↓</button>
           <button class="btn small danger" title="Remove from the playlist" @click="remove(i)">✕</button>
+          <span v-if="summary?.loop && i === entries.length - 1 && (e.end === 'freeze' || e.end === 'black')" class="muted small" title="Loop is on: the playlist wraps here">↻ wraps</span>
         </div>
       </div>
       <div class="widget-row">

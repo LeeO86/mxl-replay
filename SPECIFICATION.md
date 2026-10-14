@@ -314,11 +314,13 @@ The flow step (1–5) is a module behind one interface:
   format and stored as JPEG frame sequence + PCM, so they behave exactly like buffer
   clips (any speed, interpolation, frame-accurate).
 - **Playlists**: ordered clips with per-entry speed, end action, auto-advance;
-  next clip preloaded; cut transitions in v1. A playlist can **loop** (1.5.0): after its
+  next clip preloaded; cut transitions in v1. A playlist can **loop** (1.6.0): after its
   last entry it starts again at its first (`loop` in the API, the catalog and the config
-  export).
+  export). With `loop` on, the last playable entry's `freeze` or `black` acts as `next`
+  (the list wraps and plays on); that entry's own `loop` (the clip repeats) and
+  `return-to-live` still apply.
 - End action per clip: `freeze` (default), `black`, `loop`, `next`, `return-to-live`.
-- **Idle playlist** (1.5.0): per channel `CH<n>_IDLE_PLAYLIST` (a playlist id; Settings;
+- **Idle playlist** (1.6.0): per channel `CH<n>_IDLE_PLAYLIST` (a playlist id; Settings;
   `POST /api/v1/channels/{n}/idle-playlist {"playlist": id}`, `""` clears it; kept in the
   state directory and the config export; deleting the playlist clears it). It plays, looped:
   - when it is set (and at start, once the buffer is indexed);
@@ -350,16 +352,16 @@ The flow step (1–5) is a module behind one interface:
 - Nothing else on this screen except: big **Back to live** and **Stop** buttons, speed preset
   buttons, the countdowns, the filter, and a small status line (recording OK, storage, GPU).
 - Keyboard: number keys select buttons, Space play/pause, Enter cue/play.
-- **Countdowns** (1.5.0) for every channel: the playing time to the clip's OUT and to the
+- **Countdowns** (1.6.0) for every channel: the playing time to the clip's OUT and to the
   playlist's end at the speed set (status `clip_remaining_ns`, `playlist_remaining_ns`; null
   when there is nothing to count or the speed never gets there: 0, or an entry that loops).
   The playlist ends after the first entry that does not end with `next`, else after its last
   (looped or idle: the end of this pass); the time an entry waits cued is not counted. The
   countdown turns red under 5 s while the channel plays. Also in the transport widget.
-- **Filter** (1.5.0): all, clips, or playlists (kept in the browser).
-- A playlist's button stacks the thumbnails of its first three clips (1.5.0;
+- **Filter** (1.6.0): all, clips, or playlists (kept in the browser).
+- A playlist's button stacks the thumbnails of its first three clips (1.6.0;
   `GET /api/v1/playlists` gives each playlist's `clip_ids`).
-- **Stop** (1.5.0) next to *Back to live*: the idle playlist (§7).
+- **Stop** (1.6.0) next to *Back to live*: the idle playlist (§7).
 
 ### 8.2 LSM / edit screen
 
@@ -463,7 +465,7 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
   its `default`), a `playlist` a playlist id (`^[A-Za-z0-9._-]{1,64}$`; one that does not
   exist is shown as such, it may be deleted later).
 - `transport` (`channel`, required; `clip`, default false; `presets`, default true;
-  `min_size` 480×180, 480×160 before 1.5.0): one channel's label, state and timecode, the
+  `min_size` 480×180, 480×160 before 1.6.0): one channel's label, state and timecode, the
   countdowns (§8.1), Cue (to its IN, paused), Play / Pause, Stop (§7), Live (E2E), the speed
   fader 0–200 % and, with `presets`, the presets. With `clip`: IN, OUT, Go IN, Go OUT, the
   marks and their length, and Create clip (IN to OUT on the channel's camera with the
