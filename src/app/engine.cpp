@@ -14,7 +14,9 @@
 #include "util/json.hpp"
 #include "util/logging.hpp"
 
+#include <fcntl.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -734,6 +736,13 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     else if (runtime.scheduler.playing)
     {
         runtime.scheduler.step();
+        // The outgoing entry of a transition plays on to its OUT and holds there.
+        if (runtime.mix.active)
+        {
+            runtime.mix.scheduler.step();
+            runtime.mix.scheduler.positionNs = std::min(runtime.mix.scheduler.positionNs, static_cast<std::int64_t>(runtime.mix.outNs));
+        }
+        maybeStartTransition(channel);
     }
     if (!runtime.clipId.empty() && runtime.hasOut && runtime.scheduler.positionNs >= static_cast<std::int64_t>(runtime.outNs) && runtime.scheduler.playing)
     {
@@ -786,7 +795,60 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     bool renderedOnGpu = false;
     // The output grain is this thread's last GPU picture (the preview tile is drawn from it there).
     bool devicePicture = false;
-    if (auto const* ring = ringOf(camera); !runtime.black && cudaFlowAvailable() && ring != nullptr)
+    // A video mix (SPECIFICATION.md §7, 1.7.0): the outgoing entry's and the incoming entry's nearest frames,
+    // blended at the mix weight on the GPU (the blend path without a flow) or on the CPU.
+    bool mixed = false;
+    Frame10 mixPicture;
+    if (runtime.mix.active && runtime.mix.done < runtime.mix.videoFrames && !runtime.black)
+    {
+        int const outCamera = runtime.mix.scheduler.camera;
+        auto const* ringOut = ringOf(outCamera);
+        auto const* ringIn = ringOf(camera);
+        auto const nearest = [&](std::int64_t positionNs, int cam) {
+            auto const p = pickSource(std::max<std::int64_t>(0, positionNs), 0, period, hfrFactor(cam), config_.hfrSnap, MotionMode::Repeat);
+            return static_cast<std::uint64_t>(p.frameA) * sourcePeriod(cam);
+        };
+        auto const taiOut = nearest(runtime.mix.scheduler.positionNs, outCamera);
+        auto const taiIn = nearest(runtime.scheduler.positionNs, camera);
+        double const weight = mixWeight(runtime.mix.done, runtime.mix.videoFrames);
+        bool const gpu = cudaFlowAvailable();
+        if (ringOut != nullptr && ringIn != nullptr)
+        {
+            lock.unlock();
+            auto const storedOut = ringOut->findNearest(taiOut);
+            auto const storedIn = ringIn->findNearest(taiIn);
+            GpuPicture gpuPicture;
+            if (storedOut && storedIn && !storedOut->jpeg.empty() && !storedIn->jpeg.empty())
+            {
+                if (gpu && gpuRenderFromJpeg(storedOut->jpeg.data(), storedOut->jpeg.size(), std::to_string(outCamera) + ":" + std::to_string(storedOut->taiNs),
+                               storedIn->jpeg.data(), storedIn->jpeg.size(), std::to_string(camera) + ":" + std::to_string(storedIn->taiNs),
+                               static_cast<float>(weight), nullptr, config_.format.width, config_.format.height, gpuPicture))
+                {
+                    rendered.v210 = std::move(gpuPicture.v210);
+                    renderedOnGpu = true;
+                    devicePicture = true;
+                    mixed = true;
+                }
+                else
+                {
+                    Frame10 frameIn;
+                    if (decodeJpeg422(storedOut->jpeg.data(), storedOut->jpeg.size(), mixPicture) &&
+                        decodeJpeg422(storedIn->jpeg.data(), storedIn->jpeg.size(), frameIn) && mixPicture.width == frameIn.width &&
+                        mixPicture.height == frameIn.height)
+                    {
+                        blendInto(mixPicture, frameIn, weight);
+                        mixed = true;
+                    }
+                }
+            }
+            lock.lock();
+            if (renderedOnGpu)
+            {
+                runtime.lastV210 = rendered.v210;
+            }
+        }
+    }
+    if (auto const* ring = ringOf(camera); !mixed && !runtime.black && cudaFlowAvailable() && ring != nullptr)
     {
         // Read, decode, interpolate and download without the engine lock, so channels and
         // the recorder do not wait for each other's disk or GPU work.
@@ -828,7 +890,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     // CPU: an exact frame is decoded straight into the output grain; only blends and
     // interpolation need the 16-bit frames, and only they need frame B.
     bool directV210 = false;
-    if (renderedOnGpu)
+    if (renderedOnGpu || mixed)
     {
         foundA = true;
     }
@@ -880,6 +942,14 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             blackFrame = true;
         }
         rendered.black = !renderedOnGpu && (runtime.black || (!foundA && !foundB));
+    }
+    else if (mixed)
+    {
+        exact = false;
+        if (!renderedOnGpu)
+        {
+            picture = std::move(mixPicture);
+        }
     }
     else if (renderedOnGpu || directV210)
     {
@@ -935,7 +1005,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     }
     rendered.positionNs = position;
     rendered.speed = runtime.scheduler.speed;
-    rendered.motion = motionName(exact && motion == MotionMode::Interpolate ? MotionMode::Repeat : motion);
+    rendered.motion = mixed ? "mix" : motionName(exact && motion == MotionMode::Interpolate ? MotionMode::Repeat : motion);
     rendered.exact = exact;
     rendered.camera = camera;
     auto const tcTai = cfg.timecode == TcMode::Source ? position : outputTaiNs;
@@ -954,7 +1024,8 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     // A channel that stands still (paused, cued, at a clip's end, black, or at speed 0) is silent: its position
     // does not move, and its frame's samples repeated every grain are a buzz. Slow motion in `mute` is silent too.
     bool const still = !runtime.liveMode && (!runtime.scheduler.playing || runtime.black || speed <= 0.01);
-    bool const silent = still || (!runtime.liveMode && speed < 0.999 && cfg.audio == AudioMode::Mute);
+    // A playlist entry whose own audio is off is silent too (its aux track plays, 1.7.0).
+    bool const silent = still || (!runtime.liveMode && speed < 0.999 && cfg.audio == AudioMode::Mute) || (!runtime.liveMode && !runtime.ownAudio);
     std::vector<float> pcm(static_cast<std::size_t>(samples) * 2, 0.f);
     if (auto const* ring = ringOf(audioCamera))
     {
@@ -1007,6 +1078,69 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     {
         applyFadeIn(pcm, 2 - runtime.fadeFramesLeft, 2);
         --runtime.fadeFramesLeft;
+    }
+    // The audio crossfade of a transition (equal power): the outgoing entry's audio at its own position, faded out
+    // under the incoming's. A channel that stops ends it with a one-grain fade.
+    bool outgoingAudible = false;
+    if (runtime.mix.active && runtime.mix.audioSamples < runtime.mix.audioTotal)
+    {
+        auto& mix = runtime.mix;
+        double const outSpeed = std::fabs(mix.scheduler.speed);
+        bool const outMuted = !mix.ownAudio || (outSpeed < 0.999 && mix.audio == AudioMode::Mute);
+        std::vector<float> outPcm(pcm.size(), 0.f);
+        int const outAudioCamera = cfg.atmosCamera > 0 ? cfg.atmosCamera : mix.scheduler.camera;
+        if (auto const* ring = ringOf(outAudioCamera); ring != nullptr && !outMuted)
+        {
+            auto const house = static_cast<std::uint64_t>(std::max<std::int64_t>(1, period));
+            auto const outPosition = static_cast<std::uint64_t>(std::max<std::int64_t>(0, mix.scheduler.positionNs));
+            auto at = (outPosition + house / 2) / house * house;
+            // Held at its OUT: the audio after it, not the same frame again.
+            if (mix.audioNs != 0 && at <= mix.audioNs)
+            {
+                at = mix.audioNs + house;
+            }
+            mix.audioNs = at;
+            lock.unlock();
+            auto audio = ring->findNearestAudio(at);
+            lock.lock();
+            if (!audio.empty())
+            {
+                audio.resize(outPcm.size(), 0.f);
+                outPcm = std::move(audio);
+            }
+            if (outSpeed < 0.999 && mix.audio == AudioMode::Stretch)
+            {
+                outPcm = timeStretch(outPcm, 2, outSpeed).samples;
+                outPcm.resize(pcm.size(), 0.f);
+            }
+            else if (outSpeed < 0.999 && mix.audio == AudioMode::Follow)
+            {
+                outPcm = resampleLinear(outPcm, 2, outSpeed);
+                outPcm.resize(pcm.size(), 0.f);
+            }
+        }
+        if (still)
+        {
+            applyMuteFade(outPcm, 0, 1);
+        }
+        std::size_t const frames = pcm.size() / 2;
+        for (std::size_t i = 0; i < frames; ++i)
+        {
+            auto const gains = still ? CrossfadeGains{1.f, 1.f} : crossfadeGains(mix.audioSamples + static_cast<std::int64_t>(i), mix.audioTotal);
+            pcm[2 * i] = pcm[2 * i] * gains.in + outPcm[2 * i] * gains.out;
+            pcm[2 * i + 1] = pcm[2 * i + 1] * gains.in + outPcm[2 * i + 1] * gains.out;
+        }
+        mix.audioSamples = still ? mix.audioTotal : mix.audioSamples + static_cast<std::int64_t>(frames);
+        outgoingAudible = !outMuted;
+    }
+    mixAux(channel, lock, pcm, still, !silent || outgoingAudible, outputTaiNs);
+    if (runtime.mix.active && runtime.scheduler.playing)
+    {
+        ++runtime.mix.done;
+        if (runtime.mix.done >= std::max(runtime.mix.videoFrames, runtime.mix.audioFrames) && runtime.mix.audioSamples >= runtime.mix.audioTotal)
+        {
+            runtime.mix.active = false;
+        }
     }
     rendered.audio = std::move(pcm);
     metrics_.set("channel_speed", {{"channel", std::to_string(channel)}}, runtime.scheduler.speed);
@@ -1228,6 +1362,7 @@ bool Engine::startIdle(int channel)
     runtime.playlistId = list.id;
     runtime.playlistIndex = first;
     cueClip(channel, clip, &list.entries[static_cast<std::size_t>(first)]);
+    runtime.auxRestart = true;
     runtime.idle = true;
     runtime.scheduler.playing = true;
     runtime.shot.clipId = list.id;
@@ -1337,6 +1472,7 @@ void Engine::goLive(ChannelRuntime& runtime)
     runtime.liveMode = true;
     runtime.black = false;
     runtime.idle = false;
+    runtime.mix.active = false;
     runtime.scheduler.playing = false;
     if (runtime.scheduler.camera == kLibraryCamera)
     {
@@ -1673,6 +1809,7 @@ std::string Engine::createClip(int channel, std::string const& name, bool allAng
         clip.end = EndAction::Freeze;
         clip.groupId = allAngles ? group : "";
         catalog_.upsertClip(clip);
+        ++catalogVersion_;
         if (auto* ring = ringOf(camera))
         {
             ring->protect(clip.inNs, clip.outNs);
@@ -1728,6 +1865,7 @@ ClipEdit Engine::updateClip(ClipRef clip, bool force)
         }
     }
     catalog_.upsertClip(clip);
+    ++catalogVersion_;
     if (moved && holdsRange(existing))
     {
         // The new range first: frames both ranges share stay protected throughout.
@@ -1754,6 +1892,7 @@ bool Engine::deleteClip(std::string const& id)
             return false;
         }
         catalog_.deleteClip(id);
+        ++catalogVersion_;
         // A consolidated clip released its range already; releasing it again could remove
         // another clip's identical range.
         ring = holdsRange(clip) ? ringOf(clip.camera) : nullptr;
@@ -1788,6 +1927,8 @@ void Engine::cueClip(int channel, ClipRef const& clip, PlaylistEntry const* entr
     runtime.liveMode = false;
     runtime.black = false;
     runtime.idle = false;
+    runtime.mix.active = false;
+    runtime.ownAudio = entry == nullptr || entry->ownAudio;
     runtime.clipId = clip.id;
     runtime.hasIn = true;
     runtime.hasOut = true;
@@ -1864,12 +2005,13 @@ ShotState Engine::shotClick(int channel, std::string const& id)
         runtime.playlistId = first >= 0 ? id : std::string{};
         runtime.playlistIndex = first;
         cueClip(channel, clip, first >= 0 ? &list.entries[static_cast<std::size_t>(first)] : nullptr);
+        runtime.auxRestart = true;
         runtime.scheduler.playing = state == ShotState::Playing;
     }
     return runtime.shot.state;
 }
 
-std::string Engine::createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries, bool loop)
+std::string Engine::createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries, bool loop, AuxTrack const& aux)
 {
     std::lock_guard lock{mutex_};
     Catalog::Playlist playlist;
@@ -1877,7 +2019,9 @@ std::string Engine::createPlaylist(std::string const& name, std::vector<Playlist
     playlist.name = name.empty() ? playlist.id : name;
     playlist.entries = entries;
     playlist.loop = loop;
+    playlist.aux = aux;
     catalog_.upsertPlaylist(playlist);
+    ++catalogVersion_;
     return playlist.id;
 }
 
@@ -1894,6 +2038,7 @@ bool Engine::updatePlaylist(Catalog::Playlist const& playlist)
         stored.name = stored.id;
     }
     catalog_.upsertPlaylist(stored);
+    ++catalogVersion_;
     // A channel playing the playlist stays on its entry: the same clip nearest its old place,
     // else the same place (or the last entry).
     int const size = static_cast<int>(stored.entries.size());
@@ -1929,6 +2074,7 @@ bool Engine::deletePlaylist(std::string const& id)
         return false;
     }
     catalog_.deletePlaylist(id);
+    ++catalogVersion_;
     // A channel whose idle playlist it was has none any more.
     bool changed = false;
     for (std::size_t i = 0; i < channels_.size(); ++i)
@@ -1983,6 +2129,7 @@ void Engine::playPlaylist(int channel, std::string const& id, bool play)
     runtime.playlistId = id;
     runtime.playlistIndex = first;
     cueClip(channel, clip, &list.entries[static_cast<std::size_t>(first)]);
+    runtime.auxRestart = true;
     runtime.scheduler.playing = play;
     runtime.shot.clipId = id;
     runtime.shot.state = play ? ShotState::Playing : ShotState::Cued;
@@ -1991,6 +2138,45 @@ void Engine::playPlaylist(int channel, std::string const& id, bool play)
 std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::string const& name, std::string& error)
 {
     auto converted = convertUpload(data, size, config_.format);
+    if (converted.frames.empty() && converted.audioOnly && !converted.audio.empty())
+    {
+        // An audio item (1.7.0): 48 kHz stereo float, written to a file of the library and read per grain.
+        std::lock_guard serial{uploadMutex_};
+        std::string id;
+        {
+            std::lock_guard lock{mutex_};
+            id = std::string(kAudioItemPrefix) + std::to_string(clipSerial_++);
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(libraryDir_ + "/audio", ec);
+        auto const path = audioItemPath(id);
+        {
+            std::ofstream file(path + ".tmp", std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<char const*>(converted.audio.data()), static_cast<std::streamsize>(converted.audio.size() * sizeof(float)));
+            if (!file)
+            {
+                error = "audio could not be stored";
+                std::filesystem::remove(path + ".tmp", ec);
+                return {};
+            }
+        }
+        std::filesystem::rename(path + ".tmp", path, ec);
+        if (ec)
+        {
+            error = "audio could not be stored";
+            return {};
+        }
+        Catalog::AudioItem item;
+        item.id = id;
+        item.name = name.empty() ? id : name;
+        item.samples = static_cast<std::int64_t>(converted.audio.size() / 2);
+        item.createdNs = taiNowNs();
+        std::lock_guard lock{mutex_};
+        catalog_.upsertAudioItem(item);
+        ++catalogVersion_;
+        error.clear();
+        return id;
+    }
     if (converted.frames.empty())
     {
         error = converted.error.empty() ? "upload failed" : converted.error;
@@ -2045,7 +2231,67 @@ std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::stri
     clip.library = true;
     clip.end = EndAction::Freeze;
     catalog_.upsertClip(clip);
+    ++catalogVersion_;
     return clip.id;
+}
+
+bool Engine::auxSourceExists(std::string const& source) const
+{
+    std::lock_guard lock{mutex_};
+    if (source.empty())
+    {
+        return true;
+    }
+    return source.rfind(kAudioItemPrefix, 0) == 0 ? !catalog_.audioItem(source).id.empty() : !catalog_.clip(source).id.empty();
+}
+
+std::vector<Catalog::AudioItem> Engine::audioItems() const
+{
+    std::lock_guard lock{mutex_};
+    return catalog_.audioItems();
+}
+
+Catalog::AudioItem Engine::audioItem(std::string const& id) const
+{
+    std::lock_guard lock{mutex_};
+    return catalog_.audioItem(id);
+}
+
+bool Engine::renameAudioItem(std::string const& id, std::string const& name)
+{
+    std::lock_guard lock{mutex_};
+    auto item = catalog_.audioItem(id);
+    if (item.id.empty())
+    {
+        return false;
+    }
+    item.name = name;
+    catalog_.upsertAudioItem(item);
+    ++catalogVersion_;
+    return true;
+}
+
+bool Engine::deleteAudioItem(std::string const& id)
+{
+    std::lock_guard lock{mutex_};
+    if (catalog_.audioItem(id).id.empty())
+    {
+        return false;
+    }
+    catalog_.deleteAudioItem(id);
+    // The playlists that used it lose their aux track.
+    for (auto playlist : catalog_.playlists())
+    {
+        if (playlist.aux.source == id)
+        {
+            playlist.aux.source.clear();
+            catalog_.upsertPlaylist(playlist);
+        }
+    }
+    ++catalogVersion_;
+    std::error_code ec;
+    std::filesystem::remove(audioItemPath(id), ec);
+    return true;
 }
 
 std::string Engine::exportClip(std::string const& id, std::string& error)
@@ -2110,6 +2356,7 @@ bool Engine::consolidate(std::string const& id, std::string& error)
     }
     clip.library = true;
     catalog_.upsertClip(clip);
+    ++catalogVersion_;
     if (clip.camera >= 1 && clip.camera <= static_cast<int>(cameras_.size()))
     {
         cameras_[static_cast<std::size_t>(clip.camera - 1)].ring.unprotect(clip.inNs, clip.outNs);
@@ -2283,9 +2530,9 @@ std::string Engine::exportConfigJson() const
             }
             entryFirst = false;
             out << "{\"clip_id\":\"" << jsonEscape(entry.clipId) << "\",\"speed\":" << entry.speed << ",\"end\":\"" << endActionName(entry.end)
-                << "\",\"auto_advance\":" << (entry.autoAdvance ? "true" : "false") << '}';
+                << "\",\"auto_advance\":" << (entry.autoAdvance ? "true" : "false") << ',' << entryTransitionJson(entry) << '}';
         }
-        out << "]}";
+        out << "],\"aux\":" << auxJson(playlist.aux) << '}';
     }
     out << "]}";
     return out.str();
@@ -2404,6 +2651,7 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             // releases its own (after: frames both ranges share stay protected).
             auto const previous = catalog_.clip(clip.id);
             catalog_.upsertClip(clip);
+            ++catalogVersion_;
             if (auto* ring = holdsRange(clip) ? ringOf(clip.camera) : nullptr)
             {
                 ring->protect(clip.inNs, clip.outNs);
@@ -2440,9 +2688,26 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
                 }
                 field = entryItem.get("auto_advance");
                 entry.autoAdvance = field == nullptr || jsonBool(*field).value_or(true);
+                // Transition fields that do not read keep their defaults (as the other entry fields).
+                std::string ignored;
+                auto copy = entry;
+                if (readEntryTransition(entryItem, copy, ignored))
+                {
+                    entry = copy;
+                }
                 playlist.entries.push_back(entry);
             }
+            if (auto const* aux = item.get("aux"))
+            {
+                std::string ignored;
+                auto copy = playlist.aux;
+                if (readAux(*aux, copy, ignored))
+                {
+                    playlist.aux = copy;
+                }
+            }
             catalog_.upsertPlaylist(playlist);
+            ++catalogVersion_;
         }
         continueSerial();
         result.ok = true;
@@ -2678,6 +2943,317 @@ std::uint64_t Engine::freeBytes() const
     return static_cast<std::uint64_t>(st.f_bavail) * static_cast<std::uint64_t>(st.f_frsize);
 }
 
+Catalog::Playlist const& Engine::currentPlaylist(int channel)
+{
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    auto const key = runtime.playlistId + "#" + std::to_string(catalogVersion_);
+    if (key != runtime.planKey)
+    {
+        runtime.planKey = key;
+        runtime.plan = runtime.playlistId.empty() ? Catalog::Playlist{} : findPlaylist(catalog_, runtime.playlistId);
+    }
+    return runtime.plan;
+}
+
+void Engine::maybeStartTransition(int channel)
+{
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    if (runtime.mix.active || runtime.liveMode || runtime.black || !runtime.scheduler.playing || runtime.playlistId.empty() || runtime.clipId.empty() ||
+        !runtime.hasOut)
+    {
+        return;
+    }
+    auto const period = runtime.scheduler.framePeriodNs;
+    double const speed = runtime.scheduler.speed;
+    auto const position = runtime.scheduler.positionNs;
+    auto const out = static_cast<std::int64_t>(runtime.outNs);
+    if (speed < kMinClipSpeed || period <= 0 || position >= out)
+    {
+        return; // at OUT finishClip cuts
+    }
+    // The grains that still show the outgoing entry, this one included.
+    auto const left = static_cast<std::int64_t>(std::ceil(static_cast<double>(out - position) / (speed * static_cast<double>(period))));
+    if (left > kMaxTransitionFrames)
+    {
+        return;
+    }
+    auto const list = currentPlaylist(channel);
+    int const index = runtime.playlistIndex;
+    if (list.id.empty() || index < 0 || index >= static_cast<int>(list.entries.size()))
+    {
+        return;
+    }
+    auto const& entry = list.entries[static_cast<std::size_t>(index)];
+    auto const exists = [&](int i) { return !catalog_.clip(list.entries[static_cast<std::size_t>(i)].clipId).id.empty(); };
+    // The entry finishClip plays next: the idle playlist plays every entry on; otherwise `next` (or a looped
+    // playlist's wrap) with auto-advance.
+    int next = -1;
+    if (runtime.idle)
+    {
+        std::vector<bool> present;
+        for (int i = 0; i < static_cast<int>(list.entries.size()); ++i)
+        {
+            present.push_back(exists(i));
+        }
+        next = idleNext(present, index);
+    }
+    else
+    {
+        int later = playlistNext(list.entries, index);
+        while (later >= 0 && !exists(later))
+        {
+            later = playlistNext(list.entries, later);
+        }
+        bool const wraps = list.loop && later < 0 && (entry.end == EndAction::Freeze || entry.end == EndAction::Black);
+        bool const advances = (entry.end == EndAction::Next && entry.autoAdvance) || wraps;
+        if (!advances)
+        {
+            return;
+        }
+        next = later;
+        if (next < 0 && list.loop)
+        {
+            ClipRef first;
+            next = firstPlayable(catalog_, list, first);
+        }
+    }
+    if (next < 0)
+    {
+        return;
+    }
+    auto const plan = transitionPlan(list.entries[static_cast<std::size_t>(next)]);
+    if (plan.length() == 0 || left > plan.length())
+    {
+        return;
+    }
+    auto const& cfg = config_.channelList[static_cast<std::size_t>(channel - 1)];
+    ChannelRuntime::Mix mix;
+    mix.scheduler = runtime.scheduler;
+    mix.outNs = runtime.outNs;
+    mix.videoFrames = plan.videoFrames;
+    mix.audioFrames = plan.audioFrames;
+    mix.audioTotal = static_cast<std::int64_t>(std::llround(static_cast<double>(plan.audioFrames) * 48000.0 * config_.format.rateDen / config_.format.rateNum));
+    mix.ownAudio = runtime.ownAudio;
+    mix.audio = cfg.audio;
+    mix.audioNs = runtime.audioNs;
+    auto const outgoingClip = runtime.clipId;
+    finishClip(channel);
+    if (runtime.playlistIndex != next || !runtime.scheduler.playing || runtime.liveMode)
+    {
+        return;
+    }
+    mix.active = true;
+    runtime.mix = mix;
+    metrics_.inc("transitions_total", {{"channel", std::to_string(channel)}, {"kind", plan.videoFrames > 0 ? "mix" : "cut"}});
+    logInfo("transition", {{"channel", std::to_string(channel)}, {"playlist", runtime.playlistId}, {"from", outgoingClip}, {"to", runtime.clipId},
+                              {"frames", std::to_string(plan.videoFrames)}, {"audio_frames", std::to_string(plan.audioFrames)}});
+}
+
+std::string Engine::audioItemPath(std::string const& id) const
+{
+    return libraryDir_ + "/audio/" + id + ".f32";
+}
+
+std::int64_t Engine::auxLength(std::string const& source) const
+{
+    if (source.rfind(kAudioItemPrefix, 0) == 0)
+    {
+        return catalog_.audioItem(source).samples;
+    }
+    auto const clip = catalog_.clip(source);
+    if (clip.id.empty() || clip.outNs < clip.inNs)
+    {
+        return 0;
+    }
+    auto const period = static_cast<std::uint64_t>(framePeriodNs(config_.format.rateNum, config_.format.rateDen));
+    auto const first = clip.inNs / period;
+    auto const frames = (clip.outNs - clip.inNs) / period + 1;
+    return static_cast<std::int64_t>(audioSamplesUntil(first + frames, config_.format.rateNum, config_.format.rateDen) -
+                                     audioSamplesUntil(first, config_.format.rateNum, config_.format.rateDen));
+}
+
+std::vector<float> Engine::readAuxSamples(std::string const& source, ClipRef const& clip, std::int64_t position, std::int64_t count) const
+{
+    // Called without the engine lock: the caller read the clip from the catalog; the rings have their own lock.
+    std::vector<float> out(static_cast<std::size_t>(std::max<std::int64_t>(0, count)) * 2, 0.f);
+    if (count <= 0 || position < 0)
+    {
+        return out;
+    }
+    if (source.rfind(kAudioItemPrefix, 0) == 0)
+    {
+        auto const path = audioItemPath(source);
+        int const fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0)
+        {
+            auto const bytes = static_cast<std::size_t>(count) * 2 * sizeof(float);
+            auto const got = ::pread(fd, out.data(), bytes, static_cast<off_t>(position) * 2 * static_cast<off_t>(sizeof(float)));
+            (void)got; // a short read leaves zeros
+            ::close(fd);
+        }
+        return out;
+    }
+    auto const* ring = clip.id.empty() ? nullptr : ringOf(clip.camera);
+    if (ring == nullptr)
+    {
+        return out;
+    }
+    // The clip's frames carry the audio of their house frame (audioSamplesForFrame); sample frame `s` of the clip
+    // is in clip frame f with U(f) <= s < U(f+1), U counted from the clip's IN frame.
+    auto const num = config_.format.rateNum;
+    auto const den = config_.format.rateDen;
+    auto const period = static_cast<std::uint64_t>(framePeriodNs(num, den));
+    auto const first = clip.inNs / period;
+    auto const until = [&](std::int64_t f) {
+        return static_cast<std::int64_t>(audioSamplesUntil(first + static_cast<std::uint64_t>(f), num, den) - audioSamplesUntil(first, num, den));
+    };
+    auto const frames = static_cast<std::int64_t>((clip.outNs - clip.inNs) / period + 1);
+    auto f = static_cast<std::int64_t>(static_cast<double>(position) * num / (48000.0 * den));
+    while (f > 0 && until(f) > position)
+    {
+        --f;
+    }
+    while (until(f + 1) <= position)
+    {
+        ++f;
+    }
+    std::int64_t done = 0;
+    while (done < count && f < frames)
+    {
+        auto const start = until(f);
+        auto const size = until(f + 1) - start;
+        auto const audio = ring->findNearestAudio(clip.inNs + static_cast<std::uint64_t>(f) * period);
+        for (auto s = position + done - start; s < size && done < count; ++s, ++done)
+        {
+            auto const i = static_cast<std::size_t>(s) * 2;
+            auto const o = static_cast<std::size_t>(done) * 2;
+            out[o] = i < audio.size() ? audio[i] : 0.f;
+            out[o + 1] = i + 1 < audio.size() ? audio[i + 1] : 0.f;
+        }
+        ++f;
+    }
+    return out;
+}
+
+void Engine::mixAux(int channel, std::unique_lock<std::recursive_mutex>& lock, std::vector<float>& pcm, bool still, bool ownAudible, std::uint64_t outputTaiNs)
+{
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    auto const& list = currentPlaylist(channel);
+    bool const onList = !runtime.liveMode && !runtime.playlistId.empty() && !list.id.empty() && !list.aux.source.empty();
+    if (onList && (runtime.auxPlaylist != list.id || runtime.auxRestart || runtime.aux.source != list.aux.source))
+    {
+        // A playlist that starts (or another aux source): the aux starts at its beginning, faded in.
+        runtime.auxPlaylist = list.id;
+        runtime.auxPosition = 0;
+        runtime.auxRun = 0;
+        runtime.duck = {};
+    }
+    runtime.auxRestart = false;
+    if (onList)
+    {
+        runtime.aux = list.aux;
+    }
+    bool const wanted = onList && !still;
+    if ((!wanted && runtime.auxRun <= 0) || runtime.aux.source.empty())
+    {
+        runtime.auxRun = 0;
+        runtime.auxGainDb = -120;
+        if (!onList)
+        {
+            runtime.auxPlaylist.clear();
+        }
+        return;
+    }
+    auto const aux = runtime.aux;
+    auto const length = auxLength(aux.source);
+    auto const clip = aux.source.rfind(kAudioItemPrefix, 0) == 0 ? ClipRef{} : catalog_.clip(aux.source);
+    // The time to the playlist's end (its countdown) for the end fade: none when it does not end.
+    std::int64_t remaining = -1;
+    if (aux.fadeOutFrames > 0 && onList)
+    {
+        std::int64_t clipLeft = -1;
+        remaining = countdowns(runtime, list, clipLeft);
+    }
+    auto const fadeNs = static_cast<std::int64_t>(aux.fadeOutFrames) * framePeriodNs(config_.format.rateNum, config_.format.rateDen);
+    auto const frames = static_cast<std::int64_t>(pcm.size() / 2);
+    auto position = runtime.auxPosition;
+    lock.unlock();
+    // The samples of this grain, from the source's start again when it loops.
+    std::vector<float> samples(pcm.size(), 0.f);
+    std::vector<std::int64_t> where(static_cast<std::size_t>(frames), -1);
+    std::int64_t done = 0;
+    while (done < frames && length > 0 && (position < length || aux.loop))
+    {
+        if (position >= length)
+        {
+            position = 0;
+        }
+        auto const n = std::min(frames - done, length - position);
+        auto const part = readAuxSamples(aux.source, clip, position, n);
+        std::copy(part.begin(), part.end(), samples.begin() + done * 2);
+        for (std::int64_t i = 0; i < n; ++i)
+        {
+            where[static_cast<std::size_t>(done + i)] = position + i;
+        }
+        done += n;
+        position += n;
+    }
+    lock.lock();
+    auto& rt = channels_[static_cast<std::size_t>(channel - 1)];
+    double const level = dbToGain(aux.levelDb);
+    double const runStep = 1.0 / (2.0 * static_cast<double>(std::max<std::int64_t>(1, frames)));
+    double const attack = aux.attackMs * 48.0;
+    double const release = aux.releaseMs * 48.0;
+    double duckGain = 1;
+    double end = 1;
+    for (std::int64_t i = 0; i < frames; ++i)
+    {
+        rt.auxRun = wanted ? std::min(1.0, rt.auxRun + runStep) : std::max(0.0, rt.auxRun - runStep);
+        duckGain = rt.duck.next(ownAudible, aux.duckDb, attack, release);
+        end = endFadeGain(remaining < 0 ? -1 : std::max<std::int64_t>(0, remaining - i * 1000000000 / 48000), fadeNs);
+        auto const at = where[static_cast<std::size_t>(i)];
+        double const edge = at < 0 ? 0.0 : edgeGain(at, length);
+        auto const gain = static_cast<float>(level * duckGain * end * edge * rt.auxRun);
+        pcm[static_cast<std::size_t>(2 * i)] += samples[static_cast<std::size_t>(2 * i)] * gain;
+        pcm[static_cast<std::size_t>(2 * i + 1)] += samples[static_cast<std::size_t>(2 * i + 1)] * gain;
+    }
+    rt.auxPosition = aux.loop && length > 0 ? position % length : std::min(position, length);
+    double const steady = level * duckGain * end;
+    rt.auxGainDb = steady > 1e-6 ? 20.0 * std::log10(steady) : -120;
+    (void)outputTaiNs;
+}
+
+std::int64_t Engine::countdowns(ChannelRuntime const& channel, Catalog::Playlist const& list, std::int64_t& clipLeft) const
+{
+    clipLeft = -1;
+    std::int64_t listLeft = -1;
+    bool const onClip = !channel.liveMode && !channel.clipId.empty() && channel.hasOut;
+    if (onClip)
+    {
+        clipLeft = channel.shot.state == ShotState::Ended || channel.black ? 0 : remainingNs(channel.scheduler.positionNs, channel.outNs, channel.scheduler.targetSpeed);
+    }
+    if (onClip && !list.id.empty())
+    {
+        auto entries = list.entries;
+        std::vector<std::int64_t> lengths;
+        for (auto& entry : entries)
+        {
+            // The idle playlist plays every entry on.
+            if (channel.idle)
+            {
+                entry.end = EndAction::Next;
+            }
+            auto const clip = catalog_.clip(entry.clipId);
+            lengths.push_back(clip.id.empty() ? -1 : remainingNs(static_cast<std::int64_t>(clip.inNs), clip.outNs, entry.speed));
+        }
+        // An ended shot (stopped, or the playlist's last clip at its end) has nothing left.
+        listLeft = clipLeft == 0 && channel.shot.state == ShotState::Ended
+                       ? 0
+                       : playlistRemainingNs(entries, lengths, channel.playlistIndex, clipLeft, framePeriodNs(config_.format.rateNum, config_.format.rateDen));
+    }
+    return listLeft;
+}
+
 std::string Engine::statusJson() const
 {
     std::lock_guard lock{mutex_};
@@ -2751,30 +3327,29 @@ std::string Engine::statusJson() const
         // Shotbox countdowns (SPECIFICATION.md §8.1): playing time to OUT and to the playlist's end at the speed set; null
         // without a clip, or when the speed never gets there.
         std::int64_t clipLeft = -1;
-        std::int64_t listLeft = -1;
         bool const onClip = !channel.liveMode && !channel.clipId.empty() && channel.hasOut;
-        if (onClip)
-        {
-            clipLeft = channel.shot.state == ShotState::Ended || channel.black ? 0
-                                                                                 : remainingNs(channel.scheduler.positionNs, channel.outNs, channel.scheduler.targetSpeed);
-        }
         auto const list = onClip && !channel.playlistId.empty() ? findPlaylist(catalog_, channel.playlistId) : Catalog::Playlist{};
-        if (!list.id.empty())
+        std::int64_t const listLeft = countdowns(channel, list, clipLeft);
+        // A transition into the current entry (1.7.0) and the aux track.
+        out << ",\"own_audio\":" << (channel.ownAudio ? "true" : "false") << ",\"transition\":";
+        if (channel.mix.active)
         {
-            auto entries = list.entries;
-            std::vector<std::int64_t> lengths;
-            for (auto& entry : entries)
-            {
-                // The idle playlist plays every entry on.
-                if (channel.idle)
-                {
-                    entry.end = EndAction::Next;
-                }
-                auto const clip = catalog_.clip(entry.clipId);
-                lengths.push_back(clip.id.empty() ? -1 : remainingNs(static_cast<std::int64_t>(clip.inNs), clip.outNs, entry.speed));
-            }
-            // An ended shot (stopped, or the playlist's last clip at its end) has nothing left.
-            listLeft = clipLeft == 0 && channel.shot.state == ShotState::Ended ? 0 : playlistRemainingNs(entries, lengths, channel.playlistIndex, clipLeft);
+            out << "{\"kind\":\"" << (channel.mix.videoFrames > 0 ? "mix" : "cut") << "\",\"frames\":" << channel.mix.videoFrames
+                << ",\"audio_frames\":" << channel.mix.audioFrames << ",\"done\":" << channel.mix.done << '}';
+        }
+        else
+        {
+            out << "null";
+        }
+        out << ",\"aux\":";
+        if (!channel.auxPlaylist.empty() && channel.auxRun > 0 && !channel.aux.source.empty())
+        {
+            out << "{\"source\":" << jsonString(channel.aux.source) << ",\"gain_db\":" << std::round(channel.auxGainDb * 10) / 10
+                << ",\"ducked\":" << (channel.duck.db < -0.05 ? "true" : "false") << ",\"position_ns\":" << channel.auxPosition * 1000000000 / 48000 << '}';
+        }
+        else
+        {
+            out << "null";
         }
         auto const nsOrNull = [](std::int64_t ns) { return ns < 0 ? std::string("null") : std::to_string(ns); };
         out << ",\"clip_remaining_ns\":" << nsOrNull(clipLeft) << ",\"playlist_remaining_ns\":" << nsOrNull(listLeft)

@@ -11,6 +11,8 @@
 #include "playout/flowahead.hpp"
 #include "playout/scheduler.hpp"
 #include "playout/shotbox.hpp"
+#include "playout/transition.hpp"
+#include "media/audio.hpp"
 #include "record/ring.hpp"
 #include "tally/tsl.hpp"
 
@@ -50,6 +52,9 @@ struct Route
 
 // Clips of uploaded files play from the library ring, not from a camera.
 constexpr int kLibraryCamera = 0;
+
+// Audio-only library items (1.7.0) have ids "audio-N"; their PCM is <library>/audio/<id>.f32.
+constexpr char const* kAudioItemPrefix = "audio-";
 
 // Clips and playlist entries play forward at 1 %–200 %: at 0 % or backwards they never reach OUT.
 constexpr double kMinClipSpeed = 0.01;
@@ -139,7 +144,15 @@ public:
     ShotState shotClick(int channel, std::string const& id);
     void playClip(int channel, std::string const& clipId);
 
-    std::string createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries, bool loop = false);
+    std::string createPlaylist(std::string const& name, std::vector<PlaylistEntry> const& entries, bool loop = false, AuxTrack const& aux = {});
+    // An aux source: "" (none), a clip or an audio item.
+    [[nodiscard]] bool auxSourceExists(std::string const& source) const;
+    [[nodiscard]] std::vector<Catalog::AudioItem> audioItems() const;
+    // Empty id when unknown.
+    [[nodiscard]] Catalog::AudioItem audioItem(std::string const& id) const;
+    bool renameAudioItem(std::string const& id, std::string const& name);
+    // Removes the item and its file, and the aux of the playlists that use it. False when unknown.
+    bool deleteAudioItem(std::string const& id);
     // False when the id is unknown. A channel playing the playlist stays on its entry.
     bool updatePlaylist(Catalog::Playlist const& playlist);
     bool deletePlaylist(std::string const& id);
@@ -149,6 +162,7 @@ public:
     // Plays the playlist from its first clip that exists; `play` false cues it there (paused, shot Cued).
     void playPlaylist(int channel, std::string const& id, bool play = true);
 
+    // A clip ("upload-N"), or an audio item ("audio-N") for a file with audio and no video.
     std::string upload(std::uint8_t const* data, std::size_t size, std::string const& name, std::string& error);
     std::string exportClip(std::string const& id, std::string& error);
     bool consolidate(std::string const& id, std::string& error);
@@ -243,6 +257,35 @@ private:
         std::uint64_t tallyPlayNs = 0;
         // The channel plays its idle playlist (looped, every entry plays on).
         bool idle = false;
+        // The current entry's own audio plays (a playlist entry's `own_audio`; true otherwise).
+        bool ownAudio = true;
+        // A transition into the current entry (SPECIFICATION.md §7, 1.7.0): the outgoing entry's side.
+        struct Mix
+        {
+            bool active = false;
+            Scheduler scheduler; // the outgoing entry, stepping on to its OUT
+            std::uint64_t outNs = 0;
+            int videoFrames = 0;
+            int audioFrames = 0;
+            int done = 0; // grains of the transition rendered
+            std::int64_t audioSamples = 0; // crossfade samples done
+            std::int64_t audioTotal = 0;
+            bool ownAudio = true;
+            AudioMode audio = AudioMode::Mute;
+            std::uint64_t audioNs = 0; // the house time of the outgoing audio read last
+        } mix;
+        // The playlist the channel's state was read for (playlistId and the catalog version), and what it gave.
+        std::string planKey;
+        Catalog::Playlist plan;
+        // The aux track (SPECIFICATION.md §5.4, 1.7.0): the playlist it plays for, its sample position, the run
+        // gain (0 paused … 1 playing) and the duck. `auxRestart` starts it from 0 on the next grain.
+        std::string auxPlaylist;
+        AuxTrack aux;
+        std::int64_t auxPosition = 0;
+        double auxRun = 0;
+        DuckRamp duck;
+        bool auxRestart = false;
+        double auxGainDb = -120;
     };
 
     // Encode into `pending`; pushFrames() writes them after the engine lock is released.
@@ -259,6 +302,20 @@ private:
     // whether a frame exists; false with found set means it is not in the house format.
     bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found) const;
     void finishClip(int channel);
+    // The shotbox countdowns of a channel on `list` (SPECIFICATION.md §8.1): the time to the playlist's end, and to
+    // OUT in `clipLeft`; -1 for none (lock held).
+    std::int64_t countdowns(ChannelRuntime const& channel, Catalog::Playlist const& list, std::int64_t& clipLeft) const;
+    // The channel's playlist, read again only when it or the catalog changed (lock held).
+    Catalog::Playlist const& currentPlaylist(int channel);
+    // Starts a mix or crossfade into the next entry when the current one has the transition's length left and
+    // finishClip would play the next entry (lock held). The channel moves to the next entry at once.
+    void maybeStartTransition(int channel);
+    // The aux track mixed into one grain's `pcm` (lock held, released for the reads).
+    void mixAux(int channel, std::unique_lock<std::recursive_mutex>& lock, std::vector<float>& pcm, bool still, bool ownAudible, std::uint64_t outputTaiNs);
+    // `count` stereo sample frames of an aux source from `position` (zeros past its end); its length in sample frames.
+    std::vector<float> readAuxSamples(std::string const& source, ClipRef const& clip, std::int64_t position, std::int64_t count) const;
+    [[nodiscard]] std::int64_t auxLength(std::string const& source) const;
+    [[nodiscard]] std::string audioItemPath(std::string const& id) const;
     // Plays the channel's idle playlist from its first entry (lock held). False when it has none or no clip of it exists.
     bool startIdle(int channel);
     // Posts the pairs the channel's next grains interpolate to its flow worker. Lock held.
@@ -321,6 +378,8 @@ private:
     // TAI at construction: a camera's last-frame age counts from here at most.
     std::uint64_t startedNs_ = 0;
     std::uint64_t clipSerial_ = 1;
+    // Bumped by every catalog change a channel's cached playlist depends on.
+    std::uint64_t catalogVersion_ = 0;
     std::string libraryDir_;
     PreviewMosaic* mosaic_ = nullptr;
     std::uint64_t mosaicStep_ = 1;

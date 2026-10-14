@@ -161,10 +161,12 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
             {
                 while (avcodec_receive_frame(actx, frame) >= 0)
                 {
-                    std::vector<float> interleaved(static_cast<std::size_t>(frame->nb_samples) * 2);
+                    // Room for every output sample (44.1 kHz gives more samples at 48 kHz; the resampler kept the rest
+                    // until the end of the file before 1.7.0).
+                    std::vector<float> interleaved(static_cast<std::size_t>(swr_get_out_samples(swr, frame->nb_samples)) * 2 + 2);
                     std::uint8_t* dest[1] = {reinterpret_cast<std::uint8_t*>(interleaved.data())};
                     auto** inNonConst = frame->extended_data;
-                    int const got = swr_convert(swr, dest, frame->nb_samples, const_cast<std::uint8_t const**>(inNonConst), frame->nb_samples);
+                    int const got = swr_convert(swr, dest, static_cast<int>(interleaved.size() / 2), const_cast<std::uint8_t const**>(inNonConst), frame->nb_samples);
                     if (got > 0)
                     {
                         out.audio.insert(out.audio.end(), interleaved.begin(), interleaved.begin() + static_cast<std::ptrdiff_t>(got * 2));
@@ -173,6 +175,31 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
             }
         }
         av_packet_unref(packet);
+    }
+    // Drain the audio decoder, then the resampler's delay line (the last milliseconds of the file).
+    if (actx != nullptr && swr != nullptr && avcodec_send_packet(actx, nullptr) >= 0)
+    {
+        while (avcodec_receive_frame(actx, frame) >= 0)
+        {
+            std::vector<float> interleaved(static_cast<std::size_t>(swr_get_out_samples(swr, frame->nb_samples)) * 2 + 2);
+            std::uint8_t* dest[1] = {reinterpret_cast<std::uint8_t*>(interleaved.data())};
+            int const got = swr_convert(swr, dest, static_cast<int>(interleaved.size() / 2), const_cast<std::uint8_t const**>(frame->extended_data), frame->nb_samples);
+            if (got > 0)
+            {
+                out.audio.insert(out.audio.end(), interleaved.begin(), interleaved.begin() + static_cast<std::ptrdiff_t>(got * 2));
+            }
+        }
+    }
+    while (swr != nullptr)
+    {
+        std::vector<float> tail(4096 * 2);
+        std::uint8_t* dest[1] = {reinterpret_cast<std::uint8_t*>(tail.data())};
+        int const got = swr_convert(swr, dest, 4096, nullptr, 0);
+        if (got <= 0)
+        {
+            break;
+        }
+        out.audio.insert(out.audio.end(), tail.begin(), tail.begin() + static_cast<std::ptrdiff_t>(got * 2));
     }
     av_frame_free(&yuv);
     av_frame_free(&frame);
@@ -184,9 +211,10 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
     avformat_close_input(&fmt);
     av_freep(&io->buffer);
     avio_context_free(&io);
-    if (out.frames.empty())
+    out.audioOnly = video < 0 && audio >= 0;
+    if (out.frames.empty() && !(out.audioOnly && !out.audio.empty()))
     {
-        out.error = "no video frames";
+        out.error = out.audioOnly ? "no audio samples" : "no video frames";
     }
     return out;
 }
