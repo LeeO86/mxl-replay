@@ -1,8 +1,6 @@
 # Changelog
 
-## Unreleased
-
-Proposed for **1.6.0**:
+## 1.6.0
 
 - Playlist transitions: an entry has a transition into it, `cut` (as before) or `mix` over `transition_frames` (1–250, default 25), and an audio crossfade over `audio_frames` (−1, the default: as the mix, and 2 frames on a cut, so the join does not click; 0: the audio cuts). The two entries overlap by the longer of both; the channel moves to the incoming entry when the transition starts. Each grain of a mix blends the two entries' nearest frames at `(k+1)/(N+1)` (GPU: the blend path without a flow; one extra JPEG decode per grain of a mix). The audio crossfade is equal power (sin/cos per sample: two entries are uncorrelated programme, so the loudness stays even; a linear fade dips 3 dB). A mix needs *next* with auto-advance (or the loop wrap, or the idle playlist), else the join cuts. Status per channel `transition`; metric `transitions_total{channel,kind}`; log `transition`. The countdowns and `duration_ns` take the overlaps off.
 - Own audio per entry (`own_audio`, default on): off, the entry is silent and only the aux track plays.
@@ -22,6 +20,7 @@ Proposed for **1.6.0**:
 - Widgets: `playlist-editor` (a playlist's entries: add a clip, reorder, speed, end action, remove; saved at once; `playlist` or a picker), `playlist-player` (`channel`; pick a playlist or `playlist`; Cue, Play/Pause, Stop, the countdown to its end, Loop on/off) and `timeline` (`channel`; the LSM tab's timeline with seek, clip marks, IN/OUT, Go IN/OUT, ±1 frame). `transport` takes `clip=true` (IN, OUT, Go IN, Go OUT, Create clip) and `presets=false`; its defaults look as before. One list of widgets serves `/widgets` and `/widget/<id>`, which checks every param of it (400) and answers an id not in it with 404.
 - `POST /api/v1/playlists/{id}/cue {"channel"}` cues a playlist's first clip, paused (as `/play` without playing).
 - Slow motion on the GPU: the two JPEG frames of an interpolated or blended grain (and of an optical flow) are decoded with one nvJPEG state, and the second decode could refill its staging buffers while the first one's copies were still queued, so parts of frame B could show in frame A. Between consecutive frames of one camera this is hardly visible (they look alike), but it is wrong. The decoder now waits for A before it decodes B, only when both are decoded in the same call (the start of a play, a jump, an angle change). Found while testing playlist mixes, where two different cameras made it obvious.
+- Known limitations: during a long mix the clip countdown counts to the outgoing entry's OUT and does not reach 0 before the channel moves on (the playlist countdown is right); in a slow-motion mix the outgoing side's audio advances one frame per grain; an aux audio item deleted while it plays stops without a fade.
 
 ## 1.5.0
 
