@@ -1102,8 +1102,8 @@ int loadPair(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& ke
         return -1;
     }
     // One nvJPEG state decodes both frames: its staging buffers are refilled by the next decode's host phase while
-    // the previous decode's copies may still be queued on the stream. Two different pictures (a mix of two cameras,
-    // 1.7.0) showed parts of B in A; wait for A before decoding B.
+    // the previous decode's copies may still be queued on the stream. Two different pictures (two cameras, or
+    // a fast cut between them) can show parts of B in A; wait for A before decoding B.
     if (needB && decodeA && state.slotKey[1 - a] != keyB && cudaStreamSynchronize(state.stream) != cudaSuccess)
     {
         return -1;
