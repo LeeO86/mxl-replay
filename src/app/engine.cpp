@@ -1392,10 +1392,13 @@ bool Engine::setPlayOnTally(int channel, bool enabled, std::string& error)
 
 bool Engine::saveSettings(std::string& error) const
 {
-    std::ofstream out(config_.stateDir + "/config.json");
+    // Written next to it and renamed over it: a crash mid-write leaves the old file, not half a file.
+    auto const path = config_.stateDir + "/config.json";
+    auto const temp = path + ".tmp";
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
     if (!out)
     {
-        error = "cannot write " + config_.stateDir + "/config.json";
+        error = "cannot write " + path;
         return false;
     }
     out << "{\n";
@@ -1410,6 +1413,14 @@ bool Engine::saveSettings(std::string& error) const
         out << "  \"" << jsonEscape(key) << "\": \"" << jsonEscape(value) << '"';
     }
     out << "\n}\n";
+    out.close();
+    std::error_code ec;
+    if (!out || (std::filesystem::rename(temp, path, ec), ec))
+    {
+        error = "cannot write " + path;
+        std::filesystem::remove(temp, ec);
+        return false;
+    }
     return true;
 }
 
