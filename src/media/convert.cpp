@@ -162,7 +162,7 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
                 while (avcodec_receive_frame(actx, frame) >= 0)
                 {
                     // Room for every output sample (44.1 kHz gives more samples at 48 kHz; the resampler kept the rest
-                    // until the end of the file before 1.7.0).
+                    // until the end of the file before 1.6.0).
                     std::vector<float> interleaved(static_cast<std::size_t>(swr_get_out_samples(swr, frame->nb_samples)) * 2 + 2);
                     std::uint8_t* dest[1] = {reinterpret_cast<std::uint8_t*>(interleaved.data())};
                     auto** inNonConst = frame->extended_data;

@@ -344,7 +344,7 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-bottom-wi
 .widget-timeline { display: flex; flex-direction: column; gap: .4rem; }
 .widget-timeline .timeline-head .small { display: none; }
 .widget-timeline .btn-grid button.btn { padding: .4rem .3rem; }
-/* Playlists (1.7.0): small IN thumbnails, the transition cell and the aux track. */
+/* Playlists (1.6.0): small IN thumbnails, the transition cell and the aux track. */
 .thumb-cell.small-thumb img, .thumb-cell.small-thumb .noimg { width: 64px; height: 36px; }
 .transition-cell { white-space: nowrap; }
 .transition-cell select { width: auto; }

@@ -1,4 +1,4 @@
-// Playlist transitions, the audio crossfade, the aux track and audio items (SPECIFICATION.md §5.4 and §7, 1.7.0).
+// Playlist transitions, the audio crossfade, the aux track and audio items (SPECIFICATION.md §5.4 and §7, 1.6.0).
 #include <doctest/doctest.h>
 
 #include "app/engine.hpp"

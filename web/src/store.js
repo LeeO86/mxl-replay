@@ -15,7 +15,7 @@ export const state = reactive({
   status: null,
   clips: [],
   playlists: [],
-  audio: [], // audio items (1.7.0): uploads without video, for playlists' aux tracks
+  audio: [], // audio items (1.6.0): uploads without video, for playlists' aux tracks
   channel: storedChannel(),
   connected: false, // WebSocket /api/v1/events
   indexing: false, // 503 {"status":"indexing"} while the buffer is indexed

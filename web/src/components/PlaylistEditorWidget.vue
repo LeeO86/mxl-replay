@@ -1,6 +1,6 @@
 <script setup>
 // The playlist editor widget (SPECIFICATION.md §8.7): one playlist's entries. Add a clip, reorder, end action,
-// speed, transition (cut or mix), own audio, remove, and the aux track's source and level (1.7.0); every change is
+// speed, transition (cut or mix), own audio, remove, and the aux track's source and level (1.6.0); every change is
 // saved at once (no Save button). Without `playlist` the widget has a playlist picker.
 import { computed, ref, watch } from "vue";
 import { api, END_ACTIONS, entryTransition, fmtNs, playNs, TRANSITION_PRESETS, transitionPreset } from "../api.js";

@@ -77,7 +77,7 @@ export const END_ACTIONS = [
   { value: "next", label: "Next" },
   { value: "return-to-live", label: "Return to live" },
 ];
-// Playlist transitions (1.7.0): the entry's `transition` and `transition_frames` as one choice for compact editors.
+// Playlist transitions (1.6.0): the entry's `transition` and `transition_frames` as one choice for compact editors.
 export const TRANSITION_PRESETS = [
   { value: "cut", label: "Cut", transition: "cut", frames: 0 },
   { value: "mix12", label: "Mix 12", transition: "mix", frames: 12 },

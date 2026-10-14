@@ -33,14 +33,14 @@ public:
         std::vector<PlaylistEntry> entries;
         // After its last entry the playlist starts again at its first (SPECIFICATION.md §7).
         bool loop = false;
-        // The audio aux track (1.7.0; no source: none).
+        // The audio aux track (1.6.0; no source: none).
         AuxTrack aux;
     };
     void upsertPlaylist(Playlist const& playlist);
     void deletePlaylist(std::string const& id);
     [[nodiscard]] std::vector<Playlist> playlists() const;
 
-    // An audio-only library item (1.7.0): 48 kHz stereo float PCM in a file of the library.
+    // An audio-only library item (1.6.0): 48 kHz stereo float PCM in a file of the library.
     struct AudioItem
     {
         std::string id;

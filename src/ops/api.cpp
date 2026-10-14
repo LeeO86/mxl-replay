@@ -840,7 +840,7 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         {
             return error(400, problem);
         }
-        // An audio-only file is an audio item (1.7.0).
+        // An audio-only file is an audio item (1.6.0).
         return json(201, std::string("{\"id\":\"") + jsonEscape(id) + "\",\"kind\":\"" + (id.rfind(kAudioItemPrefix, 0) == 0 ? "audio" : "clip") + "\"}");
     }
 

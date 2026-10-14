@@ -48,7 +48,7 @@ void Catalog::open(std::string const& path)
         "CREATE TABLE IF NOT EXISTS playlist_entries (playlist TEXT, position INTEGER, clip_id TEXT, speed REAL, end_action TEXT, auto_advance INTEGER);"
         "CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);"
         "CREATE TABLE IF NOT EXISTS audio_items (id TEXT PRIMARY KEY, name TEXT, samples INTEGER, created_ns INTEGER);");
-    // Columns added since 1.0 (1.6.0: a playlist can loop; 1.7.0: transitions, own audio and the aux track): a
+    // Columns added since 1.0 (1.6.0: a playlist can loop, transitions, own audio and the aux track): a
     // catalog from before gets them with their defaults.
     auto const addColumns = [this](char const* table, std::vector<std::pair<char const*, char const*>> const& columns) {
         std::vector<std::string> present;

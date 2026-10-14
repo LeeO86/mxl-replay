@@ -45,7 +45,7 @@ struct ClipRef
     bool library = false;
 };
 
-// The transition into a playlist entry from the one before (SPECIFICATION.md §7, 1.7.0).
+// The transition into a playlist entry from the one before (SPECIFICATION.md §7, 1.6.0).
 enum class Transition
 {
     Cut,
@@ -77,7 +77,7 @@ struct PlaylistEntry
     bool ownAudio = true;
 };
 
-// A playlist's audio aux track (SPECIFICATION.md §5.4, 1.7.0): a clip's audio or an audio item, under the
+// A playlist's audio aux track (SPECIFICATION.md §5.4, 1.6.0): a clip's audio or an audio item, under the
 // entries, ducked while an entry's own audio plays.
 struct AuxTrack
 {
@@ -118,7 +118,7 @@ struct Shotbox
 // the first entry whose end action is not `next` (freeze, black, return to live), else after the last entry (a
 // looped playlist: the end of this pass); the time an entry waits cued (no auto-advance) is not counted. -1 when it
 // never ends (a `loop` entry). With `framePeriodNs`, a transition into an auto-advanced entry takes its overlap off
-// (1.7.0).
+// (1.6.0).
 [[nodiscard]] std::int64_t playlistRemainingNs(std::vector<PlaylistEntry> const& entries, std::vector<std::int64_t> const& lengthsNs, int index,
     std::int64_t clipRemainingNs, std::int64_t framePeriodNs = 0);
 

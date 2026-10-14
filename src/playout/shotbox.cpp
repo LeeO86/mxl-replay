@@ -158,7 +158,7 @@ std::int64_t playlistRemainingNs(std::vector<PlaylistEntry> const& entries, std:
                 continue; // a deleted clip is skipped
             }
             total += length;
-            // A transition into an auto-advanced entry overlaps the two entries (1.7.0).
+            // A transition into an auto-advanced entry overlaps the two entries (1.6.0).
             auto const& before = entries[static_cast<std::size_t>(i - 1)];
             if (framePeriodNs > 0 && before.autoAdvance)
             {

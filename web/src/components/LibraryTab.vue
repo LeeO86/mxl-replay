@@ -51,7 +51,7 @@ async function consolidate(clip) {
     refreshLists();
   }
 }
-// Audio items (1.7.0): uploads without video, the sources of playlists' aux tracks.
+// Audio items (1.6.0): uploads without video, the sources of playlists' aux tracks.
 async function renameAudio(item) {
   const name = prompt("Name of the audio item", item.name);
   if (!name || name.trim() === item.name) return;

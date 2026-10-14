@@ -795,7 +795,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     bool renderedOnGpu = false;
     // The output grain is this thread's last GPU picture (the preview tile is drawn from it there).
     bool devicePicture = false;
-    // A video mix (SPECIFICATION.md §7, 1.7.0): the outgoing entry's and the incoming entry's nearest frames,
+    // A video mix (SPECIFICATION.md §7, 1.6.0): the outgoing entry's and the incoming entry's nearest frames,
     // blended at the mix weight on the GPU (the blend path without a flow) or on the CPU.
     bool mixed = false;
     Frame10 mixPicture;
@@ -1024,7 +1024,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     // A channel that stands still (paused, cued, at a clip's end, black, or at speed 0) is silent: its position
     // does not move, and its frame's samples repeated every grain are a buzz. Slow motion in `mute` is silent too.
     bool const still = !runtime.liveMode && (!runtime.scheduler.playing || runtime.black || speed <= 0.01);
-    // A playlist entry whose own audio is off is silent too (its aux track plays, 1.7.0).
+    // A playlist entry whose own audio is off is silent too (its aux track plays, 1.6.0).
     bool const silent = still || (!runtime.liveMode && speed < 0.999 && cfg.audio == AudioMode::Mute) || (!runtime.liveMode && !runtime.ownAudio);
     std::vector<float> pcm(static_cast<std::size_t>(samples) * 2, 0.f);
     if (auto const* ring = ringOf(audioCamera))
@@ -2140,7 +2140,7 @@ std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::stri
     auto converted = convertUpload(data, size, config_.format);
     if (converted.frames.empty() && converted.audioOnly && !converted.audio.empty())
     {
-        // An audio item (1.7.0): 48 kHz stereo float, written to a file of the library and read per grain.
+        // An audio item (1.6.0): 48 kHz stereo float, written to a file of the library and read per grain.
         std::lock_guard serial{uploadMutex_};
         std::string id;
         {
@@ -3353,7 +3353,7 @@ std::string Engine::statusJson() const
         bool const onClip = !channel.liveMode && !channel.clipId.empty() && channel.hasOut;
         auto const list = onClip && !channel.playlistId.empty() ? findPlaylist(catalog_, channel.playlistId) : Catalog::Playlist{};
         std::int64_t const listLeft = countdowns(channel, list, clipLeft);
-        // A transition into the current entry (1.7.0) and the aux track.
+        // A transition into the current entry (1.6.0) and the aux track.
         out << ",\"own_audio\":" << (channel.ownAudio ? "true" : "false") << ",\"transition\":";
         if (channel.mix.active)
         {

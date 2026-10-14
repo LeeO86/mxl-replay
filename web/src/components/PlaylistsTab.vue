@@ -1,7 +1,7 @@
 <script setup>
 // Playlists (SPECIFICATION.md §7): ordered clips, each with its own speed, end action and
 // auto-advance, a transition into it (cut or mix, audio crossfade, own audio); an aux audio track per playlist
-// (1.7.0); play on the selected channel.
+// (1.6.0); play on the selected channel.
 import { computed, ref, watch } from "vue";
 import ChannelPicker from "./ChannelPicker.vue";
 import { api, AUX_DEFAULTS, END_ACTIONS, entryTransition, fmtNs, playNs } from "../api.js";

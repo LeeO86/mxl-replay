@@ -53,7 +53,7 @@ struct Route
 // Clips of uploaded files play from the library ring, not from a camera.
 constexpr int kLibraryCamera = 0;
 
-// Audio-only library items (1.7.0) have ids "audio-N"; their PCM is <library>/audio/<id>.f32.
+// Audio-only library items (1.6.0) have ids "audio-N"; their PCM is <library>/audio/<id>.f32.
 constexpr char const* kAudioItemPrefix = "audio-";
 
 // Clips and playlist entries play forward at 1 %–200 %: at 0 % or backwards they never reach OUT.
@@ -259,7 +259,7 @@ private:
         bool idle = false;
         // The current entry's own audio plays (a playlist entry's `own_audio`; true otherwise).
         bool ownAudio = true;
-        // A transition into the current entry (SPECIFICATION.md §7, 1.7.0): the outgoing entry's side.
+        // A transition into the current entry (SPECIFICATION.md §7, 1.6.0): the outgoing entry's side.
         struct Mix
         {
             bool active = false;
@@ -281,7 +281,7 @@ private:
         std::vector<std::int64_t> planLengths;
         int planMaxTransition = 0;
         std::int64_t planAuxLength = 0;
-        // The aux track (SPECIFICATION.md §5.4, 1.7.0): the playlist it plays for, its sample position, the run
+        // The aux track (SPECIFICATION.md §5.4, 1.6.0): the playlist it plays for, its sample position, the run
         // gain (0 paused … 1 playing) and the duck. `auxRestart` starts it from 0 on the next grain.
         std::string auxPlaylist;
         AuxTrack aux;

@@ -1,6 +1,6 @@
 #pragma once
 
-// Playlist transitions and the aux track (SPECIFICATION.md §5.4 and §7, 1.7.0): the weights of a video mix, the
+// Playlist transitions and the aux track (SPECIFICATION.md §5.4 and §7, 1.6.0): the weights of a video mix, the
 // gains of the equal-power audio crossfade, the aux track's duck, end fade and edges, and the JSON of the
 // entry and aux fields (the API, the config export and import).
 
