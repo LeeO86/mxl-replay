@@ -277,6 +277,10 @@ private:
         // The playlist the channel's state was read for (playlistId and the catalog version), and what it gave.
         std::string planKey;
         Catalog::Playlist plan;
+        // Its entries' playing times (-1: a deleted clip), the longest transition in it, and the aux source's length.
+        std::vector<std::int64_t> planLengths;
+        int planMaxTransition = 0;
+        std::int64_t planAuxLength = 0;
         // The aux track (SPECIFICATION.md §5.4, 1.7.0): the playlist it plays for, its sample position, the run
         // gain (0 paused … 1 playing) and the duck. `auxRestart` starts it from 0 on the next grain.
         std::string auxPlaylist;
@@ -305,6 +309,8 @@ private:
     // The shotbox countdowns of a channel on `list` (SPECIFICATION.md §8.1): the time to the playlist's end, and to
     // OUT in `clipLeft`; -1 for none (lock held).
     std::int64_t countdowns(ChannelRuntime const& channel, Catalog::Playlist const& list, std::int64_t& clipLeft) const;
+    // The same with the entries' playing times given (-1: a deleted clip).
+    std::int64_t countdowns(ChannelRuntime const& channel, Catalog::Playlist const& list, std::vector<std::int64_t> const& lengths, std::int64_t& clipLeft) const;
     // The channel's playlist, read again only when it or the catalog changed (lock held).
     Catalog::Playlist const& currentPlaylist(int channel);
     // Starts a mix or crossfade into the next entry when the current one has the transition's length left and

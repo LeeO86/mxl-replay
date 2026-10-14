@@ -211,9 +211,9 @@ async function play(id) {
               <span v-else class="muted">{{ e.clip_id }} (deleted, skipped)</span>
             </td>
             <td class="num">{{ clipsById[e.clip_id] ? fmtNs(playNs(clipsById[e.clip_id], e.speed / 100)) : "–" }}</td>
-            <td><input v-model.number="e.speed" type="number" min="1" max="200" step="1" :class="{ invalid: !speedOk(e.speed) }" :aria-label="`Speed of entry ${i + 1}`" /></td>
+            <td><input v-model.number="e.speed" class="narrow" type="number" min="1" max="200" step="1" :class="{ invalid: !speedOk(e.speed) }" :aria-label="`Speed of entry ${i + 1}`" /></td>
             <td>
-              <select v-model="e.end" :aria-label="`End action of entry ${i + 1}`">
+              <select v-model="e.end" class="end-select" :aria-label="`End action of entry ${i + 1}`">
                 <option v-for="a in END_ACTIONS" :key="a.value" :value="a.value">{{ a.label }}</option>
               </select>
               <div v-if="draft.loop && i === draft.entries.length - 1 && (e.end === 'freeze' || e.end === 'black')" class="muted small">↻ Loop: wraps to the first clip</div>

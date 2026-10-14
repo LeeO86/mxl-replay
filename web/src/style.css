@@ -356,3 +356,5 @@ fieldset.aux label.check input { width: auto; flex: none; margin: 0; }
 .widget-entry .wthumb { width: 48px; height: 27px; object-fit: cover; border-radius: 3px; background: #000; flex: none; }
 .widget-entry .own { min-width: 1.6rem; }
 .widget-entry .own.off { opacity: .45; text-decoration: line-through; }
+input.narrow { width: 4.6rem; }
+select.end-select { min-width: 8.5rem; }

@@ -2951,6 +2951,15 @@ Catalog::Playlist const& Engine::currentPlaylist(int channel)
     {
         runtime.planKey = key;
         runtime.plan = runtime.playlistId.empty() ? Catalog::Playlist{} : findPlaylist(catalog_, runtime.playlistId);
+        runtime.planLengths.clear();
+        runtime.planMaxTransition = 0;
+        for (auto const& entry : runtime.plan.entries)
+        {
+            auto const clip = catalog_.clip(entry.clipId);
+            runtime.planLengths.push_back(clip.id.empty() ? -1 : remainingNs(static_cast<std::int64_t>(clip.inNs), clip.outNs, entry.speed));
+            runtime.planMaxTransition = std::max(runtime.planMaxTransition, transitionPlan(entry).length());
+        }
+        runtime.planAuxLength = runtime.plan.aux.source.empty() ? 0 : auxLength(runtime.plan.aux.source);
     }
     return runtime.plan;
 }
@@ -2977,7 +2986,13 @@ void Engine::maybeStartTransition(int channel)
     {
         return;
     }
-    auto const list = currentPlaylist(channel);
+    // Nothing to look up in a playlist without transitions, or long before its longest one.
+    (void)currentPlaylist(channel);
+    if (left > runtime.planMaxTransition)
+    {
+        return;
+    }
+    auto const list = runtime.plan;
     int const index = runtime.playlistIndex;
     if (list.id.empty() || index < 0 || index >= static_cast<int>(list.entries.size()))
     {
@@ -3165,14 +3180,14 @@ void Engine::mixAux(int channel, std::unique_lock<std::recursive_mutex>& lock, s
         return;
     }
     auto const aux = runtime.aux;
-    auto const length = auxLength(aux.source);
+    auto const length = aux.source == list.aux.source ? runtime.planAuxLength : auxLength(aux.source);
     auto const clip = aux.source.rfind(kAudioItemPrefix, 0) == 0 ? ClipRef{} : catalog_.clip(aux.source);
     // The time to the playlist's end (its countdown) for the end fade: none when it does not end.
     std::int64_t remaining = -1;
     if (aux.fadeOutFrames > 0 && onList)
     {
         std::int64_t clipLeft = -1;
-        remaining = countdowns(runtime, list, clipLeft);
+        remaining = countdowns(runtime, list, runtime.planLengths, clipLeft);
     }
     auto const fadeNs = static_cast<std::int64_t>(aux.fadeOutFrames) * framePeriodNs(config_.format.rateNum, config_.format.rateDen);
     auto const frames = static_cast<std::int64_t>(pcm.size() / 2);
@@ -3225,6 +3240,17 @@ void Engine::mixAux(int channel, std::unique_lock<std::recursive_mutex>& lock, s
 
 std::int64_t Engine::countdowns(ChannelRuntime const& channel, Catalog::Playlist const& list, std::int64_t& clipLeft) const
 {
+    std::vector<std::int64_t> lengths;
+    for (auto const& entry : list.entries)
+    {
+        auto const clip = catalog_.clip(entry.clipId);
+        lengths.push_back(clip.id.empty() ? -1 : remainingNs(static_cast<std::int64_t>(clip.inNs), clip.outNs, entry.speed));
+    }
+    return countdowns(channel, list, lengths, clipLeft);
+}
+
+std::int64_t Engine::countdowns(ChannelRuntime const& channel, Catalog::Playlist const& list, std::vector<std::int64_t> const& lengths, std::int64_t& clipLeft) const
+{
     clipLeft = -1;
     std::int64_t listLeft = -1;
     bool const onClip = !channel.liveMode && !channel.clipId.empty() && channel.hasOut;
@@ -3235,7 +3261,6 @@ std::int64_t Engine::countdowns(ChannelRuntime const& channel, Catalog::Playlist
     if (onClip && !list.id.empty())
     {
         auto entries = list.entries;
-        std::vector<std::int64_t> lengths;
         for (auto& entry : entries)
         {
             // The idle playlist plays every entry on.
@@ -3243,8 +3268,6 @@ std::int64_t Engine::countdowns(ChannelRuntime const& channel, Catalog::Playlist
             {
                 entry.end = EndAction::Next;
             }
-            auto const clip = catalog_.clip(entry.clipId);
-            lengths.push_back(clip.id.empty() ? -1 : remainingNs(static_cast<std::int64_t>(clip.inNs), clip.outNs, entry.speed));
         }
         // An ended shot (stopped, or the playlist's last clip at its end) has nothing left.
         listLeft = clipLeft == 0 && channel.shot.state == ShotState::Ended
