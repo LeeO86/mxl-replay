@@ -1341,7 +1341,16 @@ TEST_CASE("api edits clips and playlists and serves previews")
     CHECK(stored.entries[0].speed == doctest::Approx(0.25));
     CHECK(stored.entries[0].end == EndAction::Freeze);
     CHECK_FALSE(stored.entries[0].autoAdvance);
+    // Cue puts the channel on the playlist's first clip, paused; play plays it.
+    auto const cued = call(*engine, "POST", "/api/v1/playlists/" + pid + "/cue", "{\"channel\":1}");
+    CHECK(cued.status == 200);
+    CHECK(cued.body.find("\"shot\":\"cued\"") != std::string::npos);
+    CHECK(cued.body.find("\"playlist\":\"" + pid + "\"") != std::string::npos);
+    CHECK(cued.body.find("\"playing\":false") != std::string::npos);
+    CHECK(call(*engine, "POST", "/api/v1/playlists/" + pid + "/cue", "{\"channel\":9}").status == 404);
+    CHECK(call(*engine, "POST", "/api/v1/playlists/playlist-999/cue", "{\"channel\":1}").status == 404);
     CHECK(call(*engine, "POST", "/api/v1/playlists/" + pid + "/play", "{\"channel\":1}").status == 200);
+    CHECK(call(*engine, "GET", "/api/v1/status").body.find("\"shot\":\"playing\"") != std::string::npos);
     CHECK(call(*engine, "DELETE", "/api/v1/playlists/" + pid).status == 200);
     CHECK(call(*engine, "DELETE", "/api/v1/playlists/" + pid).status == 404);
 

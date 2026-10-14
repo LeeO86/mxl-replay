@@ -146,7 +146,8 @@ public:
     [[nodiscard]] std::vector<Catalog::Playlist> playlists() const;
     // Empty id when unknown.
     [[nodiscard]] Catalog::Playlist playlist(std::string const& id) const;
-    void playPlaylist(int channel, std::string const& id);
+    // Plays the playlist from its first clip that exists; `play` false cues it there (paused, shot Cued).
+    void playPlaylist(int channel, std::string const& id, bool play = true);
 
     std::string upload(std::uint8_t const* data, std::size_t size, std::string const& name, std::string& error);
     std::string exportClip(std::string const& id, std::string& error);

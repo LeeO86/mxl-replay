@@ -318,3 +318,29 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-bottom-wi
   header, nav { padding-left: 1rem; padding-right: 1rem; }
   main { padding: 1rem; }
 }
+.widget-marks { display: flex; align-items: center; gap: .8rem; }
+.widget-marks .mono { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+/* Playlist widgets and the timeline widget */
+.widget-pl { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: .4rem; }
+.widget-pl select, .widget-pl input[type="number"] { padding: .2rem .3rem; font-size: .8rem; }
+.widget-pl .widget-head select { flex: 1; min-width: 0; }
+.widget-entries { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: .25rem; }
+.widget-entry { position: relative; display: flex; align-items: center; gap: .4rem; padding: .25rem .4rem .25rem .7rem; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; font-size: .8rem; }
+.widget-entry.current { border-color: var(--ok); }
+.widget-entry .stripe { position: absolute; left: 0; top: 0; bottom: 0; width: 4px; border-radius: 6px 0 0 6px; }
+.widget-entry .idx { width: 1.4rem; text-align: right; color: var(--muted); }
+.widget-entry .text { flex: 1; min-width: 0; }
+.widget-entry .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.widget-entry .meta { font-size: .7rem; color: var(--muted); }
+.widget-entry input[type="number"] { width: 4.2rem; flex: none; }
+.widget-entry select { width: 6.5rem; flex: none; }
+.widget-entry .btn.small { padding: .15rem .4rem; }
+.widget-entry.dim { opacity: .55; }
+.widget-row { display: flex; gap: .4rem; align-items: center; }
+.widget-row select { flex: 1; min-width: 0; }
+.widget-big { display: flex; align-items: baseline; gap: .8rem; }
+.widget-big .cd { font-family: ui-monospace, monospace; font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.widget-big .cd.soon { color: var(--bad); }
+.widget-timeline { display: flex; flex-direction: column; gap: .4rem; }
+.widget-timeline .timeline-head .small { display: none; }
+.widget-timeline .btn-grid button.btn { padding: .4rem .3rem; }

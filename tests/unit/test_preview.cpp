@@ -323,31 +323,76 @@ TEST_CASE("widgets: the list with CORS for listed origins, the pages with CSP fr
     CHECK(header(get(*engine, "/widgets"), "Access-Control-Allow-Origin").empty());
     Json widgets;
     REQUIRE(parseJson(list.body, widgets));
-    REQUIRE(widgets.items.size() == 2);
+    REQUIRE(widgets.items.size() == widgetSpecs().size());
+    std::vector<std::string> ids;
+    for (auto const& item : widgets.items)
+    {
+        ids.push_back(item.get("id")->text);
+        CHECK(item.get("version")->text == REPLAY_VERSION);
+        CHECK(item.get("params")->get("type")->text == "object");
+    }
+    CHECK(ids == std::vector<std::string>{"transport", "clip-list", "playlist-editor", "playlist-player", "timeline"});
     auto const& transport = widgets.items[0];
-    CHECK(transport.get("id")->text == "transport");
     CHECK(transport.get("min_size")->get("w")->text == "480");
     CHECK(transport.get("min_size")->get("h")->text == "180");
-    CHECK(transport.get("params")->get("properties")->get("channel")->get("maximum")->text == "2");
+    auto const* transportParams = transport.get("params")->get("properties");
+    CHECK(transportParams->get("channel")->get("maximum")->text == "2");
     CHECK(transport.get("params")->get("required")->items[0].text == "channel");
+    // The optional sections: clip off, presets on (the look before them).
+    CHECK(transportParams->get("clip")->get("type")->text == "boolean");
+    CHECK_FALSE(transportParams->get("clip")->get("default")->boolean);
+    CHECK(transportParams->get("presets")->get("default")->boolean);
     auto const& clips = widgets.items[1];
-    CHECK(clips.get("id")->text == "clip-list");
     CHECK(clips.get("min_size")->get("w")->text == "400");
     CHECK(clips.get("params")->get("required") == nullptr);
-    CHECK(clips.get("version")->text == REPLAY_VERSION);
+    auto const& editor = widgets.items[2];
+    CHECK(editor.get("params")->get("properties")->get("playlist")->get("type")->text == "string");
+    CHECK(editor.get("params")->get("required") == nullptr);
+    auto const& player = widgets.items[3];
+    CHECK(player.get("params")->get("required")->items.size() == 1);
+    CHECK(player.get("params")->get("required")->items[0].text == "channel");
+    CHECK(player.get("params")->get("properties")->get("playlist") != nullptr);
+    auto const& timeline = widgets.items[4];
+    CHECK(timeline.get("params")->get("required")->items[0].text == "channel");
+    CHECK(timeline.get("min_size")->get("w")->text == "600");
 
     auto const page = get(*engine, "/widget/transport", "channel=2&theme=transparent");
     CHECK(page.status == 200);
     CHECK(page.body == "<html>replay</html>");
     CHECK(header(page, "Content-Security-Policy") == "frame-ancestors 'self' https://designer.example");
     CHECK(header(page, "X-Frame-Options").empty());
+    // Every listed widget is served, with the same CSP.
+    for (auto const& spec : widgetSpecs())
+    {
+        auto const each = get(*engine, "/widget/" + spec.id, "channel=1");
+        CHECK(each.status == 200);
+        CHECK(header(each, "Content-Security-Policy") == "frame-ancestors 'self' https://designer.example");
+    }
     CHECK(get(*engine, "/widget/clip-list").status == 200);
     CHECK(get(*engine, "/widget/clip-list", "channel=1&theme=light").status == 200);
+    CHECK(get(*engine, "/widget/transport", "channel=1&clip=true&presets=false").status == 200);
+    CHECK(get(*engine, "/widget/transport", "channel=1&clip=1&presets=0").status == 200);
+    CHECK(get(*engine, "/widget/transport", "channel=1&clip=yes").status == 400);
+    CHECK(get(*engine, "/widget/transport", "channel=1&presets=2").status == 400);
     CHECK(get(*engine, "/widget/transport").status == 400);
     CHECK(get(*engine, "/widget/transport", "channel=3").status == 400);
     CHECK(get(*engine, "/widget/transport", "channel=x").status == 400);
     CHECK(get(*engine, "/widget/clip-list", "theme=pink").status == 400);
+    CHECK(get(*engine, "/widget/playlist-editor").status == 200);
+    CHECK(get(*engine, "/widget/playlist-editor", "playlist=playlist-3").status == 200);
+    CHECK(get(*engine, "/widget/playlist-editor", "playlist=a%2Fb").status == 400);
+    CHECK(get(*engine, "/widget/playlist-editor", "playlist=" + std::string(65, 'p')).status == 400);
+    CHECK(get(*engine, "/widget/playlist-player", "channel=2&playlist=playlist-3").status == 200);
+    CHECK(get(*engine, "/widget/playlist-player").status == 400);
+    CHECK(get(*engine, "/widget/playlist-player", "channel=1&playlist=%3Cx%3E").status == 400);
+    CHECK(get(*engine, "/widget/timeline", "channel=2").status == 200);
+    CHECK(get(*engine, "/widget/timeline").status == 400);
+    CHECK(get(*engine, "/widget/timeline", "channel=0").status == 400);
     CHECK(get(*engine, "/widget/tally").status == 404);
+    CHECK(get(*engine, "/widget/").status == 404);
+    CHECK(get(*engine, "/widget/transport/x", "channel=1").status == 404);
+    CHECK(findWidget("timeline") != nullptr);
+    CHECK(findWidget("Timeline") == nullptr);
     // The app itself is not framed by others.
     CHECK(header(get(*engine, "/"), "Content-Security-Policy").empty());
 

@@ -583,24 +583,6 @@ HttpResponse channelCommand(Engine& engine, int channel, std::string const& acti
     return json(200, engine.statusJson());
 }
 
-// The query of /widget/<id>: `channel` (1..REPLAY_CHANNELS; required for transport) and `theme`. Empty when valid.
-std::string widgetError(Config const& cfg, std::string const& id, std::string const& query)
-{
-    auto const channel = queryValue(query, "channel");
-    bool const valid = channel.size() <= 2 && channel.find_first_not_of("0123456789") == std::string::npos &&
-                       (channel.empty() || (std::stoi(channel) >= 1 && std::stoi(channel) <= cfg.channels));
-    if (!valid || (id == "transport" && channel.empty()))
-    {
-        return "channel must be a channel 1.." + std::to_string(cfg.channels);
-    }
-    auto const theme = queryValue(query, "theme");
-    if (!theme.empty() && theme != "dark" && theme != "light" && theme != "transparent")
-    {
-        return "theme must be dark, light or transparent";
-    }
-    return {};
-}
-
 // PATCH /api/v1/clips/{id}: the given fields change, the others stay.
 HttpResponse patchClip(Engine& engine, std::string const& id, Json const& body)
 {
@@ -757,11 +739,13 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
     if (path.rfind("/widget/", 0) == 0 && method == "GET")
     {
         auto const id = path.substr(std::string("/widget/").size());
-        if (id != "transport" && id != "clip-list")
+        auto const* widget = findWidget(id);
+        if (widget == nullptr)
         {
             return error(404, "widget not found");
         }
-        if (auto const problem = widgetError(engine.config(), id, request.query); !problem.empty())
+        auto const value = [&](std::string const& key) { return queryValue(request.query, key); };
+        if (auto const problem = widgetQueryError(engine.config(), *widget, value); !problem.empty())
         {
             return error(400, problem);
         }
@@ -1029,7 +1013,7 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
         {
             return engine.deletePlaylist(id) ? json(200, "{\"deleted\":true}") : error(404, "unknown playlist");
         }
-        if (action == "play" && method == "POST")
+        if ((action == "play" || action == "cue") && method == "POST")
         {
             int channel = 1;
             if (!channelOf(channel))
@@ -1048,7 +1032,7 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
             {
                 return error(400, "the playlist has no clip to play");
             }
-            engine.playPlaylist(channel, id);
+            engine.playPlaylist(channel, id, action == "play");
             return json(200, engine.statusJson());
         }
         return error(404, "not found");
