@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.0
+
+- Widget `clip-list` is the shotbox for one channel: clips and playlists in shotbox order, the shotbox's filter (all, clips, playlists; kept in the browser), thumbnails (a playlist's first three clips stacked), the state on the channel and the progress. A click is a shotbox click (cue, play, pause), for a playlist too. Before, it listed clips only, newest first.
+- Widget `playlist-player` is removed (operators found it of little use): playlists play from `clip-list` as in the shotbox; the countdowns are on `transport`. `GET /widgets` no longer lists it and `/widget/playlist-player` answers 404. **Platform:** take it out of the catalog's widgets and off any operator screen before upgrading.
+- Widget `playlist-editor` gets Loop on/off (the playlist's `loop`, saved at once).
+
 ## 1.6.1
 
 - Fix: an NMOS IS-05 activation of a camera receiver could be lost. The recorder wrote its route snapshot back with each status update ("waiting", "running"), so an activation that came in between was overwritten. In a lab test a disable was ignored 1 time in 20 and a switch to another sender was lost 4 times in 40, and it stayed lost: IS-05 `/active` showed the new flow while the camera kept recording the old one. The recorder now only sets the status, and only while the route is still the one it read.

@@ -1,7 +1,7 @@
 <script setup>
 // The playlist editor widget (SPECIFICATION.md §8.7): one playlist's entries. Add a clip, reorder, end action,
-// speed, transition (cut or mix), own audio, remove, and the aux track's source and level (1.6.0); every change is
-// saved at once (no Save button). Without `playlist` the widget has a playlist picker.
+// speed, transition (cut or mix), own audio, remove, the aux track's source and level (1.6.0) and Loop (1.7.0); every
+// change is saved at once (no Save button). Without `playlist` the widget has a playlist picker.
 import { computed, ref, watch } from "vue";
 import { api, END_ACTIONS, entryTransition, fmtNs, playNs, TRANSITION_PRESETS, transitionPreset } from "../api.js";
 import { act, cameraLabel, channels, clipsById, refreshLists, state } from "../store.js";
@@ -64,6 +64,10 @@ async function save() {
   if (await act(() => api.put(`/api/v1/playlists/${encodeURIComponent(picked.value)}`, body))) await refreshLists();
   saving.value = false;
 }
+// Loop (the playlist's `loop`), saved at once; the entries are not touched.
+async function toggleLoop() {
+  if (await act(() => api.put(`/api/v1/playlists/${encodeURIComponent(picked.value)}`, { loop: !summary.value?.loop }))) await refreshLists();
+}
 // The transition presets, and a mix of another length (set on the Playlists page) as its own choice.
 const presetsOf = (e) => {
   const value = transitionPreset(e);
@@ -118,7 +122,10 @@ function add() {
       <span v-else class="name">{{ summary?.name || playlist }}</span>
       <span v-for="c in playingOn" :key="c.index" class="pill ok">{{ c.label }} entry {{ c.playlist_index + 1 }}</span>
       <span class="spacer"></span>
-      <span class="muted small">{{ entries.length }} clips · <span class="num">{{ fmtNs(total) }}</span><template v-if="summary?.loop"> · loops</template></span>
+      <span class="muted small">{{ entries.length }} clips · <span class="num">{{ fmtNs(total) }}</span></span>
+      <button v-if="summary" class="btn secondary small" :aria-pressed="!!summary.loop" title="Loop: after the last clip, start again at the first" @click="toggleLoop">
+        Loop {{ summary.loop ? "on" : "off" }}
+      </button>
     </div>
     <div v-if="missing" class="empty">No playlist {{ picked }}</div>
     <template v-else-if="picked && loaded">

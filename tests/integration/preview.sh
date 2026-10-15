@@ -165,7 +165,7 @@ grep -qi "^content-security-policy: frame-ancestors 'self' http://designer.test"
 [[ "$(code "http://127.0.0.1:${WEB_PORT}/widget/timeline?channel=1")" == 200 ]] || { echo "own: timeline widget" >&2; exit 1; }
 [[ "$(code "http://127.0.0.1:${WEB_PORT}/widget/timeline")" == 400 ]] || { echo "own: timeline widget without channel" >&2; exit 1; }
 curl -sf -D "$WORK/widgets.headers" -H 'Origin: http://designer.test' "http://127.0.0.1:${WEB_PORT}/widgets" |
-  python3 -c 'import json,sys; assert [w["id"] for w in json.load(sys.stdin)] == ["transport", "clip-list", "playlist-editor", "playlist-player", "timeline"]'
+  python3 -c 'import json,sys; assert [w["id"] for w in json.load(sys.stdin)] == ["transport", "clip-list", "playlist-editor", "timeline"]'
 grep -qi "^access-control-allow-origin: http://designer.test" "$WORK/widgets.headers" || { echo "own: /widgets CORS" >&2; exit 1; }
 METRICS=$(curl -sf "http://127.0.0.1:${WEB_PORT}/metrics")
 for line in 'preview_mode{mode="webrtc"} 1' 'preview_publish_mode{mode="own"} 1' 'preview_publish_state{state="publishing",stream="mxl-replay/mosaic"} 1'; do
