@@ -300,15 +300,11 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-bottom-wi
 .widget-cd .num { color: var(--text); font-weight: 700; }
 .widget-transport .btn-grid button.btn { padding: .45rem .3rem; }
 .widget-clips { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: .4rem; }
-.widget-list { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: .3rem; }
-.widget-clip { position: relative; display: flex; align-items: center; gap: .5rem; padding: .3rem .5rem .3rem .7rem; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
-.widget-clip.cued { border-color: var(--warn); }
-.widget-clip.playing, .widget-clip.paused { border-color: var(--ok); }
-.widget-clip .stripe { position: absolute; left: 0; top: 0; bottom: 0; width: 4px; border-radius: 6px 0 0 6px; }
-.widget-clip img { flex: none; width: 64px; height: 36px; object-fit: cover; border-radius: 3px; background: #000; }
-.widget-clip .text { flex: 1; min-width: 0; }
-.widget-clip .name { font-weight: 600; font-size: .85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.widget-clip .meta { font-size: .72rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.widget-clips .widget-head { flex-wrap: wrap; }
+.widget-shots { flex: 1; min-height: 0; overflow: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); grid-auto-rows: 132px; gap: .45rem; }
+.widget-shots .shot .label { padding: .25rem .45rem .3rem .8rem; }
+.widget-shots .shot .name { font-size: .82rem; }
+.widget-shots .shot .meta { font-size: .7rem; gap: .35rem; }
 
 @media (max-width: 1100px) {
   .lsm { grid-template-columns: 1fr; grid-template-rows: auto; }
@@ -338,9 +334,6 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-bottom-wi
 .widget-entry.dim { opacity: .55; }
 .widget-row { display: flex; gap: .4rem; align-items: center; }
 .widget-row select { flex: 1; min-width: 0; }
-.widget-big { display: flex; align-items: baseline; gap: .8rem; }
-.widget-big .cd { font-family: ui-monospace, monospace; font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
-.widget-big .cd.soon { color: var(--bad); }
 .widget-timeline { display: flex; flex-direction: column; gap: .4rem; }
 .widget-timeline .timeline-head .small { display: none; }
 .widget-timeline .btn-grid button.btn { padding: .4rem .3rem; }

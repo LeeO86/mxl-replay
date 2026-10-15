@@ -526,22 +526,22 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
   marks and their length, and Create clip (IN to OUT on the channel's camera with the
   automatic name; at the protection cap, 409, the operator confirms and it is sent with
   `force`). Without the new params it looks as before.
-- `clip-list` (`channel`, optional; `min_size` 400×300): every clip, newest first, with its
-  shotbox button on the channel (Load cues it; then Play, Pause). Without `channel` the
-  widget has a channel picker.
+- `clip-list` (`channel`, optional; `min_size` 400×300): the shotbox's buttons (§8.1) for the
+  channel since 1.7.0: clips and playlists in shotbox order, with the shotbox's filter (all,
+  clips, playlists; kept in the browser), thumbnails (a playlist's first three clips stacked),
+  the state on the channel and the progress. A click is a shotbox click: it cues the clip or
+  the playlist's first clip, the next click plays, the next pauses. Without `channel` the
+  widget has a channel picker. (Before 1.7.0: clips only, newest first, with Load.)
 - `playlist-editor` (`playlist`, optional; `min_size` 480×320): one playlist's entries, each
   with its clip's IN thumbnail, length, speed (1–200 %), end action, transition (*Cut*,
   *Mix 12*, *Mix 25*, *Mix 50*; 1.6.0), own audio (♪), up, down and remove, the aux track's
   source and level (1.6.0), and *Add a clip* (newest first; a new entry ends with `next` and
   auto-advances). Every change is
-  saved at once (`PUT /api/v1/playlists/{id}` with the entries). Without `playlist` the
-  widget has a playlist picker. A channel on the playlist marks its entry.
-- `playlist-player` (`channel`, required; `playlist`, optional: a picker; `min_size`
-  420×200): the channel's label, state and timecode; the countdown to the playlist's end
-  (§8.1, red under 5 s while it plays), the entry playing; Cue (the first clip, paused:
-  `POST /api/v1/playlists/{id}/cue {"channel"}`), Play / Pause (on this playlist: play or
-  pause the channel; else `…/play`), Stop (§7) and Loop (the playlist's `loop`, saved at
-  once).
+  saved at once (`PUT /api/v1/playlists/{id}` with the entries). Loop on/off (the playlist's
+  `loop`, 1.7.0). Without `playlist` the widget has a playlist picker. A channel on the
+  playlist marks its entry.
+- `playlist-player` (1.6.0 only): removed in 1.7.0. Playlists play from `clip-list` as in the
+  shotbox; the countdowns are on the `transport` widget, Loop on/off in `playlist-editor`.
 - `timeline` (`channel`, required; `min_size` 600×180): the LSM tab's timeline (§8.2) for
   the channel: its camera's buffer, the clips as marks, IN/OUT and the position; drag to
   seek, the wheel ±1 frame (Shift ±1 s), the zoom; IN, OUT, Go IN, Go OUT, ±1 frame and

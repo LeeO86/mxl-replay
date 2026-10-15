@@ -149,13 +149,8 @@ std::vector<WidgetSpec> const& widgetSpecs()
          {{"channel", "channel", "Channel", true, false},
           {"clip", "boolean", "IN / OUT, Go IN / Go OUT and Create clip", false, false},
           {"presets", "boolean", "Speed presets", false, true}}},
-        {"clip-list", "Replay clips", 400, 300, {{"channel", "channel", "Channel to load into (empty: a channel picker)", false, false}}},
+        {"clip-list", "Replay clips and playlists", 400, 300, {{"channel", "channel", "Channel to load into (empty: a channel picker)", false, false}}},
         {"playlist-editor", "Replay playlist editor", 480, 320, {{"playlist", "playlist", "Playlist (empty: a playlist picker)", false, false}}},
-        {"playlist-player",
-         "Replay playlist player",
-         420,
-         200,
-         {{"channel", "channel", "Channel", true, false}, {"playlist", "playlist", "Playlist (empty: a playlist picker)", false, false}}},
         {"timeline", "Replay timeline", 600, 180, {{"channel", "channel", "Channel", true, false}}},
     };
     return specs;

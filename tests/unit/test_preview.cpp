@@ -331,7 +331,7 @@ TEST_CASE("widgets: the list with CORS for listed origins, the pages with CSP fr
         CHECK(item.get("version")->text == REPLAY_VERSION);
         CHECK(item.get("params")->get("type")->text == "object");
     }
-    CHECK(ids == std::vector<std::string>{"transport", "clip-list", "playlist-editor", "playlist-player", "timeline"});
+    CHECK(ids == std::vector<std::string>{"transport", "clip-list", "playlist-editor", "timeline"});
     auto const& transport = widgets.items[0];
     CHECK(transport.get("min_size")->get("w")->text == "480");
     CHECK(transport.get("min_size")->get("h")->text == "180");
@@ -382,9 +382,8 @@ TEST_CASE("widgets: the list with CORS for listed origins, the pages with CSP fr
     CHECK(get(*engine, "/widget/playlist-editor", "playlist=playlist-3").status == 200);
     CHECK(get(*engine, "/widget/playlist-editor", "playlist=a%2Fb").status == 400);
     CHECK(get(*engine, "/widget/playlist-editor", "playlist=" + std::string(65, 'p')).status == 400);
-    CHECK(get(*engine, "/widget/playlist-player", "channel=2&playlist=playlist-3").status == 200);
-    CHECK(get(*engine, "/widget/playlist-player").status == 400);
-    CHECK(get(*engine, "/widget/playlist-player", "channel=1&playlist=%3Cx%3E").status == 400);
+    // 1.7.0: the playlist player widget is gone (playlists play from clip-list, as in the shotbox).
+    CHECK(get(*engine, "/widget/playlist-player", "channel=2&playlist=playlist-3").status == 404);
     CHECK(get(*engine, "/widget/timeline", "channel=2").status == 200);
     CHECK(get(*engine, "/widget/timeline").status == 400);
     CHECK(get(*engine, "/widget/timeline", "channel=0").status == 400);

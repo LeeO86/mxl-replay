@@ -6,7 +6,6 @@
 import { onMounted, onUnmounted, ref, watch } from "vue";
 import ClipListWidget from "./ClipListWidget.vue";
 import PlaylistEditorWidget from "./PlaylistEditorWidget.vue";
-import PlaylistPlayerWidget from "./PlaylistPlayerWidget.vue";
 import TimelineWidget from "./TimelineWidget.vue";
 import TransportWidget from "./TransportWidget.vue";
 import { start, state, stop } from "../store.js";
@@ -16,7 +15,6 @@ const WIDGETS = {
   transport: TransportWidget,
   "clip-list": ClipListWidget,
   "playlist-editor": PlaylistEditorWidget,
-  "playlist-player": PlaylistPlayerWidget,
   timeline: TimelineWidget,
 };
 
