@@ -168,6 +168,10 @@ public:
     bool consolidate(std::string const& id, std::string& error);
 
     void setRoute(int camera, int phase, bool video, Route route, bool persist = false);
+    // The recorder's status of a route ("waiting", "running", ...): set only while the route is still the one it
+    // read (active, same domain, flow and sender), so an IS-05 activation in between is never overwritten.
+    // False when the route changed.
+    bool setRouteState(int camera, int phase, bool video, Route const& expected, std::string const& state);
     [[nodiscard]] Route route(int camera, int phase, bool video) const;
 
     [[nodiscard]] std::string exportConfigJson() const;

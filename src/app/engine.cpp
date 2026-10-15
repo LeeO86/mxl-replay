@@ -2493,6 +2493,19 @@ void Engine::setRoute(int camera, int phase, bool video, Route route, bool persi
     }
 }
 
+bool Engine::setRouteState(int camera, int phase, bool video, Route const& expected, std::string const& state)
+{
+    std::lock_guard lock{mutex_};
+    auto const it = routes_.find(std::to_string(camera) + (video ? "v" : "a") + std::to_string(phase));
+    if (it == routes_.end() || !it->second.active || it->second.domainId != expected.domainId || it->second.flowId != expected.flowId ||
+        it->second.senderId != expected.senderId)
+    {
+        return false;
+    }
+    it->second.state = state;
+    return true;
+}
+
 
 std::string Engine::exportConfigJson() const
 {

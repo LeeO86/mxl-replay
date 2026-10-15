@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.1
+
+- Fix: an NMOS IS-05 activation of a camera receiver could be lost. The recorder wrote its route snapshot back with each status update ("waiting", "running"), so an activation that came in between was overwritten. In a lab test a disable was ignored 1 time in 20 and a switch to another sender was lost 4 times in 40, and it stayed lost: IS-05 `/active` showed the new flow while the camera kept recording the old one. The recorder now only sets the status, and only while the route is still the one it read.
+
 ## 1.6.0
 
 - Playlist transitions: an entry has a transition into it, `cut` (as before) or `mix` over `transition_frames` (1–250, default 25), and an audio crossfade over `audio_frames` (−1, the default: as the mix, and 2 frames on a cut, so the join does not click; 0: the audio cuts). The two entries overlap by the longer of both; the channel moves to the incoming entry when the transition starts. Each grain of a mix blends the two entries' nearest frames at `(k+1)/(N+1)` (GPU: the blend path without a flow; one extra JPEG decode per grain of a mix). The audio crossfade is equal power (sin/cos per sample: two entries are uncorrelated programme, so the loudness stays even; a linear fade dips 3 dB). A mix needs *next* with auto-advance (or the loop wrap, or the idle playlist), else the join cuts. Status per channel `transition`; metric `transitions_total{channel,kind}`; log `transition`. The countdowns and `duration_ns` take the overlaps off.
