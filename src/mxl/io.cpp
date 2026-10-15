@@ -309,8 +309,8 @@ void MxlBridge::readInput(int camera, int phase)
     auto audioRoute = [&](Route const& route, std::string const& state) {
         if (state != audioState)
         {
-            audioState = state;
-            engine_.setRoute(camera, 1, false, Route{true, route.domainId, route.flowId, route.senderId, state});
+            // The route changed meanwhile (an IS-05 activation): forget the state, set it on the new route next time.
+            audioState = engine_.setRouteState(camera, 1, false, route, state) ? state : std::string{};
         }
     };
     auto readAudio = [&](std::uint64_t index) -> std::vector<float> {
@@ -425,7 +425,7 @@ void MxlBridge::readInput(int camera, int phase)
         watch.connect(mxlGetTime());
         if (!attach(input, route, true))
         {
-            engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
+            engine_.setRouteState(camera, phase, true, route, "waiting");
             stalled(false);
             return false;
         }
@@ -480,7 +480,7 @@ void MxlBridge::readInput(int camera, int phase)
             if (status != MXL_STATUS_OK)
             {
                 close(input, true);
-                engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "waiting"});
+                engine_.setRouteState(camera, phase, true, route, "waiting");
                 break;
             }
             input.wait.read();
@@ -494,7 +494,7 @@ void MxlBridge::readInput(int camera, int phase)
                     engine_.ingestAudio(camera, mxlIndexToTimestamp(&rate, input.next), std::move(pcm), 2);
                 }
                 engine_.ingestV210(camera, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
-                engine_.setRoute(camera, phase, true, Route{true, route.domainId, route.flowId, route.senderId, "running"});
+                engine_.setRouteState(camera, phase, true, route, "running");
                 read = true;
                 if (auto const gap = watch.recorded(mxlGetTime()); gap != 0)
                 {
