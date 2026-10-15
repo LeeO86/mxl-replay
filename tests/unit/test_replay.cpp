@@ -1829,3 +1829,27 @@ TEST_CASE("a websocket client that does not read is dropped, not waited for")
     ::close(fd);
     server.stop();
 }
+
+TEST_CASE("the recorder's route state never overwrites an IS-05 activation that came in between")
+{
+    auto const dir = freshDir("mxl-replay-route-cas");
+    auto engine = recordedEngine(dir, 2);
+    Route const first{true, "domain-a", "flow-a", "sender-a", "waiting"};
+    engine->setRoute(1, 1, true, first);
+    // The recorder read `first` and reports it running.
+    CHECK(engine->setRouteState(1, 1, true, first, "running"));
+    CHECK(engine->route(1, 1, true).state == "running");
+    // An activation to another sender lands; the recorder's late report for the old route is refused.
+    engine->setRoute(1, 1, true, Route{true, "domain-a", "flow-b", "sender-b", "waiting"});
+    CHECK_FALSE(engine->setRouteState(1, 1, true, first, "running"));
+    auto const now = engine->route(1, 1, true);
+    CHECK(now.flowId == "flow-b");
+    CHECK(now.senderId == "sender-b");
+    CHECK(now.state == "waiting");
+    // A disable is not undone either.
+    engine->setRoute(1, 1, true, Route{false, "domain-a", "flow-b", "sender-b", "waiting"});
+    CHECK_FALSE(engine->setRouteState(1, 1, true, Route{true, "domain-a", "flow-b", "sender-b", ""}, "running"));
+    CHECK_FALSE(engine->route(1, 1, true).active);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
