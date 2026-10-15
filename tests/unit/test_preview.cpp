@@ -348,11 +348,7 @@ TEST_CASE("widgets: the list with CORS for listed origins, the pages with CSP fr
     auto const& editor = widgets.items[2];
     CHECK(editor.get("params")->get("properties")->get("playlist")->get("type")->text == "string");
     CHECK(editor.get("params")->get("required") == nullptr);
-    auto const& player = widgets.items[3];
-    CHECK(player.get("params")->get("required")->items.size() == 1);
-    CHECK(player.get("params")->get("required")->items[0].text == "channel");
-    CHECK(player.get("params")->get("properties")->get("playlist") != nullptr);
-    auto const& timeline = widgets.items[4];
+    auto const& timeline = widgets.items[3];
     CHECK(timeline.get("params")->get("required")->items[0].text == "channel");
     CHECK(timeline.get("min_size")->get("w")->text == "600");
 
