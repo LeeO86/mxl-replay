@@ -129,6 +129,17 @@ TEST_CASE("phased HFR repeats a missing phase")
     CHECK(result.frames[1].timeNs <= result.frames[2].timeNs);
 }
 
+TEST_CASE("an interlaced video flow is unsupported, a progressive one is recorded")
+{
+    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_tff"})") == "interlaced");
+    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_bff"})") == "interlaced");
+    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_psf"})") == "interlaced");
+    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video","interlace_mode":"progressive"})").empty());
+    // Nothing to go by: read as before.
+    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video"})").empty());
+    CHECK(videoUnsupportedReason("").empty());
+}
+
 TEST_CASE("a grain the writer never wrote is not a drop, a grain the reader missed is")
 {
     std::uint64_t const start = 1000000000000ull;

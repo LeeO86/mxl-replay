@@ -118,6 +118,12 @@ struct AudioWatch
     void reset() { *this = AudioWatch{limit}; }
 };
 
+// Why a camera's video flow cannot be recorded, from its flow definition (flow_def.json): "interlaced"
+// when `interlace_mode` is anything but "progressive". MXL keeps an interlaced flow as fields (half the
+// lines, at twice the declared rate); the recorder takes whole progressive frames only. Empty when the
+// flow can be recorded or the definition does not say (it is not readable or has no interlace_mode).
+[[nodiscard]] std::string videoUnsupportedReason(std::string const& flowDef);
+
 class MxlBridge
 {
 public:

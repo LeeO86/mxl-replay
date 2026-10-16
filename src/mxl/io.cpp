@@ -4,6 +4,7 @@
 #include "flow/cuda_flow.hpp"
 #include "media/timebase.hpp"
 #include "media/v210.hpp"
+#include "util/json.hpp"
 #include "util/logging.hpp"
 
 #include <algorithm>
@@ -21,6 +22,42 @@
 
 namespace replay
 {
+std::string videoUnsupportedReason(std::string const& flowDef)
+{
+    Json def;
+    if (!parseJson(flowDef, def))
+    {
+        return {};
+    }
+    auto const* mode = def.get("interlace_mode");
+    auto const text = mode != nullptr ? jsonText(*mode) : std::nullopt;
+    return text && *text != "progressive" ? "interlaced" : std::string{};
+}
+
+#if defined(REPLAY_WITH_MXL)
+namespace
+{
+// The flow's definition (flow_def.json), empty when it cannot be read.
+std::string readFlowDef(mxlInstance instance, std::string const& flowId)
+{
+    std::size_t size = 0;
+    auto const first = mxlGetFlowDef(instance, flowId.c_str(), nullptr, &size);
+    if (first != MXL_ERR_INVALID_ARG && first != MXL_STATUS_OK)
+    {
+        return {};
+    }
+    std::string buffer(size == 0 ? 8192 : size, '\0');
+    size = buffer.size();
+    if (mxlGetFlowDef(instance, flowId.c_str(), buffer.data(), &size) != MXL_STATUS_OK)
+    {
+        return {};
+    }
+    buffer.resize(std::strlen(buffer.c_str()));
+    return buffer;
+}
+} // namespace
+#endif
+
 struct MxlBridge::Impl
 {
 #if defined(REPLAY_WITH_MXL)
@@ -413,6 +450,11 @@ void MxlBridge::readInput(int camera, int phase)
             logWarn("recording_stopped", fields);
         }
     };
+    // A flow that cannot be recorded (an interlaced one): its route ("<domain>/<flow>") and when it was
+    // checked. It is not read; it is checked again once a second, so a writer that makes it again as
+    // progressive is recorded.
+    std::string unsupportedFlow;
+    std::uint64_t unsupportedAtNs = 0;
     // Reads (and encodes) every grain due since the last call; false when nothing was read.
     auto step = [&]() -> bool {
         auto const route = engine_.route(camera, phase, true);
@@ -420,14 +462,43 @@ void MxlBridge::readInput(int camera, int phase)
         {
             close(input, true);
             watch = InputWatch{watch.timeoutNs};
+            unsupportedFlow.clear();
+            return false;
+        }
+        auto const flowKey = route.domainId + "/" + route.flowId;
+        if (flowKey == unsupportedFlow && mxlGetTime() < unsupportedAtNs + 1000000000ull)
+        {
             return false;
         }
         watch.connect(mxlGetTime());
+        bool const opening = input.reader == nullptr || input.domainId != route.domainId || input.flowId != route.flowId;
         if (!attach(input, route, true))
         {
             engine_.setRouteState(camera, phase, true, route, "waiting");
             stalled(false);
             return false;
+        }
+        if (opening)
+        {
+            auto const reason = videoUnsupportedReason(readFlowDef(input.instance, route.flowId));
+            if (!reason.empty())
+            {
+                if (flowKey != unsupportedFlow)
+                {
+                    auto fields = where;
+                    fields.emplace_back("flow", route.flowId);
+                    fields.emplace_back("reason", reason);
+                    logWarn("mxl_video_unsupported", fields);
+                    engine_.metrics().inc("record_unsupported_total", {{"camera", std::to_string(camera)}, {"reason", reason}});
+                }
+                unsupportedFlow = flowKey;
+                unsupportedAtNs = mxlGetTime();
+                close(input, true);
+                watch = InputWatch{watch.timeoutNs};
+                engine_.setRouteState(camera, phase, true, route, "unsupported");
+                return false;
+            }
+            unsupportedFlow.clear();
         }
         if (input.historyNs == 0)
         {

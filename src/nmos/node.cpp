@@ -17,6 +17,7 @@
 #if defined(REPLAY_WITH_NMOS)
 #include <limits>
 #include "cpprest/host_utils.h"
+#include "nmos/capabilities.h"
 #include "nmos/channels.h"
 #include "nmos/clock_name.h"
 #include "nmos/colorspace.h"
@@ -41,6 +42,7 @@
 #include "nmos/slog.h"
 #include "nmos/transfer_characteristic.h"
 #include "nmos/transport.h"
+#include "nmos/version.h"
 #include "sdp/json.h"
 #endif
 
@@ -316,6 +318,13 @@ void NmosNode::start()
                         auto const role = camera.phases > 1 ? "Video Phase " + std::to_string(phase) : std::string("Video");
                         receiver.data[U("label")] = web::json::value::string(us(camera.label + " " + role));
                         tagGroup(receiver, camera.label, role);
+                        // BCP-004-01: progressive only. The recorder takes whole frames; an interlaced flow (fields) is
+                        // refused by the reader (state "unsupported").
+                        web::json::value progressive = web::json::value::object();
+                        progressive[U("urn:x-nmos:cap:format:interlace_mode")] =
+                            nmos::make_caps_string_constraint({nmos::interlace_modes::progressive.name});
+                        receiver.data[U("caps")][U("constraint_sets")] = web::json::value_of({progressive});
+                        receiver.data[U("caps")][U("version")] = web::json::value::string(nmos::make_version());
                         nmos::insert_resource(nodeModel.node_resources, std::move(receiver));
                         auto connection = nmos::make_connection_mxl_receiver(us(id), {});
                         connection.data[U("active")][U("master_enable")] = web::json::value::boolean(false);
