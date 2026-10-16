@@ -99,6 +99,8 @@ of sequences beyond playlists, compressed outputs, HDR.
   `record_unsupported_total{camera,reason="interlaced"}` counted once per flow, and the
   flow is checked again once a second (a writer that makes it again as progressive is
   recorded). Recording interlaced inputs is an open design question.
+  Interlaced video and its ANC follow the shared MXL interlaced convention:
+  https://github.com/LeeO86/mxl-multiviewer/blob/main/docs/mxl-interlaced.md
 - A connected input that records nothing for `REPLAY_INPUT_STALL_S` (its writer
   stopped, the flow was removed, a fabrics mirror lost its link) logs
   `recording_stopped` once (camera, phase, reason). Recording resumes by itself when
