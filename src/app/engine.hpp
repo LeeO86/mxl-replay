@@ -250,7 +250,6 @@ private:
         std::vector<std::uint8_t> lastV210;
         std::string timecode; // of the last output grain (its ANC)
         std::uint64_t late = 0;
-        std::uint64_t ancSequence = 0;
         // The flows of the next grains (SPECIFICATION.md §5.3) and the grains blended without one.
         std::unique_ptr<FlowAhead> ahead;
         LogLimit fallbackLog;

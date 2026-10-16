@@ -262,7 +262,9 @@ Per channel (and stored per clip), `motion_mode`:
 ### 5.5 Timecode
 
 - The ANC sender carries SMPTE 12M timecode (ATC, same payload format as
-  mxl-test-player/mxl-decklink): either the **source** timecode (recording TAI time
+  mxl-test-player/mxl-decklink; the grain is the RFC 8331 payload from the Length
+  field on, as MXL docs/Architecture.md stores it: Length at byte 0, ANC_Count,
+  F, reserved, the packet at byte 6; 1.7.2): either the **source** timecode (recording TAI time
   of the frame being shown — so downstream systems see when the action happened) or
   the **output** time of day; configurable per channel (default source).
 - The same value is shown in the UI.

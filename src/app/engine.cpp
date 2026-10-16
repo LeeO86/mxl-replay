@@ -1021,7 +1021,6 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     runtime.timecode = rendered.timecode;
     AncPacket packet;
     packet.tc = tc;
-    packet.sequence = static_cast<std::uint16_t>(runtime.ancSequence++);
     rendered.anc = encodeAncGrain(packet);
 
     int const samples = audioSamplesForFrame(timestampToIndex(config_.format.rateNum, config_.format.rateDen, outputTaiNs), config_.format.rateNum,

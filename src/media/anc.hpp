@@ -6,9 +6,12 @@
 
 namespace replay
 {
-// SMPTE ST 12-2 ATC inside an RFC 8331 / video/smpte291 grain.
-// Same layout as mxl-test-player and mxl-decklink: 4096-byte grain, DID/SDID 0x60/0x60.
+// SMPTE ST 12-2 ATC inside an RFC 8331 / video/smpte291 grain, DID/SDID 0x60/0x60, 4096-byte grain.
+// Stored as MXL documents it (docs/Architecture.md): the payload from the Length field on, without
+// the RTP header and the extended sequence number, as mxl-st2110-gateway reads and writes it.
 inline constexpr std::size_t kAncGrainSize = 4096;
+// Length(16) ANC_Count(8) F(2) reserved(22); the packets start at this byte.
+inline constexpr std::size_t kAncHeaderSize = 6;
 
 enum class AtcKind
 {
@@ -39,7 +42,6 @@ struct AncPacket
     AtcKind kind = AtcKind::Ltc;
     int line = 10;
     bool interlaced = false;
-    std::uint16_t sequence = 0;
 };
 
 [[nodiscard]] std::vector<std::uint8_t> encodeAncGrain(AncPacket const& packet);
