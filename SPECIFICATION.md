@@ -92,6 +92,13 @@ of sequences beyond playlists, compressed outputs, HDR.
 - Receiver behaviour as all media functions: activation accepted before the flow
   exists (`waiting`, retry), IS-04 `subscription` updated, domain scan of the MXL
   root including mirror domains.
+- Video inputs are progressive only (1.7.1). The video receivers' caps (BCP-004-01)
+  say `interlace_mode` `progressive`. A routed flow whose `flow_def.json` has another
+  `interlace_mode` (MXL keeps it as fields: half the lines, twice the rate) is not
+  read: the route state is `unsupported`, `mxl_video_unsupported` is logged and
+  `record_unsupported_total{camera,reason="interlaced"}` counted once per flow, and the
+  flow is checked again once a second (a writer that makes it again as progressive is
+  recorded). Recording interlaced inputs is an open design question.
 - A connected input that records nothing for `REPLAY_INPUT_STALL_S` (its writer
   stopped, the flow was removed, a fabrics mirror lost its link) logs
   `recording_stopped` once (camera, phase, reason). Recording resumes by itself when
@@ -578,7 +585,8 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
   default output domain id. `NMOS_LABEL` sets the node label and the device label.
   `NMOS_TAGS` is added to the node and the device. Group hints stay on the resources.
 - Inputs: per camera video + audio receivers; phase groups: N video receivers + one
-  audio receiver, grouped (`<camera>:Video Phase k`).
+  audio receiver, grouped (`<camera>:Video Phase k`). Video receivers' caps:
+  `interlace_mode` `progressive` (§4.1).
 - Outputs: per channel video, audio and data (`video/smpte291`) senders with Sources
   and Flows, grouped (`<channel>:Video|Audio|Data`). Each sender's active connection
   carries `mxl_domain_id` and `mxl_flow_id`. Flow IDs change only when the
@@ -627,7 +635,8 @@ Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`
 (grains the source wrote that were not recorded; grains it never wrote, before it
 started or while it stopped, do not count),
 `storage_write_failed_total` (frames lost to a full disk or an I/O error),
-`phase_missing_total`, `buffer_seconds`, `jpeg_encode_seconds`,
+`phase_missing_total`, `record_unsupported_total{camera,reason}` (a routed flow that
+cannot be recorded, once per flow: `interlaced`, 1.7.1), `buffer_seconds`, `jpeg_encode_seconds`,
 `record_last_frame_age_seconds` (since the newest recorded frame, counted from the
 process start at most; also `last_frame_age_s` per camera in the status); per channel
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,

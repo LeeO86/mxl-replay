@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.1
+
+- Fix: an interlaced camera input recorded nothing while its route said `running`. MXL keeps an interlaced flow as fields (half the lines, at twice the declared rate); the recorder read it at the frame rate, dropped every grain as too small for a frame, and still set the route to `running`. Now the video receivers' NMOS caps say `interlace_mode` `progressive` (BCP-004-01), so a controller that checks caps does not route an interlaced sender, and a routed flow whose `flow_def.json` is not progressive is not read: the route state is `unsupported` (red in the UI, `video_states` in the status), `mxl_video_unsupported` is logged once (`camera`, `phase`, `flow`, `reason` `interlaced`) and the new counter `record_unsupported_total{camera,reason}` counts it once per flow. The flow is checked again once a second, so one made again as progressive is recorded. Recording interlaced inputs is not supported (an open design question).
+- The Compose and Kubernetes examples use the `1.7.1` image.
+
 ## 1.7.0
 
 - Widget `clip-list` is the shotbox for one channel: clips and playlists in shotbox order, the shotbox's filter (all, clips, playlists; kept in the browser), thumbnails (a playlist's first three clips stacked), the state on the channel and the progress. A click is a shotbox click (cue, play, pause), for a playlist too. Before, it listed clips only, newest first.
