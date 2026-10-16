@@ -208,15 +208,15 @@ std::vector<std::uint8_t> encodeAncGrain(AncPacket const& pkt)
     bw.align32();
 
     int const f = !pkt.interlaced ? 0 : (pkt.tc.field != 0 ? 0x3 : 0x2);
+    // MXL stores the RFC 8331 payload from the Length field on: Length(16) ANC_Count(8) F(2)
+    // reserved(22), then the packets at byte 6.
     std::vector<std::uint8_t> grain(kAncGrainSize, 0);
-    grain[0] = static_cast<std::uint8_t>(pkt.sequence >> 8);
-    grain[1] = static_cast<std::uint8_t>(pkt.sequence);
     auto const length = static_cast<std::uint16_t>(ancBytes.size());
-    grain[2] = static_cast<std::uint8_t>(length >> 8);
-    grain[3] = static_cast<std::uint8_t>(length);
-    grain[4] = 1;
-    grain[5] = static_cast<std::uint8_t>(f << 6);
-    std::memcpy(grain.data() + 8, ancBytes.data(), std::min(ancBytes.size(), grain.size() - 8));
+    grain[0] = static_cast<std::uint8_t>(length >> 8);
+    grain[1] = static_cast<std::uint8_t>(length);
+    grain[2] = 1; // ANC_Count
+    grain[3] = static_cast<std::uint8_t>(f << 6);
+    std::memcpy(grain.data() + kAncHeaderSize, ancBytes.data(), std::min(ancBytes.size(), grain.size() - kAncHeaderSize));
     return grain;
 }
 
@@ -226,16 +226,16 @@ bool decodeAncTimecode(std::uint8_t const* grain, std::size_t size, Timecode& ou
     {
         return false;
     }
-    if (grain[4] < 1)
+    if (grain[2] < 1)
     {
         return false;
     }
-    std::uint16_t const length = static_cast<std::uint16_t>((grain[2] << 8) | grain[3]);
-    if (static_cast<std::size_t>(8 + length) > size)
+    std::uint16_t const length = static_cast<std::uint16_t>((grain[0] << 8) | grain[1]);
+    if (kAncHeaderSize + length > size)
     {
         return false;
     }
-    BitReader br(grain + 8, length);
+    BitReader br(grain + kAncHeaderSize, length);
     if (br.get(32) < 0)
     {
         return false;
@@ -294,7 +294,7 @@ bool decodeAncTimecode(std::uint8_t const* grain, std::size_t size, Timecode& ou
     out.hh = (ht & 0x3) * 10 + (hu & 0xF);
     out.drop = (ft & 0x4) != 0;
     out.field = (ht & 0x8) != 0 ? 1 : 0;
-    int const f = (grain[5] >> 6) & 0x3;
+    int const f = (grain[3] >> 6) & 0x3;
     if (f == 0x3)
     {
         out.field = 1;

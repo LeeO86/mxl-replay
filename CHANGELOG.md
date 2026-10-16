@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.2
+
+- Fix: the ANC timecode grain starts at the RFC 8331 Length field, as MXL stores it. MXL (docs/Architecture.md, `video/smpte291`) keeps the RFC 8331 payload from the Length field on; the RTP header and the extended sequence number are not stored. Replay wrote a 2-byte sequence number first (the layout copied from mxl-test-player), so Length was at byte 2 and the ATC packet at byte 8, and a reader that follows MXL (mxl-st2110-gateway ANC egress, MXL's `mxl-data-probe`, gst-mxl-rs) read the sequence number as Length. Now Length is at byte 0, ANC_Count at byte 2, the F bits at byte 3 (unchanged values), reserved to byte 5 and the packet at byte 6; the packet itself is unchanged and the sequence number is gone. Replay's own decoder reads the new layout; grains written by an older version (a stale data flow) are no longer decoded.
+- New unit test: the grain bytes of a progressive LTC packet and of a field-2 VITC1 packet equal reference vectors from mxl-st2110-gateway's ANC codec (`codec::serialiseGrain`), the same vectors as mxl-test-player 1.2.4. Checked once against the gateway's parser: no parity or checksum errors.
+- The Compose and Kubernetes examples use the `1.7.2` image.
+
 ## 1.7.1
 
 - Fix: an interlaced camera input recorded nothing while its route said `running`. MXL keeps an interlaced flow as fields (half the lines, at twice the declared rate); the recorder read it at the frame rate, dropped every grain as too small for a frame, and still set the route to `running`. Now the video receivers' NMOS caps say `interlace_mode` `progressive` (BCP-004-01), so a controller that checks caps does not route an interlaced sender, and a routed flow whose `flow_def.json` is not progressive is not read: the route state is `unsupported` (red in the UI, `video_states` in the status), `mxl_video_unsupported` is logged once (`camera`, `phase`, `flow`, `reason` `interlaced`) and the new counter `record_unsupported_total{camera,reason}` counts it once per flow. The flow is checked again once a second, so one made again as progressive is recorded. Recording interlaced inputs is not supported (an open design question).

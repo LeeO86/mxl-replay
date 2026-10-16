@@ -517,6 +517,46 @@ TEST_CASE("anc timecode round trip matches the source time")
     CHECK(decoded.format() == formatTimecode(3'661'000'000'000ull, 50, 1, false));
 }
 
+TEST_CASE("anc grain bytes are the RFC 8331 payload from the Length field on, as MXL stores it")
+{
+    // Reference vectors: mxl-st2110-gateway codec::serialiseGrain (the gateway's ANC ingest and
+    // egress codec, which follows MXL docs/Architecture.md and mxl-data-probe) for the same packet.
+    // Length(16) ANC_Count(8) F(2) reserved(22), then the packet at byte 6.
+    std::vector<std::uint8_t> const progressive = {0x00, 0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0xAF, 0xFE, 0x00, 0x98, 0x26, 0x04,
+        0x41, 0x20, 0x80, 0x11, 0x08, 0x02, 0x00, 0x80, 0x23, 0x08, 0x02, 0x00, 0x80, 0x12, 0x08, 0x02, 0x00, 0x80, 0x11, 0x08, 0x02,
+        0x60, 0x00, 0x00, 0x00};
+    std::vector<std::uint8_t> const field2 = {0x00, 0x20, 0x01, 0xC0, 0x00, 0x00, 0x23, 0xCF, 0xFE, 0x00, 0x98, 0x26, 0x04, 0x42,
+        0x28, 0x80, 0x11, 0x08, 0x02, 0x00, 0x80, 0x23, 0x08, 0x02, 0x00, 0x80, 0x12, 0x08, 0x02, 0x00, 0x80, 0x29, 0x08, 0x02, 0xE8,
+        0x00, 0x00, 0x00};
+    auto matches = [](std::vector<std::uint8_t> const& grain, std::vector<std::uint8_t> const& ref) {
+        REQUIRE(grain.size() == kAncGrainSize);
+        CHECK(std::vector<std::uint8_t>(grain.begin(), grain.begin() + static_cast<std::ptrdiff_t>(ref.size())) == ref);
+        CHECK(std::all_of(grain.begin() + static_cast<std::ptrdiff_t>(ref.size()), grain.end(), [](std::uint8_t b) { return b == 0; }));
+    };
+
+    AncPacket a;
+    a.tc.hh = 10;
+    a.tc.mm = 20;
+    a.tc.ss = 30;
+    a.tc.ff = 12;
+    a.line = 10;
+    matches(encodeAncGrain(a), progressive); // LTC, F = 0b00
+
+    AncPacket b = a;
+    b.interlaced = true;
+    b.tc.field = 1;
+    b.line = 572;
+    b.kind = AtcKind::Vitc1;
+    matches(encodeAncGrain(b), field2); // VITC1, F = 0b11, line 572
+
+    Timecode tc;
+    AtcKind kind = AtcKind::Ltc;
+    REQUIRE(decodeAncTimecode(field2.data(), field2.size(), tc, kind));
+    CHECK(tc.format() == "10:20:30:12");
+    CHECK(tc.field == 1);
+    CHECK(kind == AtcKind::Vitc1);
+}
+
 TEST_CASE("config env overrides the file and unknown env keys are ignored")
 {
     std::map<std::string, std::string> file{{"REPLAY_INPUTS", "2"}, {"WEB_PORT", "9000"}};
