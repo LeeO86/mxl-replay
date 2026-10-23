@@ -1026,6 +1026,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     {
         // One grain per field at the field rate, F bits 0b10 and 0b11, the same timecode in both.
         packet.interlaced = true;
+        packet.thirtyFrame = config_.format.rateNum == 30000 && config_.format.rateDen == 1001;
         rendered.anc = encodeAncGrain(packet);
         packet.tc.field = 1;
         packet.line = 572;

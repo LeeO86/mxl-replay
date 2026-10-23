@@ -8,6 +8,7 @@
 #include "mxl/io.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <stdexcept>
@@ -27,6 +28,36 @@ std::vector<std::uint8_t> lineNumbered(std::size_t rowBytes, int height)
         std::fill_n(frame.begin() + static_cast<std::ptrdiff_t>(rowBytes * static_cast<std::size_t>(y)), rowBytes, static_cast<std::uint8_t>(y + 1));
     }
     return frame;
+}
+
+// UDW byte `index` (0–15) of the first ATC packet in an ANC grain (packet at byte 6: a 32-bit header,
+// then 10-bit words DID, SDID, DC and the 16 UDW).
+int udw(std::vector<std::uint8_t> const& grain, int index)
+{
+    std::size_t const bit = (kAncHeaderSize * 8) + 32 + static_cast<std::size_t>(3 + index) * 10;
+    int word = 0;
+    for (std::size_t i = 0; i < 10; ++i)
+    {
+        auto const at = bit + i;
+        word = (word << 1) | ((grain[at / 8] >> (7 - at % 8)) & 1);
+    }
+    return word & 0xFF;
+}
+
+std::map<std::string, std::string> houseEnv(std::filesystem::path const& dir, std::string const& format)
+{
+    return {
+        {"REPLAY_FORMAT", format},
+        {"REPLAY_INPUTS", "1"},
+        {"REPLAY_CHANNELS", "1"},
+        {"REPLAY_BUFFER_HOURS", "0.01"},
+        {"REPLAY_STORAGE_DIR", dir.string()},
+        {"REPLAY_STATE_DIR", (dir / "state").string()},
+        {"NMOS_HOST_ADDRESS", "10.1.2.3"},
+        {"REPLAY_ALLOW_CPU_INTERP", "true"},
+        {"REPLAY_STORAGE_MIN_MBPS", "0"},
+        {"HOST_ID", "test-host"},
+    };
 }
 } // namespace
 
@@ -55,6 +86,10 @@ TEST_CASE("interlaced house formats: 1080i25 and 1080i2997, top field first only
     CHECK_THROWS_AS(parseVideoFormat("1080i5994"), std::runtime_error);
     CHECK_THROWS_AS(parseVideoFormat("1080i25bff"), std::runtime_error);
     CHECK_THROWS_AS(parseVideoFormat("1920x1081i25"), std::runtime_error);
+    // The interlaced house is 1920×1080 only.
+    CHECK_THROWS_AS(parseVideoFormat("720i25"), std::runtime_error);
+    CHECK_THROWS_AS(parseVideoFormat("64x32i25"), std::runtime_error);
+    CHECK_THROWS_AS(parseVideoFormat("1920x1088i25"), std::runtime_error);
 
     auto const p50 = parseVideoFormat("1080p50");
     CHECK_FALSE(p50.interlaced);
@@ -95,6 +130,21 @@ TEST_CASE("how a video flow is read: woven in an interlaced house, refused other
     CHECK(videoInputMode(flow("progressive", 25, 1), i25).unsupported.empty());
     CHECK_FALSE(videoInputMode(flow("progressive", 25, 1), i25).interlaced);
     CHECK(videoInputMode(flow("interlaced_tff", 30000, 1001), parseVideoFormat("1080i2997")).interlaced);
+    // A progressive flow at another rate would stall: refused as `rate` in an interlaced house.
+    CHECK(videoInputMode(flow("progressive", 50, 1), i25).unsupported == "rate");
+    CHECK(videoInputMode(flow("progressive", 30000, 1001), i25).unsupported == "rate");
+    // Progressive houses are not changed (a separate PR).
+    CHECK(videoInputMode(flow("progressive", 25, 1), p50).unsupported.empty());
+
+    // Another raster: refused as `raster` in an interlaced house, interlaced or progressive.
+    auto const sized = [](char const* mode, int w, int h) {
+        return std::string(R"({"interlace_mode":")") + mode + R"(","grain_rate":{"numerator":25,"denominator":1},"frame_width":)" +
+               std::to_string(w) + R"(,"frame_height":)" + std::to_string(h) + "}";
+    };
+    CHECK(videoInputMode(sized("interlaced_tff", 1920, 1080), i25).interlaced);
+    CHECK(videoInputMode(sized("interlaced_tff", 1280, 720), i25).unsupported == "raster");
+    CHECK(videoInputMode(sized("progressive", 1280, 720), i25).unsupported == "raster");
+    CHECK(videoInputMode(sized("progressive", 1920, 1080), i25).unsupported.empty());
 
     // Nothing to go by: read as progressive, as before.
     CHECK(videoInputMode(R"({"format":"urn:x-nmos:format:video"})", i25).unsupported.empty());
@@ -169,27 +219,15 @@ TEST_CASE("an interlaced house records and plays frames, with one ANC grain per 
 {
     auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-interlaced";
     std::filesystem::remove_all(dir);
-    std::map<std::string, std::string> env{
-        {"REPLAY_FORMAT", "64x32i25"},
-        {"REPLAY_INPUTS", "1"},
-        {"REPLAY_CHANNELS", "1"},
-        {"REPLAY_BUFFER_HOURS", "0.01"},
-        {"REPLAY_STORAGE_DIR", dir.string()},
-        {"REPLAY_STATE_DIR", (dir / "state").string()},
-        {"NMOS_HOST_ADDRESS", "10.1.2.3"},
-        {"REPLAY_ALLOW_CPU_INTERP", "true"},
-        {"REPLAY_STORAGE_MIN_MBPS", "0"},
-        {"HOST_ID", "test-host"},
-    };
     {
-        Engine engine(loadConfig(env, {}).config);
+        Engine engine(loadConfig(houseEnv(dir, "1080i25"), {}).config);
         CHECK(engine.config().format.interlaced);
         engine.openBuffer();
         // Frames at the frame rate (40 ms), as the reader stores woven ones.
         for (int i = 0; i < 6; ++i)
         {
             Frame10 frame;
-            frame.allocate(64, 32);
+            frame.allocate(1920, 1080);
             frame.fill(static_cast<std::uint16_t>(100 + i * 100), 512, 512);
             engine.ingestVideo(1, 1, static_cast<std::uint64_t>(i) * 40000000ull, std::move(frame));
         }
@@ -199,12 +237,12 @@ TEST_CASE("an interlaced house records and plays frames, with one ANC grain per 
         engine.setPosition(1, 80000000ull);
         auto const third = engine.render(1, 0);
         CHECK(third.positionNs == 80000000ull);
-        CHECK(third.v210.size() == v210Size(64, 32));
+        CHECK(third.v210.size() == v210Size(1920, 1080));
         Frame10 picture;
-        picture.allocate(64, 32);
-        unpackV210(third.v210.data(), static_cast<int>(v210RowBytes(64)), picture);
-        CHECK(picture.y[0] == 300);
-        CHECK(picture.y[static_cast<std::size_t>(64 * 31)] == 300); // both fields from the same frame
+        picture.allocate(1920, 1080);
+        unpackV210(third.v210.data(), static_cast<int>(v210RowBytes(1920)), picture);
+        CHECK(std::abs(picture.y[0] - 300) <= 4); // JPEG
+        CHECK(std::abs(picture.y[static_cast<std::size_t>(1920 * 1079)] - 300) <= 4); // both fields from the same frame
 
         // ANC: the first field's grain has F = 0b10, the second's F = 0b11, the same timecode.
         REQUIRE(third.anc.size() == kAncGrainSize);
@@ -219,6 +257,30 @@ TEST_CASE("an interlaced house records and plays frames, with one ANC grain per 
         CHECK(first.field == 0);
         CHECK(second.field == 1);
         CHECK(first.format() == second.format());
+        // 25 frames: the field mark is bit 59 (hours-tens flag), not bit 27.
+        CHECK((udw(third.ancSecond, 14) & 0x80) != 0);
+        CHECK((udw(third.ancSecond, 6) & 0x80) == 0);
+        CHECK((udw(third.anc, 14) & 0x80) == 0);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("at 1080i2997 the field mark is bit 27, not bit 59")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-interlaced-2997";
+    std::filesystem::remove_all(dir);
+    {
+        Engine engine(loadConfig(houseEnv(dir, "1080i2997"), {}).config);
+        engine.openBuffer();
+        auto const rendered = engine.render(1, 0);
+        REQUIRE(rendered.ancSecond.size() == kAncGrainSize);
+        CHECK((udw(rendered.ancSecond, 6) & 0x80) != 0);  // seconds-tens flag: bit 27
+        CHECK((udw(rendered.ancSecond, 14) & 0x80) == 0); // hours-tens flag: bit 59 stays clear
+        CHECK((udw(rendered.anc, 6) & 0x80) == 0);
+        Timecode tc;
+        AtcKind kind = AtcKind::Ltc;
+        REQUIRE(decodeAncTimecode(rendered.ancSecond.data(), rendered.ancSecond.size(), tc, kind));
+        CHECK(tc.field == 1);
     }
     std::filesystem::remove_all(dir);
 }

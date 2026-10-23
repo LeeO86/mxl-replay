@@ -103,13 +103,20 @@ of sequences beyond playlists, compressed outputs, HDR.
   Clips, positions, jog and slow motion therefore work on frames. A progressive flow at
   the house frame rate is recorded too. Bottom field first is refused (as on the other
   LeeO86 functions). The video receivers' caps (BCP-004-01) say `interlace_mode`
-  `progressive`, and in an interlaced house also `interlaced_tff`.
+  `progressive`, and in an interlaced house also `interlaced_tff`, with `grain_rate`,
+  `frame_width` and `frame_height` limited to the house's.
+- Shared convention compliance (the convention's table lives in mxl-multiviewer): replay
+  is a reader and a writer of interlaced video, **tff only** (1.8.0): it weaves
+  `interlaced_tff` inputs and writes `interlaced_tff` outputs; `interlaced_bff` is refused.
 - A routed flow that cannot be recorded is not read: the route state is `unsupported`,
   `mxl_video_unsupported` is logged and `record_unsupported_total{camera,reason}` counted
   once per flow, and the flow is checked again once a second (a writer that makes it again
   in a recordable format is recorded). Reasons: `interlaced` (an interlaced flow in a
   progressive house, 1.7.1, or `interlaced_psf`), `interlaced_bff` (bottom field first),
-  `interlaced_rate` (an interlaced flow at another frame rate than the house's).
+  `interlaced_rate` (an interlaced flow at another frame rate than the house's), and in an
+  interlaced house `rate` (a progressive flow at another rate) and `raster` (another
+  `frame_width` or `frame_height`). A progressive house does not check rate or raster yet
+  (nor does a native HFR camera): a separate change.
 - A connected input that records nothing for `REPLAY_INPUT_STALL_S` (its writer
   stopped, the flow was removed, a fabrics mirror lost its link) logs
   `recording_stopped` once (camera, phase, reason). Recording resumes by itself when
@@ -180,7 +187,7 @@ of sequences beyond playlists, compressed outputs, HDR.
 - Output format = house format (`REPLAY_FORMAT`, default 1080p50); all channels and
   inputs use the same raster. Inputs with another raster are scaled on decode
   (bilinear/bicubic on GPU), and this is shown as a warning.
-- Interlaced house formats (1.8.0): `1080i25` and `1080i2997` (the number is the frame rate,
+- Interlaced house formats (1.8.0): `1080i25` and `1080i2997`, 1920×1080 only (the number is the frame rate,
   as in mxl-test-player's `PLAYER_FORMAT`; `1080i29.97` and a `tff` suffix are accepted,
   `bff` is refused). The engine works at the frame rate; each output frame is written as two
   fields (`interlaced_tff`, grain 2k the even lines, 2k+1 the odd lines, both written when the
@@ -291,7 +298,9 @@ Per channel (and stored per clip), `motion_mode`:
 - Interlaced house (1.8.0): the ANC flow runs at the field rate (declared 50/1 or
   60000/1001), one grain per field with the same index as the video field: grain 2k
   with F = 0b10 (line 10), grain 2k+1 with F = 0b11 and the field mark (line 572), the
-  frame's timecode in both.
+  frame's timecode in both. The field mark is bit 59 at 25 frames and bit 27 at 29.97
+  (SMPTE ST 12-1). The 29.97 timecode is non-drop-frame (as before; drop frame is not
+  offered).
 - The same value is shown in the UI.
 
 ---
@@ -614,7 +623,8 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
 - Inputs: per camera video + audio receivers; phase groups: N video receivers + one
   audio receiver, grouped (`<camera>:Video Phase k`). Video receivers' caps:
   `interlace_mode` `progressive`, in an interlaced house also `interlaced_tff` (§4.1).
-  In an interlaced house the video flows say `interlaced_tff` at the frame rate and the
+  In an interlaced house the caps also limit `grain_rate`, `frame_width` and
+  `frame_height` to the house's. The video flows say `interlaced_tff` at the frame rate and the
   data flows and sources the field rate (§5.5).
 - Outputs: per channel video, audio and data (`video/smpte291`) senders with Sources
   and Flows, grouped (`<channel>:Video|Audio|Data`). Each sender's active connection
@@ -665,7 +675,7 @@ Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`
 started or while it stopped, do not count),
 `storage_write_failed_total` (frames lost to a full disk or an I/O error),
 `phase_missing_total`, `record_unsupported_total{camera,reason}` (a routed flow that
-cannot be recorded, once per flow: `interlaced`, 1.7.1; `interlaced_bff`, `interlaced_rate`, 1.8.0), `buffer_seconds`, `jpeg_encode_seconds`,
+cannot be recorded, once per flow: `interlaced`, 1.7.1; `interlaced_bff`, `interlaced_rate`, `rate`, `raster`, 1.8.0), `buffer_seconds`, `jpeg_encode_seconds`,
 `record_last_frame_age_seconds` (since the newest recorded frame, counted from the
 process start at most; also `last_frame_age_s` per camera in the status); per channel
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,

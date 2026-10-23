@@ -77,10 +77,10 @@ VideoFormat parseVideoFormat(std::string const& token)
     {
         throw std::runtime_error("unrecognised video format " + token);
     }
-    // MXL takes interlaced flows at 25/1 and 30000/1001 only, with an even height.
-    if (fmt.interlaced && (fmt.height % 2 != 0 || !((fmt.rateNum == 25 && fmt.rateDen == 1) || (fmt.rateNum == 30000 && fmt.rateDen == 1001))))
+    // MXL takes interlaced flows at 25/1 and 30000/1001 only; replay's interlaced house is 1920×1080.
+    if (fmt.interlaced && (fmt.width != 1920 || fmt.height != 1080 || !((fmt.rateNum == 25 && fmt.rateDen == 1) || (fmt.rateNum == 30000 && fmt.rateDen == 1001))))
     {
-        throw std::runtime_error("interlaced formats are 1080i25 or 1080i2997 (the frame rate: 1080i25 is 50 fields a second) with an even height: " + token);
+        throw std::runtime_error("interlaced formats are 1080i25 or 1080i2997 (the frame rate: 1080i25 is 50 fields a second): " + token);
     }
     return fmt;
 }

@@ -31,28 +31,43 @@ VideoInputMode videoInputMode(std::string const& flowDef, VideoFormat const& hou
     }
     auto const* mode = def.get("interlace_mode");
     auto const text = mode != nullptr ? jsonText(*mode) : std::nullopt;
-    if (!text || *text == "progressive")
+    bool const progressive = !text || *text == "progressive";
+    if (!house.interlaced)
     {
-        return {};
+        // Progressive house: as 1.7.1 (rate and raster are not checked here yet).
+        return progressive ? VideoInputMode{} : VideoInputMode{false, "interlaced"};
     }
-    if (!house.interlaced || (*text != "interlaced_tff" && *text != "interlaced_bff"))
+    if (!progressive && *text != "interlaced_tff" && *text != "interlaced_bff")
     {
         return {false, "interlaced"};
     }
-    if (*text == "interlaced_bff")
+    if (!progressive && *text == "interlaced_bff")
     {
         return {false, "interlaced_bff"};
     }
-    auto const* rate = def.get("grain_rate");
-    auto const* num = rate != nullptr ? rate->get("numerator") : nullptr;
-    auto const* den = rate != nullptr ? rate->get("denominator") : nullptr;
-    auto const n = num != nullptr ? jsonInt(*num) : std::nullopt;
-    auto const d = den != nullptr ? jsonInt(*den) : std::optional<std::int64_t>{1};
-    if (!n || !d || *n * house.rateDen != *d * house.rateNum)
+    // Interlaced house: the flow's frame rate and raster must be the house's, else it would stall.
+    auto const number = [&def](char const* object, char const* key) -> std::optional<std::int64_t> {
+        auto const* parent = object != nullptr ? def.get(object) : &def;
+        auto const* value = parent != nullptr ? parent->get(key) : nullptr;
+        return value != nullptr ? jsonInt(*value) : std::nullopt;
+    };
+    auto const n = number("grain_rate", "numerator");
+    auto const d = number("grain_rate", "denominator").value_or(1);
+    if (n && *n * house.rateDen != d * house.rateNum)
+    {
+        return {false, progressive ? "rate" : "interlaced_rate"};
+    }
+    if (!n && !progressive)
     {
         return {false, "interlaced_rate"};
     }
-    return {true, {}};
+    auto const w = number(nullptr, "frame_width");
+    auto const h = number(nullptr, "frame_height");
+    if ((w && *w != house.width) || (h && *h != house.height))
+    {
+        return {false, "raster"};
+    }
+    return {!progressive, {}};
 }
 
 #if defined(REPLAY_WITH_MXL)

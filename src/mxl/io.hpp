@@ -122,9 +122,10 @@ struct AudioWatch
 // MXL keeps an interlaced flow as fields (half the lines, at twice the declared rate). In an interlaced
 // house (1.8.0) an `interlaced_tff` flow at the house frame rate is read as fields and woven: grains 2k
 // and 2k+1 make frame k. Otherwise `unsupported` says why the flow is not recorded: `interlaced` (the
-// house is progressive, or `interlaced_psf`), `interlaced_bff` (bottom field first is refused) or
-// `interlaced_rate` (another frame rate than the house's). A definition that is not readable or has
-// no interlace_mode is read as progressive.
+// house is progressive, or `interlaced_psf`), `interlaced_bff` (bottom field first is refused),
+// `interlaced_rate` (another frame rate than the house's), and in an interlaced house `rate` (a
+// progressive flow at another rate) and `raster` (another frame_width or frame_height). A definition
+// that is not readable or has no interlace_mode is read as progressive; a missing rate or raster passes.
 struct VideoInputMode
 {
     bool interlaced = false;

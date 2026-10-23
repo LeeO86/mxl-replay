@@ -318,7 +318,8 @@ void NmosNode::start()
                         auto const role = camera.phases > 1 ? "Video Phase " + std::to_string(phase) : std::string("Video");
                         receiver.data[U("label")] = web::json::value::string(us(camera.label + " " + role));
                         tagGroup(receiver, camera.label, role);
-                        // BCP-004-01: progressive, and in an interlaced house also interlaced_tff (woven into frames, 1.8.0).
+                        // BCP-004-01: progressive, and in an interlaced house also interlaced_tff (woven into frames, 1.8.0)
+                        // at the house frame rate and raster.
                         // Any other flow is refused by the reader (state "unsupported").
                         std::vector<utility::string_t> modes;
                         for (auto const& mode : replay::acceptedInterlaceModes(impl_->config.format))
@@ -327,6 +328,13 @@ void NmosNode::start()
                         }
                         web::json::value interlace = web::json::value::object();
                         interlace[U("urn:x-nmos:cap:format:interlace_mode")] = nmos::make_caps_string_constraint(modes);
+                        if (impl_->config.format.interlaced)
+                        {
+                            // The reader refuses another rate or raster in an interlaced house (`rate`, `raster`).
+                            interlace[U("urn:x-nmos:cap:format:grain_rate")] = nmos::make_caps_rational_constraint({rate});
+                            interlace[U("urn:x-nmos:cap:format:frame_width")] = nmos::make_caps_integer_constraint({impl_->config.format.width});
+                            interlace[U("urn:x-nmos:cap:format:frame_height")] = nmos::make_caps_integer_constraint({impl_->config.format.height});
+                        }
                         receiver.data[U("caps")][U("constraint_sets")] = web::json::value_of({interlace});
                         receiver.data[U("caps")][U("version")] = web::json::value::string(nmos::make_version());
                         nmos::insert_resource(nodeModel.node_resources, std::move(receiver));

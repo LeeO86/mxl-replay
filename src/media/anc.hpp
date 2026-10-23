@@ -42,6 +42,9 @@ struct AncPacket
     AtcKind kind = AtcKind::Ltc;
     int line = 10;
     bool interlaced = false;
+    // 30-frame timecode (29.97): the field mark is bit 27 (the seconds-tens flag); at 25 frames it is
+    // bit 59 (the hours-tens flag). SMPTE ST 12-1.
+    bool thirtyFrame = false;
 };
 
 [[nodiscard]] std::vector<std::uint8_t> encodeAncGrain(AncPacket const& packet);
