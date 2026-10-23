@@ -1022,6 +1022,16 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     AncPacket packet;
     packet.tc = tc;
     rendered.anc = encodeAncGrain(packet);
+    if (config_.format.interlaced)
+    {
+        // One grain per field at the field rate, F bits 0b10 and 0b11, the same timecode in both.
+        packet.interlaced = true;
+        packet.thirtyFrame = config_.format.rateNum == 30000 && config_.format.rateDen == 1001;
+        rendered.anc = encodeAncGrain(packet);
+        packet.tc.field = 1;
+        packet.line = 572;
+        rendered.ancSecond = encodeAncGrain(packet);
+    }
 
     int const samples = audioSamplesForFrame(timestampToIndex(config_.format.rateNum, config_.format.rateDen, outputTaiNs), config_.format.rateNum,
         config_.format.rateDen, 48000);
@@ -2189,7 +2199,7 @@ std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::stri
         error.clear();
         return id;
     }
-    if (converted.frames.empty())
+    if (converted.frames.empty() || converted.order.empty())
     {
         error = converted.error.empty() ? "upload failed" : converted.error;
         return {};
@@ -2203,23 +2213,34 @@ std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::stri
     ClipRef clip;
     clip.camera = kLibraryCamera;
     clip.inNs = origin;
-    clip.outNs = origin + static_cast<std::uint64_t>(converted.frames.size() - 1) * period;
+    clip.outNs = origin + static_cast<std::uint64_t>(converted.order.size() - 1) * period;
     // Protected first: the library ring keeps only segments a clip touches.
     library_->protect(clip.inNs, clip.outNs);
     std::size_t stored = 0;
-    for (std::size_t i = 0; i < converted.frames.size(); ++i)
+    // House frame i shows source frame order[i]; a repeated source frame is encoded once (1.8.1).
+    std::vector<std::uint8_t> jpeg;
+    std::size_t encoded = converted.frames.size();
+    for (std::size_t i = 0; i < converted.order.size(); ++i)
     {
+        auto const source = static_cast<std::size_t>(converted.order[i]);
+        if (source != encoded)
+        {
+            jpeg = gpuEncodeFrame10(converted.frames[source], config_.jpegQuality);
+            if (jpeg.empty())
+            {
+                jpeg = encodeJpeg422(converted.frames[source], config_.jpegQuality);
+            }
+            encoded = source;
+        }
         StoredFrame frame;
         frame.taiNs = origin + static_cast<std::uint64_t>(i) * period;
-        frame.jpeg = gpuEncodeFrame10(converted.frames[i], config_.jpegQuality);
-        if (frame.jpeg.empty())
-        {
-            frame.jpeg = encodeJpeg422(converted.frames[i], config_.jpegQuality);
-        }
+        frame.jpeg = jpeg;
         if (!converted.audio.empty())
         {
             int const samples = audioSamplesForFrame(i, config_.format.rateNum, config_.format.rateDen, 48000);
-            std::size_t const offset = i * static_cast<std::size_t>(samples) * static_cast<std::size_t>(converted.channels);
+            // The cadence's own offset: at 29.97 the frames have 1601 or 1602 samples.
+            std::size_t const offset = static_cast<std::size_t>(audioSamplesUntil(i, config_.format.rateNum, config_.format.rateDen, 48000)) *
+                                       static_cast<std::size_t>(converted.channels);
             if (offset < converted.audio.size())
             {
                 frame.audio.assign(converted.audio.begin() + static_cast<std::ptrdiff_t>(offset),

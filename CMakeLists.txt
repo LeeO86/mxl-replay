@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(mxl-replay VERSION 1.7.2 LANGUAGES CXX)
+project(mxl-replay VERSION 1.8.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,6 +80,8 @@ if(REPLAY_BUILD_TESTS)
         tests/unit/test_flowahead.cpp
         tests/unit/test_tally.cpp
         tests/unit/test_transitions.cpp
+        tests/unit/test_interlaced.cpp
+        tests/unit/test_upload_rate.cpp
     )
     target_link_libraries(unit-tests PRIVATE replay-core)
     target_compile_options(unit-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)

@@ -10,6 +10,7 @@ extern "C"
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -80,6 +81,7 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
         bool const mismatch = decoded.width != house.width || decoded.height != house.height;
         scaleFrame(decoded, scaled, ScaleFilter::Bilinear);
         out.frames.push_back(std::move(scaled));
+        out.order.push_back(0);
         if (mismatch)
         {
             out.error = "scaled";
@@ -116,8 +118,22 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
         AVCodec const* codec = avcodec_find_decoder(stream->codecpar->codec_id);
         vctx = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(vctx, stream->codecpar);
-        avcodec_open2(vctx, codec, nullptr);
-        sws = sws_getContext(vctx->width, vctx->height, vctx->pix_fmt, house.width, house.height, AV_PIX_FMT_YUV422P, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        bool const opened = codec != nullptr && avcodec_open2(vctx, codec, nullptr) >= 0;
+        // sws_getContext asserts (aborts the process) on AV_PIX_FMT_NONE: check the input first.
+        if (opened && vctx->width > 0 && vctx->height > 0 && vctx->pix_fmt != AV_PIX_FMT_NONE && sws_isSupportedInput(vctx->pix_fmt) > 0)
+        {
+            sws = sws_getContext(vctx->width, vctx->height, vctx->pix_fmt, house.width, house.height, AV_PIX_FMT_YUV422P, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        }
+        if (sws == nullptr)
+        {
+            // No decoder or no scaler for this picture (unknown codec or pixel format, no size): fail the
+            // upload with the reason, do not read it.
+            char const* name = vctx->pix_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(vctx->pix_fmt) : nullptr;
+            auto const codecName = stream->codecpar->codec_id == AV_CODEC_ID_NONE ? std::string("an unknown codec") : std::string(avcodec_get_name(stream->codecpar->codec_id));
+            out.error = !opened ? "unsupported video: no decoder for " + codecName
+                                : "unsupported video: cannot convert " + std::string(name != nullptr ? name : "an unknown pixel format") + " " +
+                                      std::to_string(vctx->width) + "x" + std::to_string(vctx->height) + " to the house format";
+        }
     }
     if (audio >= 0)
     {
@@ -141,7 +157,32 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
     yuv->width = house.width;
     yuv->height = house.height;
     av_frame_get_buffer(yuv, 32);
-    while (av_read_frame(fmt, packet) >= 0)
+    // Frame-rate conversion to the house rate (1.8.1, FrameRateConverter): each source frame is kept
+    // once in out.frames, and out.order lists the one each house frame shows. A frame without a
+    // timestamp follows the previous one by its duration (the stream's frame rate, else the house's).
+    FrameRateConverter rate(house.rateNum, house.rateDen);
+    AVRational const nanos{1, 1000000000};
+    AVRational const timeBase = video >= 0 ? fmt->streams[video]->time_base : AVRational{1, 1};
+    AVRational const streamRate = video >= 0 ? fmt->streams[video]->avg_frame_rate : AVRational{0, 1};
+    std::int64_t const fallbackNs = streamRate.num > 0 && streamRate.den > 0 ? av_rescale(1000000000LL, streamRate.den, streamRate.num)
+                                                                              : av_rescale(1000000000LL, house.rateDen, house.rateNum);
+    std::int64_t firstPts = AV_NOPTS_VALUE;
+    SourceClock clock{fallbackNs};
+    auto take = [&](AVFrame* decoded) {
+        sws_scale(sws, decoded->data, decoded->linesize, 0, decoded->height, yuv->data, yuv->linesize);
+        auto const pts = decoded->best_effort_timestamp;
+        if (pts != AV_NOPTS_VALUE && firstPts == AV_NOPTS_VALUE)
+        {
+            firstPts = pts;
+        }
+        auto const ns = clock.start(pts != AV_NOPTS_VALUE ? std::max<std::int64_t>(0, av_rescale_q(pts - firstPts, timeBase, nanos)) : -1,
+            decoded->duration > 0 ? av_rescale_q(decoded->duration, timeBase, nanos) : 0);
+        out.frames.push_back(fromYuv(yuv->data[0], yuv->data[1], yuv->data[2], house.width, house.height, yuv->linesize[0], yuv->linesize[1], yuv->linesize[2]));
+        rate.add(static_cast<std::uint32_t>(out.frames.size() - 1), ns, out.order);
+    };
+    // Without a scaler for its video the file is not read at all (the upload fails).
+    bool const readable = video < 0 || sws != nullptr;
+    while (readable && av_read_frame(fmt, packet) >= 0)
     {
         if (vctx != nullptr && packet->stream_index == video)
         {
@@ -149,9 +190,7 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
             {
                 while (avcodec_receive_frame(vctx, frame) >= 0)
                 {
-                    sws_scale(sws, frame->data, frame->linesize, 0, frame->height, yuv->data, yuv->linesize);
-                    out.frames.push_back(fromYuv(yuv->data[0], yuv->data[1], yuv->data[2], house.width, house.height, yuv->linesize[0], yuv->linesize[1],
-                        yuv->linesize[2]));
+                    take(frame);
                 }
             }
         }
@@ -175,6 +214,22 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
             }
         }
         av_packet_unref(packet);
+    }
+    // Drain the video decoder (frames it still holds), then the last source frame for its own duration.
+    if (vctx != nullptr && readable && avcodec_send_packet(vctx, nullptr) >= 0)
+    {
+        while (avcodec_receive_frame(vctx, frame) >= 0)
+        {
+            take(frame);
+        }
+    }
+    if (out.frames.size() == 1)
+    {
+        out.order.assign(1, 0); // a still image: one frame, as before
+    }
+    else
+    {
+        rate.finish(clock.endNs(), out.order);
     }
     // Drain the audio decoder, then the resampler's delay line (the last milliseconds of the file).
     if (actx != nullptr && swr != nullptr && avcodec_send_packet(actx, nullptr) >= 0)
@@ -212,7 +267,7 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
     av_freep(&io->buffer);
     avio_context_free(&io);
     out.audioOnly = video < 0 && audio >= 0;
-    if (out.frames.empty() && !(out.audioOnly && !out.audio.empty()))
+    if (out.error.empty() && out.frames.empty() && !(out.audioOnly && !out.audio.empty()))
     {
         out.error = out.audioOnly ? "no audio samples" : "no video frames";
     }

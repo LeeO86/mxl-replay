@@ -158,12 +158,17 @@ std::vector<std::uint8_t> encodeAncGrain(AncPacket const& pkt)
     }
     putNibble(udw, 2, frameTens);
     putNibble(udw, 4, pkt.tc.ss % 10);
-    putNibble(udw, 6, (pkt.tc.ss / 10) & 0x7);
+    int secondsTens = (pkt.tc.ss / 10) & 0x7;
+    if (pkt.tc.field != 0 && pkt.thirtyFrame)
+    {
+        secondsTens |= 0x8;
+    }
+    putNibble(udw, 6, secondsTens);
     putNibble(udw, 8, pkt.tc.mm % 10);
     putNibble(udw, 10, (pkt.tc.mm / 10) & 0x7);
     putNibble(udw, 12, pkt.tc.hh % 10);
     int hourTens = (pkt.tc.hh / 10) & 0x3;
-    if (pkt.tc.field != 0)
+    if (pkt.tc.field != 0 && !pkt.thirtyFrame)
     {
         hourTens |= 0x8;
     }
@@ -293,7 +298,8 @@ bool decodeAncTimecode(std::uint8_t const* grain, std::size_t size, Timecode& ou
     out.mm = (mt & 0x7) * 10 + (mu & 0xF);
     out.hh = (ht & 0x3) * 10 + (hu & 0xF);
     out.drop = (ft & 0x4) != 0;
-    out.field = (ht & 0x8) != 0 ? 1 : 0;
+    // The field mark: bit 59 (25 frames) or bit 27 (30 frames); the F bits below win when set.
+    out.field = (ht & 0x8) != 0 || (st & 0x8) != 0 ? 1 : 0;
     int const f = (grain[3] >> 6) & 0x3;
     if (f == 0x3)
     {

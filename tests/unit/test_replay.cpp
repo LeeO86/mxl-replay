@@ -129,15 +129,16 @@ TEST_CASE("phased HFR repeats a missing phase")
     CHECK(result.frames[1].timeNs <= result.frames[2].timeNs);
 }
 
-TEST_CASE("an interlaced video flow is unsupported, a progressive one is recorded")
+TEST_CASE("an interlaced video flow is unsupported in a progressive house, a progressive one is recorded")
 {
-    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_tff"})") == "interlaced");
-    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_bff"})") == "interlaced");
-    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_psf"})") == "interlaced");
-    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video","interlace_mode":"progressive"})").empty());
+    auto const house = parseVideoFormat("1080p50");
+    CHECK(videoInputMode(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_tff"})", house).unsupported == "interlaced");
+    CHECK(videoInputMode(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_bff"})", house).unsupported == "interlaced");
+    CHECK(videoInputMode(R"({"format":"urn:x-nmos:format:video","interlace_mode":"interlaced_psf"})", house).unsupported == "interlaced");
+    CHECK(videoInputMode(R"({"format":"urn:x-nmos:format:video","interlace_mode":"progressive"})", house).unsupported.empty());
     // Nothing to go by: read as before.
-    CHECK(videoUnsupportedReason(R"({"format":"urn:x-nmos:format:video"})").empty());
-    CHECK(videoUnsupportedReason("").empty());
+    CHECK(videoInputMode(R"({"format":"urn:x-nmos:format:video"})", house).unsupported.empty());
+    CHECK(videoInputMode("", house).unsupported.empty());
 }
 
 TEST_CASE("a grain the writer never wrote is not a drop, a grain the reader missed is")
