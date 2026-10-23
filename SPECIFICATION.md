@@ -374,8 +374,9 @@ The flow step (1–5) is a module behind one interface:
   archiving; **Consolidate** copies a clip into library storage so the ring can be
   released.
 - **Upload** files (video/still) like mxl-test-player: converted at upload to house
-  format (raster and rate: house frame n shows the newest source frame that starts at
-  or before n / rate, so the duration and the audio sync stay; 1.8.1) and stored as JPEG frame sequence + PCM, so they behave exactly like buffer
+  format (raster and rate: house frame n shows the source frame whose start is nearest
+  to n / rate, so the duration and the audio sync stay; a repeated frame is stored once
+  in memory; a file that cannot be decoded or scaled fails with a reason; 1.8.1) and stored as JPEG frame sequence + PCM, so they behave exactly like buffer
   clips (any speed, interpolation, frame-accurate). A file with an audio stream and no
   video (WAV, MP3, AAC, FLAC: anything FFmpeg decodes) is an **audio item** (1.6.0):
   resampled to 48 kHz stereo float and kept as `<library>/audio/<id>.f32` (ids `audio-N`;

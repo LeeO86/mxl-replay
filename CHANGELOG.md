@@ -2,9 +2,12 @@
 
 ## 1.8.1
 
-- Fix: an upload at another frame rate than the house's kept its frames 1:1 at the house rate, so it played at the wrong speed and lost the audio after its shortened end. In a 50p house, a 2 s 25p file became a 1 s clip (`out_ns` − `in_ns` 0.98 s) with only its first second of audio. Uploads are now converted to the house rate by their timestamps. House frame n shows the newest source frame that starts at or before n / rate. A 25p file repeats each frame in a 50p house, a 50p file drops every second one in a 25p house, and 29.97 maps to 25 by the same rule. The duration stays, and the audio (already 48 kHz for the whole file) stays in sync. A still image is still one frame; frames without timestamps are still taken 1:1.
+- Fix: an upload at another frame rate than the house's kept its frames 1:1 at the house rate, so it played at the wrong speed and lost the audio after its shortened end. In a 50p house, a 2 s 25p file became a 1 s clip (`out_ns` − `in_ns` 0.98 s) with only its first second of audio. Uploads are now converted to the house rate by their timestamps: each house frame shows the source frame whose start is nearest to it (the earlier one on a tie). A 25p file repeats each frame in a 50p house, a 50p file drops every second one in a 25p house, and 29.97 maps to 25 by the same rule. Equal rates stay 1:1 under timestamp jitter of up to half a period. The duration stays, and the audio (already 48 kHz for the whole file) stays in sync. A still image is still one frame.
+- A repeated source frame is kept once in memory and JPEG-encoded once (a 25p upload in a 50p house no longer needs twice the RAM).
+- A frame without a timestamp in a file with timestamps keeps its place: it follows the previous frame by that frame's duration (else the stream's frame period).
+- Fix: an upload whose video has no decoder or no pixel format (e.g. an AVI with an unknown codec) aborted the process inside `sws_getContext`. It now fails with 400 and a reason (`unsupported video: no decoder for …`, `… cannot convert <format> <size> to the house format`).
 - Fix: an upload's audio in a 29.97 house was sliced with the frame's own sample count times its index instead of the cadence (1601/1602 samples), so it drifted by up to a frame's worth of samples.
-- New unit tests: the frame-rate conversion (25→50, 50→25, 29.97↔25, 1:1, a single short frame) and a 25p / 50p YUV4MPEG2 upload through FFmpeg.
+- New unit tests: the frame-rate conversion (25→50, 50→25, 29.97↔25, 1:1, ±3 ms jitter at 50p and 25p stays 1:1 over 500 frames, a single short frame), the source clock (frames without timestamps), 25p / 50p YUV4MPEG2 uploads through FFmpeg (50 stored frames for 100 house frames), and the unknown-codec AVI.
 - The Compose and Kubernetes examples use the `1.8.1` image.
 
 ## 1.8.0
