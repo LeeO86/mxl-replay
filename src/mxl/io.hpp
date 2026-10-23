@@ -118,11 +118,19 @@ struct AudioWatch
     void reset() { *this = AudioWatch{limit}; }
 };
 
-// Why a camera's video flow cannot be recorded, from its flow definition (flow_def.json): "interlaced"
-// when `interlace_mode` is anything but "progressive". MXL keeps an interlaced flow as fields (half the
-// lines, at twice the declared rate); the recorder takes whole progressive frames only. Empty when the
-// flow can be recorded or the definition does not say (it is not readable or has no interlace_mode).
-[[nodiscard]] std::string videoUnsupportedReason(std::string const& flowDef);
+// How a camera's video flow is read, from its flow definition (flow_def.json) and the house format.
+// MXL keeps an interlaced flow as fields (half the lines, at twice the declared rate). In an interlaced
+// house (1.8.0) an `interlaced_tff` flow at the house frame rate is read as fields and woven: grains 2k
+// and 2k+1 make frame k. Otherwise `unsupported` says why the flow is not recorded: `interlaced` (the
+// house is progressive, or `interlaced_psf`), `interlaced_bff` (bottom field first is refused) or
+// `interlaced_rate` (another frame rate than the house's). A definition that is not readable or has
+// no interlace_mode is read as progressive.
+struct VideoInputMode
+{
+    bool interlaced = false;
+    std::string unsupported;
+};
+[[nodiscard]] VideoInputMode videoInputMode(std::string const& flowDef, VideoFormat const& house);
 
 class MxlBridge
 {

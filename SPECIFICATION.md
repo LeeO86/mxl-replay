@@ -92,15 +92,24 @@ of sequences beyond playlists, compressed outputs, HDR.
 - Receiver behaviour as all media functions: activation accepted before the flow
   exists (`waiting`, retry), IS-04 `subscription` updated, domain scan of the MXL
   root including mirror domains.
-- Video inputs are progressive only (1.7.1). The video receivers' caps (BCP-004-01)
-  say `interlace_mode` `progressive`. A routed flow whose `flow_def.json` has another
-  `interlace_mode` (MXL keeps it as fields: half the lines, twice the rate) is not
-  read: the route state is `unsupported`, `mxl_video_unsupported` is logged and
-  `record_unsupported_total{camera,reason="interlaced"}` counted once per flow, and the
-  flow is checked again once a second (a writer that makes it again as progressive is
-  recorded). Recording interlaced inputs is an open design question.
-  Interlaced video and its ANC follow the shared MXL interlaced convention:
+- Interlaced video and its ANC follow the shared MXL interlaced convention:
   https://github.com/LeeO86/mxl-multiviewer/blob/main/docs/mxl-interlaced.md
+  MXL keeps an interlaced flow as fields: one field per grain (half the lines), grain 2k
+  the first field of frame k, the ring at twice the declared (frame) rate.
+- Interlaced inputs (1.8.0) are recorded as **frames**: in an interlaced house format
+  (`1080i25`, `1080i2997`, §5.1) an `interlaced_tff` flow at the house frame rate is read
+  field by field, grains 2k (the top field, the even lines) and 2k+1 (the odd lines) are
+  woven into frame k, and the frame is stored at the frame rate like a progressive one.
+  Clips, positions, jog and slow motion therefore work on frames. A progressive flow at
+  the house frame rate is recorded too. Bottom field first is refused (as on the other
+  LeeO86 functions). The video receivers' caps (BCP-004-01) say `interlace_mode`
+  `progressive`, and in an interlaced house also `interlaced_tff`.
+- A routed flow that cannot be recorded is not read: the route state is `unsupported`,
+  `mxl_video_unsupported` is logged and `record_unsupported_total{camera,reason}` counted
+  once per flow, and the flow is checked again once a second (a writer that makes it again
+  in a recordable format is recorded). Reasons: `interlaced` (an interlaced flow in a
+  progressive house, 1.7.1, or `interlaced_psf`), `interlaced_bff` (bottom field first),
+  `interlaced_rate` (an interlaced flow at another frame rate than the house's).
 - A connected input that records nothing for `REPLAY_INPUT_STALL_S` (its writer
   stopped, the flow was removed, a fabrics mirror lost its link) logs
   `recording_stopped` once (camera, phase, reason). Recording resumes by itself when
@@ -171,6 +180,13 @@ of sequences beyond playlists, compressed outputs, HDR.
 - Output format = house format (`REPLAY_FORMAT`, default 1080p50); all channels and
   inputs use the same raster. Inputs with another raster are scaled on decode
   (bilinear/bicubic on GPU), and this is shown as a warning.
+- Interlaced house formats (1.8.0): `1080i25` and `1080i2997` (the number is the frame rate,
+  as in mxl-test-player's `PLAYER_FORMAT`; `1080i29.97` and a `tff` suffix are accepted,
+  `bff` is refused). The engine works at the frame rate; each output frame is written as two
+  fields (`interlaced_tff`, grain 2k the even lines, 2k+1 the odd lines, both written when the
+  frame is), so downstream sees 1080i with the field order kept. A clip recorded from an
+  interlaced input plays back as it was recorded. There is no format conversion between
+  interlaced and progressive: an interlaced input in a progressive house is refused (§4.1).
 - The output clock is TAI: one grain per output grain index, always. A channel more than
   two grains late continues at the current grain (a resync): counted per channel in
   `output_resyncs_total`, logged as `output_resync` at most once per 10 s (1.4.0). The playout
@@ -183,7 +199,10 @@ of sequences beyond playlists, compressed outputs, HDR.
 
 - **Live / E2E**: channel follows a camera live (minimal delay).
 - **Scrub**: move the play position back in the buffer by frames, seconds or with a
-  jog control; the picture follows frame-accurately (paused).
+  jog control; the picture follows frame-accurately (paused). In an interlaced house a
+  step is one frame (two fields); field-accurate jog and slow motion are out of scope: a
+  paused or repeated woven frame shows both its fields, so fast motion combs, and `blend`
+  and `interpolate` work on woven frames.
 - **Mark IN / OUT** at the current position; **Go to IN**, **Go to OUT**.
 - **Play** from the current position at the current speed; **Pause**; **Back to live**.
 - **Speed**: continuous 0–200 % via a speed fader (UI slider, mouse wheel, keys),
@@ -269,6 +288,10 @@ Per channel (and stored per clip), `motion_mode`:
   F, reserved, the packet at byte 6; 1.7.2): either the **source** timecode (recording TAI time
   of the frame being shown — so downstream systems see when the action happened) or
   the **output** time of day; configurable per channel (default source).
+- Interlaced house (1.8.0): the ANC flow runs at the field rate (declared 50/1 or
+  60000/1001), one grain per field with the same index as the video field: grain 2k
+  with F = 0b10 (line 10), grain 2k+1 with F = 0b11 and the field mark (line 572), the
+  frame's timecode in both.
 - The same value is shown in the UI.
 
 ---
@@ -590,7 +613,9 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
   `NMOS_TAGS` is added to the node and the device. Group hints stay on the resources.
 - Inputs: per camera video + audio receivers; phase groups: N video receivers + one
   audio receiver, grouped (`<camera>:Video Phase k`). Video receivers' caps:
-  `interlace_mode` `progressive` (§4.1).
+  `interlace_mode` `progressive`, in an interlaced house also `interlaced_tff` (§4.1).
+  In an interlaced house the video flows say `interlaced_tff` at the frame rate and the
+  data flows and sources the field rate (§5.5).
 - Outputs: per channel video, audio and data (`video/smpte291`) senders with Sources
   and Flows, grouped (`<channel>:Video|Audio|Data`). Each sender's active connection
   carries `mxl_domain_id` and `mxl_flow_id`. Flow IDs change only when the
@@ -609,7 +634,7 @@ The contract of mxl-webrtc-monitor 1.3.0 §6.6.
 
 | Key | Default |
 | --- | --- |
-| `REPLAY_FORMAT` | `1080p50` |
+| `REPLAY_FORMAT` | `1080p50` (interlaced: `1080i25`, `1080i2997`; §5.1) |
 | `REPLAY_INPUTS` / `REPLAY_CHANNELS` | 4 / 2 |
 | `REPLAY_STORAGE_DIR` | `/data/replay` (local NVMe) |
 | `REPLAY_BUFFER_HOURS` | 2 (per camera, overridable) |
@@ -640,7 +665,7 @@ Metrics (prefix `mxl_replay_`): per camera `record_fps`, `record_dropped_total`
 started or while it stopped, do not count),
 `storage_write_failed_total` (frames lost to a full disk or an I/O error),
 `phase_missing_total`, `record_unsupported_total{camera,reason}` (a routed flow that
-cannot be recorded, once per flow: `interlaced`, 1.7.1), `buffer_seconds`, `jpeg_encode_seconds`,
+cannot be recorded, once per flow: `interlaced`, 1.7.1; `interlaced_bff`, `interlaced_rate`, 1.8.0), `buffer_seconds`, `jpeg_encode_seconds`,
 `record_last_frame_age_seconds` (since the newest recorded frame, counted from the
 process start at most; also `last_frame_age_s` per camera in the status); per channel
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,
@@ -724,4 +749,6 @@ Deployment:
 Reverse playback, mix/wipe transitions in playlists, multi-server clip sharing,
 LSM remote panel support, EVS-style "highlight" auto-clip from tally/markers,
 compressed (proxy) export, 10-bit intra storage (e.g. JPEG XS) if 8-bit JPEG
-shows banding on gradients.
+shows banding on gradients. Field-accurate jog and slow motion of interlaced
+recordings (per-field positions, field-based interpolation), bottom field first,
+and interlaced ↔ progressive conversion.

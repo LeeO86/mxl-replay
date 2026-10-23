@@ -48,19 +48,19 @@ bool parseRateToken(std::string const& text, int& numerator, int& denominator)
     {
         return false;
     }
-    if (text == "2398")
+    if (text == "2398" || text == "23.98")
     {
         numerator = 24000;
         denominator = 1001;
         return true;
     }
-    if (text == "2997")
+    if (text == "2997" || text == "29.97")
     {
         numerator = 30000;
         denominator = 1001;
         return true;
     }
-    if (text == "5994")
+    if (text == "5994" || text == "59.94")
     {
         numerator = 60000;
         denominator = 1001;

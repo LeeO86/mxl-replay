@@ -32,6 +32,8 @@ struct RenderedFrame
     std::vector<std::uint8_t> v210;
     std::vector<float> audio;
     std::vector<std::uint8_t> anc;
+    // Interlaced house: the second field's ANC grain (`anc` is the first field's).
+    std::vector<std::uint8_t> ancSecond;
     std::string timecode;
     std::string motion;
     double speed = 1;

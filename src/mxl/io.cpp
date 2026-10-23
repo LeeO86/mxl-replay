@@ -22,7 +22,7 @@
 
 namespace replay
 {
-std::string videoUnsupportedReason(std::string const& flowDef)
+VideoInputMode videoInputMode(std::string const& flowDef, VideoFormat const& house)
 {
     Json def;
     if (!parseJson(flowDef, def))
@@ -31,7 +31,28 @@ std::string videoUnsupportedReason(std::string const& flowDef)
     }
     auto const* mode = def.get("interlace_mode");
     auto const text = mode != nullptr ? jsonText(*mode) : std::nullopt;
-    return text && *text != "progressive" ? "interlaced" : std::string{};
+    if (!text || *text == "progressive")
+    {
+        return {};
+    }
+    if (!house.interlaced || (*text != "interlaced_tff" && *text != "interlaced_bff"))
+    {
+        return {false, "interlaced"};
+    }
+    if (*text == "interlaced_bff")
+    {
+        return {false, "interlaced_bff"};
+    }
+    auto const* rate = def.get("grain_rate");
+    auto const* num = rate != nullptr ? rate->get("numerator") : nullptr;
+    auto const* den = rate != nullptr ? rate->get("denominator") : nullptr;
+    auto const n = num != nullptr ? jsonInt(*num) : std::nullopt;
+    auto const d = den != nullptr ? jsonInt(*den) : std::optional<std::int64_t>{1};
+    if (!n || !d || *n * house.rateDen != *d * house.rateNum)
+    {
+        return {false, "interlaced_rate"};
+    }
+    return {true, {}};
 }
 
 #if defined(REPLAY_WITH_MXL)
@@ -123,7 +144,7 @@ void MxlBridge::start()
                         "\",\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"" + channel.label + ":Video\"]},\"media_type\":\"video/v210\",\"grain_rate\":{\"numerator\":" +
                         std::to_string(cfg.format.rateNum) + ",\"denominator\":" + std::to_string(cfg.format.rateDen) + "},\"frame_width\":" +
                         std::to_string(cfg.format.width) + ",\"frame_height\":" + std::to_string(cfg.format.height) +
-                        ",\"interlace_mode\":\"progressive\",\"colorspace\":\"BT709\",\"components\":[{\"name\":\"Y\",\"width\":" +
+                        ",\"interlace_mode\":\"" + (cfg.format.interlaced ? "interlaced_tff" : "progressive") + "\",\"colorspace\":\"BT709\",\"components\":[{\"name\":\"Y\",\"width\":" +
                         std::to_string(cfg.format.width) + ",\"height\":" + std::to_string(cfg.format.height) +
                         ",\"bit_depth\":10},{\"name\":\"Cb\",\"width\":" + std::to_string(cfg.format.width / 2) + ",\"height\":" +
                         std::to_string(cfg.format.height) + ",\"bit_depth\":10},{\"name\":\"Cr\",\"width\":" + std::to_string(cfg.format.width / 2) +
@@ -138,10 +159,11 @@ void MxlBridge::start()
                         "\",\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"" + channel.label +
                         ":Audio\"]},\"media_type\":\"audio/float32\",\"sample_rate\":{\"numerator\":48000,\"denominator\":1},\"channel_count\":2,\"bit_depth\":32}";
         mxlCreateFlowWriter(impl_->instance, audioDef.c_str(), "{}", &writer.audio, nullptr, &created);
+        // An interlaced video's ANC runs at the field rate (MXL does not double a data flow).
         auto ancDef = std::string("{\"id\":\"") + ids.dataFlow(channel.index, cfg.format.token()) + "\",\"format\":\"urn:x-nmos:format:data\",\"label\":\"" +
                       channel.label + "\",\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"" + channel.label +
-                      ":Data\"]},\"media_type\":\"video/smpte291\",\"grain_rate\":{\"numerator\":" + std::to_string(cfg.format.rateNum) +
-                      ",\"denominator\":" + std::to_string(cfg.format.rateDen) + "}}";
+                      ":Data\"]},\"media_type\":\"video/smpte291\",\"grain_rate\":{\"numerator\":" +
+                      std::to_string(cfg.format.rateNum * (cfg.format.interlaced ? 2 : 1)) + ",\"denominator\":" + std::to_string(cfg.format.rateDen) + "}}";
         mxlCreateFlowWriter(impl_->instance, ancDef.c_str(), "{}", &writer.anc, nullptr, &created);
         impl_->writers.push_back(writer);
     }
@@ -218,30 +240,54 @@ void MxlBridge::publish(int channel, RenderedFrame const& frame, std::uint64_t t
     mxlRational const rate{cfg.format.rateNum, cfg.format.rateDen};
     auto const index = mxlTimestampToIndex(&rate, taiNs);
     auto& writer = impl_->writers[static_cast<std::size_t>(channel - 1)];
-    if (writer.video != nullptr && !frame.v210.empty())
-    {
+    // Opens grain `grain`, lets `fill(payload, grainSize)` write it, and commits it whole.
+    auto writeGrain = [](mxlFlowWriter handle, std::uint64_t grain, auto&& fill) {
         mxlGrainInfo info{};
         std::uint8_t* payload = nullptr;
-        if (mxlFlowWriterOpenGrain(writer.video, index, &info, &payload) == MXL_STATUS_OK && payload != nullptr)
+        if (mxlFlowWriterOpenGrain(handle, grain, &info, &payload) == MXL_STATUS_OK && payload != nullptr)
         {
-            auto const n = std::min(frame.v210.size(), static_cast<std::size_t>(info.grainSize));
-            std::memcpy(payload, frame.v210.data(), n);
+            fill(payload, static_cast<std::size_t>(info.grainSize));
             info.flags = 0;
             info.validSlices = info.totalSlices;
-            mxlFlowWriterCommitGrain(writer.video, &info);
+            mxlFlowWriterCommitGrain(handle, &info);
+        }
+    };
+    auto copy = [](std::vector<std::uint8_t> const& bytes) {
+        return [&bytes](std::uint8_t* payload, std::size_t size) { std::memcpy(payload, bytes.data(), std::min(bytes.size(), size)); };
+    };
+    if (!cfg.format.interlaced)
+    {
+        if (writer.video != nullptr && !frame.v210.empty())
+        {
+            writeGrain(writer.video, index, copy(frame.v210));
+        }
+        if (writer.anc != nullptr && !frame.anc.empty())
+        {
+            writeGrain(writer.anc, index, copy(frame.anc));
         }
     }
-    if (writer.anc != nullptr && !frame.anc.empty())
+    else
     {
-        mxlGrainInfo info{};
-        std::uint8_t* payload = nullptr;
-        if (mxlFlowWriterOpenGrain(writer.anc, index, &info, &payload) == MXL_STATUS_OK && payload != nullptr)
+        // Interlaced (shared MXL interlaced convention): frame k is written as two fields, grain 2k the
+        // first (top) field, grain 2k+1 the second; its ANC likewise at the field rate.
+        auto const rowBytes = v210RowBytes(cfg.format.width);
+        auto const fieldBytes = rowBytes * static_cast<std::size_t>(cfg.format.height / 2);
+        for (std::uint64_t grain = 2 * index; grain <= 2 * index + 1; ++grain)
         {
-            auto const n = std::min(frame.anc.size(), static_cast<std::size_t>(info.grainSize));
-            std::memcpy(payload, frame.anc.data(), n);
-            info.flags = 0;
-            info.validSlices = info.totalSlices;
-            mxlFlowWriterCommitGrain(writer.anc, &info);
+            if (writer.video != nullptr && frame.v210.size() >= 2 * fieldBytes)
+            {
+                writeGrain(writer.video, grain, [&](std::uint8_t* payload, std::size_t size) {
+                    if (size >= fieldBytes)
+                    {
+                        extractField(frame.v210.data(), rowBytes, cfg.format.height, fieldParity(grain, false), payload);
+                    }
+                });
+            }
+            auto const& anc = grain % 2 == 0 ? frame.anc : frame.ancSecond;
+            if (writer.anc != nullptr && !anc.empty())
+            {
+                writeGrain(writer.anc, grain, copy(anc));
+            }
         }
     }
     if (writer.audio != nullptr && !frame.audio.empty())
@@ -277,6 +323,7 @@ void MxlBridge::readInput(int camera, int phase)
 #if defined(REPLAY_WITH_MXL)
     auto const& cfg = engine_.config();
     mxlRational const rate{cfg.format.rateNum, cfg.format.rateDen};
+    auto const rowBytes = v210RowBytes(cfg.format.width);
     // The reader is kept open while its route stays the same. Opening a reader scans
     // every domain and maps every grain of the flow, so doing it per grain recorded
     // about 9 of 50 grains per camera.
@@ -290,6 +337,9 @@ void MxlBridge::readInput(int camera, int phase)
         // Video only: how long the flow keeps a grain, and whether the reader waits for its writer.
         std::uint64_t historyNs = 0;
         ReaderWait wait;
+        // An interlaced flow (VideoInputMode): its fields are woven into `frame`.
+        bool interlaced = false;
+        std::vector<std::uint8_t> frame;
     };
     Input input;
     auto close = [](Input& open, bool pinned) {
@@ -480,7 +530,10 @@ void MxlBridge::readInput(int camera, int phase)
         }
         if (opening)
         {
-            auto const reason = videoUnsupportedReason(readFlowDef(input.instance, route.flowId));
+            auto const mode = videoInputMode(readFlowDef(input.instance, route.flowId), cfg.format);
+            auto const& reason = mode.unsupported;
+            input.interlaced = mode.interlaced;
+            input.frame.assign(mode.interlaced ? v210Size(cfg.format.width, cfg.format.height) : 0, 0);
             if (!reason.empty())
             {
                 if (flowKey != unsupportedFlow)
@@ -522,7 +575,28 @@ void MxlBridge::readInput(int camera, int phase)
         {
             mxlGrainInfo info{};
             std::uint8_t* payload = nullptr;
-            auto const status = mxlFlowReaderGetGrainNonBlocking(input.reader, input.next, &info, &payload);
+            // Progressive: grain `next` is the frame. Interlaced: grains 2·next (the first, top field) and
+            // 2·next + 1 are woven into input.frame; `grain` is the one that was not readable.
+            auto grain = input.interlaced ? 2 * input.next : input.next;
+            auto status = mxlFlowReaderGetGrainNonBlocking(input.reader, grain, &info, &payload);
+            bool valid = status == MXL_STATUS_OK && payload != nullptr && (info.flags & MXL_GRAIN_FLAG_INVALID) == 0;
+            if (input.interlaced && status == MXL_STATUS_OK)
+            {
+                for (int field = 0; field < 2 && status == MXL_STATUS_OK; ++field)
+                {
+                    if (field == 1)
+                    {
+                        ++grain;
+                        status = mxlFlowReaderGetGrainNonBlocking(input.reader, grain, &info, &payload);
+                        valid = valid && status == MXL_STATUS_OK && payload != nullptr && (info.flags & MXL_GRAIN_FLAG_INVALID) == 0;
+                    }
+                    valid = valid && info.grainSize >= input.frame.size() / 2;
+                    if (valid)
+                    {
+                        weaveField(payload, rowBytes, cfg.format.height, fieldParity(grain, false), input.frame.data());
+                    }
+                }
+            }
             if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
             {
                 // Gone from the history. Not a drop when the reader was waiting for it: the
@@ -539,8 +613,8 @@ void MxlBridge::readInput(int camera, int phase)
                 // or resumed after this grain never writes it (one that moves on marks a grain
                 // it gave up as invalid). Skip it instead of waiting until the history drops it.
                 mxlFlowRuntimeInfo runtime{};
-                if (mxlFlowReaderGetRuntimeInfo(input.reader, &runtime) == MXL_STATUS_OK && runtime.headIndex > input.next &&
-                    mxlFlowReaderGetGrainNonBlocking(input.reader, input.next, &info, &payload) == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
+                if (mxlFlowReaderGetRuntimeInfo(input.reader, &runtime) == MXL_STATUS_OK && runtime.headIndex > grain &&
+                    mxlFlowReaderGetGrainNonBlocking(input.reader, grain, &info, &payload) == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
                 {
                     ++watch.skipped;
                     continue;
@@ -555,7 +629,7 @@ void MxlBridge::readInput(int camera, int phase)
                 break;
             }
             input.wait.read();
-            if (payload != nullptr && (info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
+            if (valid)
             {
                 if (withAudio)
                 {
@@ -564,7 +638,14 @@ void MxlBridge::readInput(int camera, int phase)
                     watchAudio(!pcm.empty());
                     engine_.ingestAudio(camera, mxlIndexToTimestamp(&rate, input.next), std::move(pcm), 2);
                 }
-                engine_.ingestV210(camera, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
+                if (input.interlaced)
+                {
+                    engine_.ingestV210(camera, phase, mxlIndexToTimestamp(&rate, input.next), input.frame.data(), input.frame.size());
+                }
+                else
+                {
+                    engine_.ingestV210(camera, phase, mxlIndexToTimestamp(&rate, input.next), payload, info.grainSize);
+                }
                 engine_.setRouteState(camera, phase, true, route, "running");
                 read = true;
                 if (auto const gap = watch.recorded(mxlGetTime()); gap != 0)

@@ -32,6 +32,22 @@ std::size_t v210Size(int width, int height)
     return v210RowBytes(width) * static_cast<std::size_t>(height);
 }
 
+void weaveField(std::uint8_t const* field, std::size_t rowBytes, int frameHeight, int parity, std::uint8_t* frame)
+{
+    for (int i = 0; i < frameHeight / 2; ++i)
+    {
+        std::memcpy(frame + static_cast<std::size_t>(2 * i + parity) * rowBytes, field + static_cast<std::size_t>(i) * rowBytes, rowBytes);
+    }
+}
+
+void extractField(std::uint8_t const* frame, std::size_t rowBytes, int frameHeight, int parity, std::uint8_t* field)
+{
+    for (int i = 0; i < frameHeight / 2; ++i)
+    {
+        std::memcpy(field + static_cast<std::size_t>(i) * rowBytes, frame + static_cast<std::size_t>(2 * i + parity) * rowBytes, rowBytes);
+    }
+}
+
 namespace
 {
 std::uint16_t sample10(std::uint32_t word, int shift)

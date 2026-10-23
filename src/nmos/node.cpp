@@ -318,12 +318,16 @@ void NmosNode::start()
                         auto const role = camera.phases > 1 ? "Video Phase " + std::to_string(phase) : std::string("Video");
                         receiver.data[U("label")] = web::json::value::string(us(camera.label + " " + role));
                         tagGroup(receiver, camera.label, role);
-                        // BCP-004-01: progressive only. The recorder takes whole frames; an interlaced flow (fields) is
-                        // refused by the reader (state "unsupported").
-                        web::json::value progressive = web::json::value::object();
-                        progressive[U("urn:x-nmos:cap:format:interlace_mode")] =
-                            nmos::make_caps_string_constraint({nmos::interlace_modes::progressive.name});
-                        receiver.data[U("caps")][U("constraint_sets")] = web::json::value_of({progressive});
+                        // BCP-004-01: progressive, and in an interlaced house also interlaced_tff (woven into frames, 1.8.0).
+                        // Any other flow is refused by the reader (state "unsupported").
+                        std::vector<utility::string_t> modes;
+                        for (auto const& mode : replay::acceptedInterlaceModes(impl_->config.format))
+                        {
+                            modes.push_back(us(mode));
+                        }
+                        web::json::value interlace = web::json::value::object();
+                        interlace[U("urn:x-nmos:cap:format:interlace_mode")] = nmos::make_caps_string_constraint(modes);
+                        receiver.data[U("caps")][U("constraint_sets")] = web::json::value_of({interlace});
                         receiver.data[U("caps")][U("version")] = web::json::value::string(nmos::make_version());
                         nmos::insert_resource(nodeModel.node_resources, std::move(receiver));
                         auto connection = nmos::make_connection_mxl_receiver(us(id), {});
@@ -357,7 +361,8 @@ void NmosNode::start()
                     nmos::insert_resource(nodeModel.node_resources, std::move(source));
                     auto flow = nmos::make_coded_video_flow(us(impl_->ids.videoFlow(channel.index, impl_->config.format.token())),
                         us(impl_->ids.videoSource(channel.index)), us(impl_->ids.device), rate, static_cast<unsigned>(impl_->config.format.width),
-                        static_cast<unsigned>(impl_->config.format.height), nmos::interlace_modes::progressive, nmos::colorspaces::BT709,
+                        static_cast<unsigned>(impl_->config.format.height),
+                        impl_->config.format.interlaced ? nmos::interlace_modes::interlaced_tff : nmos::interlace_modes::progressive, nmos::colorspaces::BT709,
                         nmos::transfer_characteristics::SDR, sdp::samplings::YCbCr_4_2_2, 10, nmos::media_types::video_v210, nodeModel.settings);
                     tagGroup(flow, channel.label, "Video");
                     nmos::insert_resource(nodeModel.node_resources, std::move(flow));
@@ -391,13 +396,15 @@ void NmosNode::start()
                     audioConnection.data[U("active")][U("master_enable")] = web::json::value::boolean(true);
                     nmos::insert_resource(nodeModel.connection_resources, std::move(audioConnection));
 
-                    auto dataSource = nmos::make_data_source(us(impl_->ids.dataSource(channel.index)), us(impl_->ids.device), nmos::clock_names::clk0, rate,
+                    // An interlaced video's ANC runs at the field rate (shared MXL interlaced convention).
+                    nmos::rational const ancRate{impl_->config.format.rateNum * (impl_->config.format.interlaced ? 2 : 1), impl_->config.format.rateDen};
+                    auto dataSource = nmos::make_data_source(us(impl_->ids.dataSource(channel.index)), us(impl_->ids.device), nmos::clock_names::clk0, ancRate,
                         nodeModel.settings);
                     tagGroup(dataSource, channel.label, "Data");
                     nmos::insert_resource(nodeModel.node_resources, std::move(dataSource));
                     auto dataFlow = nmos::make_sdianc_data_flow(us(impl_->ids.dataFlow(channel.index, impl_->config.format.token())),
                         us(impl_->ids.dataSource(channel.index)), us(impl_->ids.device), nodeModel.settings);
-                    dataFlow.data[U("grain_rate")] = nmos::make_rational(rate);
+                    dataFlow.data[U("grain_rate")] = nmos::make_rational(ancRate);
                     dataFlow.data[U("media_type")] = web::json::value::string(nmos::media_types::video_smpte291.name);
                     tagGroup(dataFlow, channel.label, "Data");
                     nmos::insert_resource(nodeModel.node_resources, std::move(dataFlow));
