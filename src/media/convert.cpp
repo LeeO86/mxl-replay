@@ -141,6 +141,41 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
     yuv->width = house.width;
     yuv->height = house.height;
     av_frame_get_buffer(yuv, 32);
+    // Frame-rate conversion to the house rate (1.8.1): house frame n (at n / rate) shows the newest
+    // source frame that starts at or before it, so a 25p file in a 50p house repeats each frame and a
+    // 50p file in a 25p house drops every second one; the duration stays. A source frame is held in
+    // `pending` until the next one shows how long it lasts. Frames without timestamps are taken 1:1.
+    FrameRateConverter rate(house.rateNum, house.rateDen);
+    AVRational const nanos{1, 1000000000};
+    AVRational const timeBase = video >= 0 ? fmt->streams[video]->time_base : AVRational{1, 1};
+    std::int64_t firstPts = AV_NOPTS_VALUE;
+    Frame10 pending;
+    std::int64_t lastNs = 0;
+    std::int64_t lastDurationNs = 0;
+    int sources = 0;
+    auto take = [&](AVFrame* decoded) {
+        sws_scale(sws, decoded->data, decoded->linesize, 0, decoded->height, yuv->data, yuv->linesize);
+        auto picture = fromYuv(yuv->data[0], yuv->data[1], yuv->data[2], house.width, house.height, yuv->linesize[0], yuv->linesize[1], yuv->linesize[2]);
+        auto const pts = decoded->best_effort_timestamp;
+        if (pts == AV_NOPTS_VALUE)
+        {
+            out.frames.push_back(std::move(picture));
+            return;
+        }
+        if (firstPts == AV_NOPTS_VALUE)
+        {
+            firstPts = pts;
+        }
+        auto const ns = av_rescale_q(pts - firstPts, timeBase, nanos);
+        if (!pending.empty())
+        {
+            rate.emitUntil(ns, pending, out.frames);
+        }
+        ++sources;
+        lastDurationNs = decoded->duration > 0 ? av_rescale_q(decoded->duration, timeBase, nanos) : ns - lastNs;
+        lastNs = ns;
+        pending = std::move(picture);
+    };
     while (av_read_frame(fmt, packet) >= 0)
     {
         if (vctx != nullptr && packet->stream_index == video)
@@ -149,9 +184,7 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
             {
                 while (avcodec_receive_frame(vctx, frame) >= 0)
                 {
-                    sws_scale(sws, frame->data, frame->linesize, 0, frame->height, yuv->data, yuv->linesize);
-                    out.frames.push_back(fromYuv(yuv->data[0], yuv->data[1], yuv->data[2], house.width, house.height, yuv->linesize[0], yuv->linesize[1],
-                        yuv->linesize[2]));
+                    take(frame);
                 }
             }
         }
@@ -175,6 +208,22 @@ ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFo
             }
         }
         av_packet_unref(packet);
+    }
+    // Drain the video decoder (frames it still holds), then the last source frame for its own duration.
+    if (vctx != nullptr && avcodec_send_packet(vctx, nullptr) >= 0)
+    {
+        while (avcodec_receive_frame(vctx, frame) >= 0)
+        {
+            take(frame);
+        }
+    }
+    if (!pending.empty() && sources == 1 && out.frames.empty())
+    {
+        out.frames.push_back(std::move(pending)); // a still image: one frame, as before
+    }
+    else if (!pending.empty())
+    {
+        rate.finish(lastNs + std::max<std::int64_t>(0, lastDurationNs), pending, out.frames);
     }
     // Drain the audio decoder, then the resampler's delay line (the last milliseconds of the file).
     if (actx != nullptr && swr != nullptr && avcodec_send_packet(actx, nullptr) >= 0)

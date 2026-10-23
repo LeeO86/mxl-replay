@@ -2229,7 +2229,9 @@ std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::stri
         if (!converted.audio.empty())
         {
             int const samples = audioSamplesForFrame(i, config_.format.rateNum, config_.format.rateDen, 48000);
-            std::size_t const offset = i * static_cast<std::size_t>(samples) * static_cast<std::size_t>(converted.channels);
+            // The cadence's own offset: at 29.97 the frames have 1601 or 1602 samples.
+            std::size_t const offset = static_cast<std::size_t>(audioSamplesUntil(i, config_.format.rateNum, config_.format.rateDen, 48000)) *
+                                       static_cast<std::size_t>(converted.channels);
             if (offset < converted.audio.size())
             {
                 frame.audio.assign(converted.audio.begin() + static_cast<std::ptrdiff_t>(offset),

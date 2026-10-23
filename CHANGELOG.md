@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.1
+
+- Fix: an upload at another frame rate than the house's kept its frames 1:1 at the house rate, so it played at the wrong speed and lost the audio after its shortened end. In a 50p house, a 2 s 25p file became a 1 s clip (`out_ns` − `in_ns` 0.98 s) with only its first second of audio. Uploads are now converted to the house rate by their timestamps. House frame n shows the newest source frame that starts at or before n / rate. A 25p file repeats each frame in a 50p house, a 50p file drops every second one in a 25p house, and 29.97 maps to 25 by the same rule. The duration stays, and the audio (already 48 kHz for the whole file) stays in sync. A still image is still one frame; frames without timestamps are still taken 1:1.
+- Fix: an upload's audio in a 29.97 house was sliced with the frame's own sample count times its index instead of the cadence (1601/1602 samples), so it drifted by up to a frame's worth of samples.
+- New unit tests: the frame-rate conversion (25→50, 50→25, 29.97↔25, 1:1, a single short frame) and a 25p / 50p YUV4MPEG2 upload through FFmpeg.
+- The Compose and Kubernetes examples use the `1.8.1` image.
+
 ## 1.8.0
 
 - Interlaced video: replay records and plays 1080i. `REPLAY_FORMAT=1080i25` (the house format) or `1080i2997` (also `1080i29.97`; the number is the frame rate, as in mxl-test-player's `PLAYER_FORMAT`; top field first only, `bff`, `1080i50` and other rasters than 1920×1080 exit 78 with a hint). The flows follow the [shared MXL interlaced convention](https://github.com/LeeO86/mxl-multiviewer/blob/main/docs/mxl-interlaced.md).
