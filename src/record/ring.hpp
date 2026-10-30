@@ -58,6 +58,10 @@ public:
     [[nodiscard]] std::optional<StoredFrame> findAfter(std::uint64_t taiNs) const;
     // The audio of the nearest frame, without reading its JPEG.
     [[nodiscard]] std::vector<float> findNearestAudio(std::uint64_t taiNs) const;
+    // Reads the frames from `fromNs` to `toNs` (both included) from their segments and drops the bytes: the
+    // page cache then has them, and their segments are open, so a reader of those frames later does not
+    // wait for the disk. Blocks for the reads (a loader thread calls it). Returns the bytes read.
+    std::uint64_t prefetch(std::uint64_t fromNs, std::uint64_t toNs) const;
     // Waits up to `timeout` until a frame at or after `taiNs` is stored; true when one is.
     bool waitFor(std::uint64_t taiNs, std::chrono::nanoseconds timeout) const;
     [[nodiscard]] std::size_t size() const;

@@ -37,6 +37,7 @@ add_library(replay-core STATIC
     src/record/ring.cpp
     src/playout/scheduler.cpp
     src/playout/flowahead.cpp
+    src/playout/readahead.cpp
     src/playout/shotbox.cpp
     src/playout/transition.cpp
     src/tally/tsl.cpp
@@ -84,6 +85,7 @@ if(REPLAY_BUILD_TESTS)
         tests/unit/test_upload_rate.cpp
         tests/unit/test_config_file.cpp
         tests/unit/test_upload_stream.cpp
+        tests/unit/test_readahead.cpp
     )
     target_link_libraries(unit-tests PRIVATE replay-core)
     target_compile_options(unit-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)

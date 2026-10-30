@@ -789,6 +789,61 @@ std::optional<StoredFrame> FrameRing::findNearest(std::uint64_t taiNs) const
     return d.load(*it, lock, true);
 }
 
+std::uint64_t FrameRing::prefetch(std::uint64_t fromNs, std::uint64_t toNs) const
+{
+    auto const& d = *impl_;
+    // One byte range per segment: a segment's frames are stored one after the other.
+    struct Range
+    {
+        int fd = -1;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+    };
+    std::vector<Range> ranges;
+    {
+        std::unique_lock lock{d.mutex};
+        std::uint32_t segment = 0;
+        for (auto it = d.lower(fromNs); it != d.index.end() && it->taiNs <= toNs; ++it)
+        {
+            auto const end = it->offset + kRecordHeaderBytes + payload(*it);
+            if (!ranges.empty() && it->segment == segment)
+            {
+                ranges.back().end = std::max(ranges.back().end, end);
+                continue;
+            }
+            int const cached = d.readFd(it->segment);
+            segment = it->segment;
+            ranges.push_back({cached < 0 ? -1 : ::fcntl(cached, F_DUPFD_CLOEXEC, 0), it->offset, end});
+        }
+    }
+    std::uint64_t read = 0;
+    std::vector<char> buffer(1u << 20);
+    for (auto const& range : ranges)
+    {
+        if (range.fd < 0)
+        {
+            continue;
+        }
+        for (auto offset = range.begin; offset < range.end;)
+        {
+            auto const size = static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), range.end - offset));
+            auto const n = ::pread(range.fd, buffer.data(), size, static_cast<off_t>(offset));
+            if (n < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            if (n <= 0)
+            {
+                break;
+            }
+            offset += static_cast<std::uint64_t>(n);
+            read += static_cast<std::uint64_t>(n);
+        }
+        ::close(range.fd);
+    }
+    return read;
+}
+
 bool FrameRing::waitFor(std::uint64_t taiNs, std::chrono::nanoseconds timeout) const
 {
     auto const& d = *impl_;
