@@ -91,6 +91,13 @@ std::string Metrics::render() const
             }
             out << "} " << hist.buckets[i] << '\n';
         }
+        // The +Inf bucket counts every observation; Prometheus' histogram_quantile needs it.
+        out << "mxl_replay_" << base << "_bucket{le=\"+Inf\"";
+        if (!extra.empty())
+        {
+            out << ',' << extra;
+        }
+        out << "} " << hist.count << '\n';
         out << "mxl_replay_" << base << "_sum";
         if (!extra.empty())
         {

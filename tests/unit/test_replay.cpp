@@ -1045,6 +1045,8 @@ TEST_CASE("metrics render the replay prefix")
     auto const text = metrics.render();
     CHECK(text.find("mxl_replay_record_dropped_total") != std::string::npos);
     CHECK(text.find("mxl_replay_frame_gpu_seconds_bucket") != std::string::npos);
+    metrics.observe("frame_gpu_seconds", {{"stage", "decode"}}, 0.5);
+    CHECK(metrics.render().find("mxl_replay_frame_gpu_seconds_bucket{le=\"+Inf\",stage=\"decode\"} 2\n") != std::string::npos);
 }
 
 TEST_CASE("last-frame age and write rate follow the recorder, and the rate drops to 0 when idle")
