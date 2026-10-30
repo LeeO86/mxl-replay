@@ -3,6 +3,7 @@
 #include <jpeglib.h>
 
 #include <algorithm>
+#include <csetjmp>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -12,6 +13,37 @@ namespace replay
 namespace
 {
 constexpr int kMcu = 8;
+
+// libjpeg's default error_exit calls exit(): one damaged JPEG (an upload, a bad segment) ended the
+// process. Decoders use these instead: the error jumps back to the decoder's setjmp, which fails.
+// Each decoder declares its C++ objects before setjmp, so the jump skips no destructor.
+struct JumpErrors
+{
+    jpeg_error_mgr pub{};
+    std::jmp_buf jump{};
+};
+
+[[noreturn]] void jumpOnError(j_common_ptr info)
+{
+    std::longjmp(reinterpret_cast<JumpErrors*>(info->err)->jump, 1);
+}
+
+void quietMessage(j_common_ptr) {}
+
+jpeg_error_mgr* jumpErrors(JumpErrors& errors)
+{
+    jpeg_std_error(&errors.pub);
+    errors.pub.error_exit = jumpOnError;
+    errors.pub.output_message = quietMessage; // warnings (e.g. a cut-off file) are not printed
+    return &errors.pub;
+}
+
+// Larger pictures are not decoded (an upload could ask for gigabytes): 16384 a side, 40 megapixels.
+bool decodableSize(jpeg_decompress_struct const& cinfo)
+{
+    return cinfo.image_width <= 16384 && cinfo.image_height <= 16384 &&
+           static_cast<std::uint64_t>(cinfo.image_width) * cinfo.image_height <= 40000000ull;
+}
 
 std::uint8_t to8(std::uint16_t sample)
 {
@@ -132,7 +164,7 @@ struct ThreadCodec
     jpeg_compress_struct encoder{};
     jpeg_decompress_struct decoder{};
     jpeg_error_mgr encoderErrors{};
-    jpeg_error_mgr decoderErrors{};
+    JumpErrors decoderErrors{};
     VectorDestination destination;
     std::vector<std::uint8_t> y, cb, cr;
     std::size_t lastSize = 256 * 1024;
@@ -141,7 +173,7 @@ struct ThreadCodec
     {
         encoder.err = jpeg_std_error(&encoderErrors);
         jpeg_create_compress(&encoder);
-        decoder.err = jpeg_std_error(&decoderErrors);
+        decoder.err = jumpErrors(decoderErrors);
         jpeg_create_decompress(&decoder);
         destination.pub.init_destination = &VectorDestination::init;
         destination.pub.empty_output_buffer = &VectorDestination::empty;
@@ -275,11 +307,22 @@ bool decodeJpeg422(std::uint8_t const* data, std::size_t size, Frame10& frame)
         return false;
     }
     jpeg_decompress_struct cinfo{};
-    jpeg_error_mgr jerr{};
-    cinfo.err = jpeg_std_error(&jerr);
+    JumpErrors errors;
+    std::vector<std::uint8_t> yPlane;
+    std::vector<std::uint8_t> cbPlane;
+    std::vector<std::uint8_t> crPlane;
+    std::vector<JSAMPROW> yRows;
+    std::vector<JSAMPROW> cbRows;
+    std::vector<JSAMPROW> crRows;
+    cinfo.err = jumpErrors(errors);
+    if (setjmp(errors.jump) != 0)
+    {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
     jpeg_create_decompress(&cinfo);
     jpeg_mem_src(&cinfo, data, static_cast<unsigned long>(size));
-    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK)
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK || !decodableSize(cinfo))
     {
         jpeg_destroy_decompress(&cinfo);
         return false;
@@ -297,12 +340,12 @@ bool decodeJpeg422(std::uint8_t const* data, std::size_t size, Frame10& frame)
     frame.allocate(width, height);
     int const cw = width / 2;
     int const mcu = static_cast<int>(cinfo.max_v_samp_factor) * DCTSIZE;
-    std::vector<std::uint8_t> yPlane(static_cast<std::size_t>(width) * static_cast<std::size_t>(mcu));
-    std::vector<std::uint8_t> cbPlane(static_cast<std::size_t>(cw) * static_cast<std::size_t>(mcu));
-    std::vector<std::uint8_t> crPlane(cbPlane.size());
-    std::vector<JSAMPROW> yRows(static_cast<std::size_t>(mcu));
-    std::vector<JSAMPROW> cbRows(static_cast<std::size_t>(mcu));
-    std::vector<JSAMPROW> crRows(static_cast<std::size_t>(mcu));
+    yPlane.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(mcu));
+    cbPlane.resize(static_cast<std::size_t>(cw) * static_cast<std::size_t>(mcu));
+    crPlane.resize(cbPlane.size());
+    yRows.resize(static_cast<std::size_t>(mcu));
+    cbRows.resize(static_cast<std::size_t>(mcu));
+    crRows.resize(static_cast<std::size_t>(mcu));
     for (int i = 0; i < mcu; ++i)
     {
         yRows[static_cast<std::size_t>(i)] = yPlane.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(width);
@@ -341,11 +384,17 @@ bool decodeJpegPreview(std::uint8_t const* data, std::size_t size, int minWidth,
         return false;
     }
     jpeg_decompress_struct cinfo{};
-    jpeg_error_mgr jerr{};
-    cinfo.err = jpeg_std_error(&jerr);
+    JumpErrors errors;
+    std::vector<JSAMPLE> line;
+    cinfo.err = jumpErrors(errors);
+    if (setjmp(errors.jump) != 0)
+    {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
     jpeg_create_decompress(&cinfo);
     jpeg_mem_src(&cinfo, data, static_cast<unsigned long>(size));
-    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK)
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK || !decodableSize(cinfo))
     {
         jpeg_destroy_decompress(&cinfo);
         return false;
@@ -369,7 +418,7 @@ bool decodeJpegPreview(std::uint8_t const* data, std::size_t size, int minWidth,
     }
     frame.allocate(width, height);
     int const cw = width / 2;
-    std::vector<JSAMPLE> line(static_cast<std::size_t>(cinfo.output_width) * 3u);
+    line.resize(static_cast<std::size_t>(cinfo.output_width) * 3u);
     while (cinfo.output_scanline < cinfo.output_height)
     {
         auto const row = static_cast<std::size_t>(cinfo.output_scanline);
@@ -451,18 +500,18 @@ std::vector<std::uint8_t> encodeJpegV210(std::uint8_t const* v210, int width, in
     return out;
 }
 
-bool decodeJpegToV210(std::uint8_t const* data, std::size_t size, int width, int height, int rowBytes, std::uint8_t* v210)
+namespace
 {
-    if (data == nullptr || size == 0 || v210 == nullptr)
-    {
-        return false;
-    }
-    if (rowBytes <= 0)
-    {
-        rowBytes = static_cast<int>(((width + 5) / 6) * 16);
-    }
+// decodeJpegToV210 after its checks: the setjmp is here, with no local changed after it.
+bool decodeJpegToV210Rows(std::uint8_t const* data, std::size_t size, int width, int height, int stride, std::uint8_t* v210)
+{
     auto& codec = threadCodec();
     auto& cinfo = codec.decoder;
+    if (setjmp(codec.decoderErrors.jump) != 0)
+    {
+        jpeg_abort_decompress(&cinfo); // the codec stays usable for the next frame
+        return false;
+    }
     jpeg_mem_src(&cinfo, data, static_cast<unsigned long>(size));
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK)
     {
@@ -498,10 +547,20 @@ bool decodeJpegToV210(std::uint8_t const* data, std::size_t size, int width, int
         int const rows = std::min(mcu, height - static_cast<int>(scan));
         for (int i = 0; i < rows; ++i)
         {
-            line8ToV210(yRows[i], cbRows[i], crRows[i], width, rowBytes, v210 + (static_cast<std::size_t>(scan) + static_cast<std::size_t>(i)) * static_cast<std::size_t>(rowBytes));
+            line8ToV210(yRows[i], cbRows[i], crRows[i], width, stride, v210 + (static_cast<std::size_t>(scan) + static_cast<std::size_t>(i)) * static_cast<std::size_t>(stride));
         }
     }
     jpeg_finish_decompress(&cinfo);
     return true;
+}
+} // namespace
+
+bool decodeJpegToV210(std::uint8_t const* data, std::size_t size, int width, int height, int rowBytes, std::uint8_t* v210)
+{
+    if (data == nullptr || size == 0 || v210 == nullptr)
+    {
+        return false;
+    }
+    return decodeJpegToV210Rows(data, size, width, height, rowBytes > 0 ? rowBytes : static_cast<int>(((width + 5) / 6) * 16), v210);
 }
 } // namespace replay

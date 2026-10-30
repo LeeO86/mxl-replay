@@ -3,6 +3,7 @@
 #include "config/config.hpp"
 #include "flow/dis.hpp"
 #include "library/catalog.hpp"
+#include "media/convert.hpp"
 #include "media/frame.hpp"
 #include "media/mosaic.hpp"
 #include "nmos/ids.hpp"
@@ -168,6 +169,18 @@ public:
 
     // A clip ("upload-N"), or an audio item ("audio-N") for a file with audio and no video.
     std::string upload(std::uint8_t const* data, std::size_t size, std::string const& name, std::string& error);
+    // The same for a file on disk (an HTTP upload's body, 1.8.2): read and stored one frame at a time.
+    std::string uploadFile(std::string const& path, std::string const& name, std::string& error);
+    // Where the HTTP server writes upload bodies (in the storage directory; emptied at start).
+    [[nodiscard]] std::string uploadDirectory() const { return config_.storageDir + "/incoming"; }
+    // Whether an upload body of `bytes` may come in: {0, ""}, or {413, reason} over REPLAY_UPLOAD_MAX_MB,
+    // or {507, reason} when the disk cannot take the body, about kUploadExpansion times it in frames,
+    // the camera buffers' remaining growth and kUploadReserveBytes.
+    [[nodiscard]] std::pair<int, std::string> admitUpload(std::uint64_t bytes) const;
+    static constexpr std::uint64_t kUploadExpansion = 8;
+    static constexpr std::uint64_t kUploadReserveBytes = 1ull << 30;
+    // Stops a running upload (shutdown): it fails with "shutting down" after its current frame.
+    void stopUploads() { uploadsStopped_.store(true); }
     std::string exportClip(std::string const& id, std::string& error);
     bool consolidate(std::string const& id, std::string& error);
 
@@ -373,6 +386,9 @@ private:
     std::vector<std::uint8_t> blackV210_;
     // One upload at a time: each starts after the library's newest frame.
     std::mutex uploadMutex_;
+    std::atomic<bool> uploadsStopped_{false};
+    std::uint64_t cameraBudgetBytes_ = 0; // the camera buffers' size on disk (estimate at start)
+    std::string storeUpload(UploadSource const& source, std::string const& name, std::string& error);
     struct Preview
     {
         std::chrono::steady_clock::time_point made;

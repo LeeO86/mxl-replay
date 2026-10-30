@@ -718,6 +718,59 @@ void FrameRing::enforceRetention()
     d.handOver(-1, std::move(expired));
 }
 
+std::size_t FrameRing::discardFrom(std::uint64_t beginNs)
+{
+    auto& d = *impl_;
+    // No push meanwhile: it could write into the open segment being removed.
+    std::lock_guard writer{d.writeMutex};
+    std::vector<std::string> doomed;
+    int openFd = -1;
+    std::size_t removed = 0;
+    {
+        std::lock_guard lock{d.mutex};
+        for (auto it = d.segments.begin(); it != d.segments.end();)
+        {
+            auto& segment = it->second;
+            if (segment.firstNs < beginNs || overlaps(d.ranges, segment.firstNs, segment.lastNs))
+            {
+                ++it;
+                continue;
+            }
+            auto const seq = it->first;
+            auto const first = d.lower(segment.firstNs);
+            auto const last = d.upper(segment.lastNs);
+            auto const kept = std::remove_if(first, last, [&](Entry const& entry) {
+                if (entry.segment != seq)
+                {
+                    return false;
+                }
+                d.payloadTotal -= payload(entry);
+                ++removed;
+                return true;
+            });
+            d.index.erase(kept, last);
+            d.dropReadFd(seq);
+            if (segment.writeFd >= 0)
+            {
+                openFd = segment.writeFd; // the next push opens a new segment
+            }
+            doomed.push_back(segment.path);
+            it = d.segments.erase(it);
+        }
+    }
+    if (openFd >= 0)
+    {
+        ::close(openFd);
+    }
+    // Deleted now, under the write lock: the next segment may get the same name (its first frame's
+    // TAI), and the janitor's later delete would remove the new file.
+    for (auto const& path : doomed)
+    {
+        ::unlink(path.c_str());
+    }
+    return removed;
+}
+
 bool FrameRing::isProtected(std::uint64_t taiNs) const
 {
     std::lock_guard lock{impl_->mutex};

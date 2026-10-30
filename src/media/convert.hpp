@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -96,7 +97,7 @@ public:
             order.push_back(previous_);
             ++next_;
         }
-        if (order.empty())
+        if (next_ == 0)
         {
             order.push_back(previous_);
             ++next_;
@@ -114,7 +115,44 @@ private:
     std::int64_t previousNs_ = 0;
 };
 
-// JPEG, or any container FFmpeg can open, scaled to the house raster and converted to the house rate.
+// An upload's file on disk (`path`), or a buffer in memory (`path` empty).
+struct UploadSource
+{
+    std::string path;
+    std::uint8_t const* data = nullptr;
+    std::size_t size = 0;
+};
+
+// Where a streamed upload goes (1.8.2). A callback that returns false stops the conversion.
+struct UploadSink
+{
+    // House frame `n` (0, 1, 2 …) shows `picture`. `source` numbers the source frames: a repeated frame keeps
+    // its number (encode it once). `audio`: the frame's 48 kHz stereo float samples (the house cadence; fewer
+    // or none past the end of the audio).
+    std::function<bool(std::uint64_t n, std::uint32_t source, Frame10 const& picture, std::vector<float> const& audio)> frame;
+    // A file without video (an audio item): its 48 kHz stereo float samples, in pieces of up to 1 s.
+    std::function<bool(float const* samples, std::size_t count)> audio;
+};
+
+struct UploadResult
+{
+    std::uint64_t frames = 0;       // house frames given to the sink
+    std::uint64_t audioSamples = 0; // stereo samples of an audio item
+    bool audioOnly = false;
+    bool stopped = false; // a callback returned false
+    std::string error;    // "scaled" for a still image of another size (not an error)
+};
+
+// A still image is decoded whole: one larger than this is refused (an error starting with kUploadTooLarge).
+inline constexpr std::size_t kMaxStillBytes = 64u * 1024u * 1024u;
+inline constexpr char const kUploadTooLarge[] = "too large: ";
+
+// JPEG, or any container FFmpeg can open, scaled to the house raster and converted to the house rate,
+// one house frame at a time (1.8.2): memory does not grow with the length of the file. The audio is read
+// by a second demuxer, so it does not matter how the file interleaves it with the video.
+[[nodiscard]] UploadResult streamUpload(UploadSource const& source, VideoFormat const& house, UploadSink const& sink);
+
+// streamUpload into memory: each source frame once, and the order of the house frames.
 [[nodiscard]] ConvertedMedia convertUpload(std::uint8_t const* data, std::size_t size, VideoFormat const& house);
 
 // Intra-frame mezzanine: a JPEG-in-MOV when FFmpeg is linked, plus a WAV.

@@ -49,6 +49,9 @@ public:
     // Deletes expired, unprotected segments. push() calls it on every new segment;
     // call it once after the clips of a restart are protected again.
     void enforceRetention();
+    // Deletes the segments that start at or after `beginNs` and that no protected range touches, the
+    // open one too, with their frames (a failed upload). Returns the frames removed.
+    std::size_t discardFrom(std::uint64_t beginNs);
     [[nodiscard]] bool isProtected(std::uint64_t taiNs) const;
     [[nodiscard]] std::optional<StoredFrame> findNearest(std::uint64_t taiNs) const;
     [[nodiscard]] std::optional<StoredFrame> findAtOrBefore(std::uint64_t taiNs) const;

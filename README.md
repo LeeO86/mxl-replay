@@ -35,6 +35,8 @@ The buffer lives on `REPLAY_STORAGE_DIR`: one series of segment files (`cam<N>/s
 
 Uploaded files are stored in their own library buffer (`REPLAY_STORAGE_DIR/library/frames`); their clips list camera `0`. A library segment stays as long as a clip uses it.
 
+An upload's body is written to `REPLAY_STORAGE_DIR/incoming` as it arrives (emptied at start), then converted one frame at a time and stored frame by frame: memory does not grow with the length or size of the file (a 5 min 1080p50 H.264 file peaked at 110 MB of RSS in the lab). The disk needs room for the file and its JPEG frames: a busy 1080p50 test pattern took about 25 GB per hour at `REPLAY_JPEG_QUALITY` 92. A body larger than `REPLAY_UPLOAD_MAX_MB` (default 8192; 0: no limit) is answered 413, and one the disk cannot take (the body, about 8 times its size in frames, the camera buffers' remaining growth and 1 GiB) 507. One upload at a time: a second one gets 409. Other requests (`/livez`, the UI) are answered while an upload converts. A body that stops arriving for 30 s is dropped. A failed upload removes the frames it stored. A still image may have up to 64 MB; a damaged JPEG is answered 400. The request returns when the clip is stored, which takes about as long as the file plays on the CPU path.
+
 10-bit and 12-bit JPEG are not used. nvJPEG's baseline 4:2:2 encoder is 8-bit. See `IMPLEMENTATION_PLAN.md`.
 
 The container image is the GPU build. It still starts with no GPU, which is enough for recording and clip playback (`repeat` / `blend`): on 2× Xeon Gold 6136 without a GPU, 4 cameras at 1080p50 plus 4 channels blending at 0.5× take about 6 cores (libjpeg-turbo). Interpolation and nvJPEG run when the NVIDIA container toolkit injects a device (`docker run --gpus all` or the Kubernetes `nvidia` runtime). Set `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility` (the image already does). The process runs as uid/gid 1000. One GPU is shared by every channel. The device holds three 4:2:2 frames and up to nine flow pairs: about 180 MB resident at 1080p and about 700 MB at 2160p, before nvJPEG's own workspace. A 4 GB GPU covers that path. These figures are the sizes of the allocations in `src/flow/dis_cuda.cu`, not a profile on an A4000 or an L4.
@@ -77,6 +79,7 @@ Process state (the SQLite catalog, imported settings, and IS-05 routes) lives in
 | `REPLAY_STORAGE_DIR` | `/data/replay` |
 | `REPLAY_BUFFER_HOURS` | 2 |
 | `REPLAY_JPEG_QUALITY` | 92 |
+| `REPLAY_UPLOAD_MAX_MB` | 8192 (the largest upload body; 0: no limit) |
 | `REPLAY_PROTECT_MAX_PCT` | 50 |
 | `REPLAY_FLOW_MODULE` | `dis-cuda` (`ofa` is accepted and still uses the DIS path) |
 | `REPLAY_INTERP_PRESET` | `balanced` |
