@@ -157,7 +157,13 @@ struct Config
 struct LoadedConfig
 {
     Config config;
+    // Every key that is set: environment, config file and state file (the effective settings).
     std::map<std::string, std::string> flat;
+    // The state file's keys that the UI owns: those that the environment or the config file do not set.
+    // Only these are saved again (1.8.2).
+    std::map<std::string, std::string> state;
+    // State file keys left out because the environment or the config file sets them.
+    std::vector<std::string> droppedStateKeys;
 };
 
 [[nodiscard]] std::vector<std::string> configKeys();

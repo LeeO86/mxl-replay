@@ -93,12 +93,13 @@ TEST_CASE("a settings save with NMOS_TAGS in env starts again")
     auto const statePath = (dir / "state" / "config.json").string();
     {
         auto const loaded = loadStartupConfig(env, {}, statePath);
-        Engine engine(loaded.config, loaded.flat);
+        Engine engine(loaded.config, loaded.flat, loaded.state);
         engine.openBuffer();
         std::string error;
         REQUIRE(engine.setPlayOnTally(1, false, error));
     }
-    REQUIRE(readText(statePath).find("NMOS_TAGS") != std::string::npos);
+    // Only what the UI set is saved (1.8.2), not the environment's NMOS_TAGS.
+    CHECK(readConfigFile(statePath) == std::map<std::string, std::string>{{"CH1_PLAY_ON_TALLY", "false"}});
     auto const again = loadStartupConfig(env, {}, statePath);
     CHECK(again.config.nmosTags.at("urn:x-example:area").at(0) == "studio \"1\"");
     CHECK_FALSE(again.config.channelList[0].playOnTally);
@@ -150,17 +151,41 @@ TEST_CASE("a state config.json that cannot be loaded is moved aside")
     std::filesystem::remove_all(dir);
 }
 
-TEST_CASE("env overrides the state file; a key only in the state file stays")
+TEST_CASE("the state file keeps only the UI's keys: platform keys leave it, env wins, a removed env key falls back")
 {
     auto const dir = freshConfigDir("mxl-replay-config-precedence");
     std::filesystem::create_directories(dir / "state");
     auto const statePath = (dir / "state" / "config.json").string();
-    writeText(statePath, configFileJson({{"NMOS_TAGS", R"({"a":["from-state"]})"}, {"NMOS_LABEL", "from-state"}}));
+    // As 1.8.1 saved it: the UI's keys and a snapshot of the environment's.
+    writeText(statePath, configFileJson({{"NMOS_TAGS", R"({"a":["from-state"]})"}, {"REPLAY_JPEG_QUALITY", "80"}, {"CH1_LABEL", "from-ui"},
+                             {"CH1_PLAY_ON_TALLY", "false"}}));
     auto env = baseEnv(dir);
     env["NMOS_TAGS"] = R"({"a":["from-env"]})";
-    auto const loaded = loadStartupConfig(env, {}, statePath);
+    env["REPLAY_JPEG_QUALITY"] = "80";
+    auto const loaded = loadStartupConfig(env, {{"NMOS_LABEL", "from-file"}}, statePath);
     CHECK(loaded.config.nmosTags.at("a").at(0) == "from-env");
-    CHECK(loaded.config.nmosLabel == "from-state");
+    CHECK(loaded.config.jpegQuality == 80);
+    CHECK(loaded.config.nmosLabel == "from-file");
+    CHECK(loaded.config.channelList[0].label == "from-ui");
+    CHECK(loaded.droppedStateKeys == std::vector<std::string>{"NMOS_TAGS", "REPLAY_JPEG_QUALITY"});
+    std::map<std::string, std::string> const ui{{"CH1_LABEL", "from-ui"}, {"CH1_PLAY_ON_TALLY", "false"}};
+    CHECK(loaded.state == ui);
+    // Rewritten at once without the platform's keys.
+    CHECK(readConfigFile(statePath) == ui);
+    // The platform drops REPLAY_JPEG_QUALITY: the default again, not the old snapshot.
+    env.erase("REPLAY_JPEG_QUALITY");
+    auto const later = loadStartupConfig(env, {}, statePath);
+    CHECK(later.config.jpegQuality == 92);
+    CHECK(later.droppedStateKeys.empty());
+    // A save keeps the UI's keys and adds none of the platform's; the export still has them all.
+    {
+        Engine engine(later.config, later.flat, later.state);
+        engine.openBuffer();
+        std::string error;
+        REQUIRE(engine.setPlayOnTally(1, true, error));
+        CHECK(engine.exportConfigJson().find("NMOS_TAGS") != std::string::npos);
+    }
+    CHECK(readConfigFile(statePath) == std::map<std::string, std::string>{{"CH1_LABEL", "from-ui"}, {"CH1_PLAY_ON_TALLY", "true"}});
     std::filesystem::remove_all(dir);
 }
 

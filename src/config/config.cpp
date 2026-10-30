@@ -519,7 +519,21 @@ LoadedConfig loadStartupConfig(std::map<std::string, std::string> const& env, st
                 throw ConfigError("the state file " + statePath + " is empty");
             }
             state = readConfigFile(statePath);
-            return loadConfig(env, file, state);
+            auto loaded = loadConfig(env, file, state);
+            if (!loaded.droppedStateKeys.empty())
+            {
+                // A 1.8.1 state file holds every key that was set, the environment's too: those are the
+                // platform's, so they leave the file (a key later removed from env falls back to its default).
+                std::string keys;
+                for (auto const& key : loaded.droppedStateKeys)
+                {
+                    keys += (keys.empty() ? "" : ",") + key;
+                }
+                std::string error;
+                bool const written = writeConfigFile(statePath, loaded.state, error);
+                logInfo("state_config_platform_keys_dropped", {{"path", statePath}, {"keys", keys}, {"rewritten", written ? "true" : "false"}, {"error", error}});
+            }
+            return loaded;
         }
         catch (ConfigError const& ex)
         {
@@ -573,6 +587,9 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     {
         values[key] = value;
     }
+    auto const platformKey = [&](std::string const& key) {
+        return file.count(key) != 0 || (env.count(key) != 0 && (std::find(known.begin(), known.end(), key) != known.end() || knownIndexed(key)));
+    };
     for (auto const& [key, value] : env)
     {
         if (std::find(known.begin(), known.end(), key) != known.end() || knownIndexed(key))
@@ -581,6 +598,18 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
         }
     }
     LoadedConfig loaded;
+    // The state file holds what the UI set (1.8.2); a key the platform sets (env, config file) is its.
+    for (auto const& [key, value] : state)
+    {
+        if (platformKey(key))
+        {
+            loaded.droppedStateKeys.push_back(key);
+        }
+        else
+        {
+            loaded.state[key] = value;
+        }
+    }
     Config& cfg = loaded.config;
     cfg.hostId = take(values, "HOST_ID", hostnameString());
     try

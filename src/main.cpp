@@ -120,7 +120,7 @@ int main(int argc, char** argv)
             }
             mediamtx.start({"mediamtx", path});
         }
-        replay::Engine engine(std::move(loaded.config), flat);
+        replay::Engine engine(std::move(loaded.config), flat, loaded.state);
         // The mosaic and its encoder outlive the reader and playout threads that draw into it.
         std::unique_ptr<replay::PreviewMosaic> mosaic;
         std::unique_ptr<replay::PreviewPublisher> publisher;

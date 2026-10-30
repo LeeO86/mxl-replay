@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The state directory's config.json (1.8.2). 1: with NMOS_TAGS (JSON with quotes) in the environment,
-# a settings save writes it, and the replay starts again from that file. 2: a config.json that cannot be
+# The state directory's config.json (1.8.2). 1: with NMOS_TAGS (JSON with quotes) in the environment, a
+# settings save writes only the UI's key, and the replay starts again from that file. 2: a 1.8.1 file with
+# the environment's keys loses them (state_config_platform_keys_dropped). 3: a config.json that cannot be
 # read is moved aside to config.json.bad, logged (state_config_invalid), and the replay starts.
 # CURL may name another curl (a lab wrapper); the default is curl.
 set -euo pipefail
@@ -69,14 +70,24 @@ stop() {
 start
 "$CURL" -sf -X POST "http://127.0.0.1:${PORT}/api/v1/channels/1/play-on-tally" \
   -H 'content-type: application/json' -d '{"enable":false}' >/dev/null
-grep -q NMOS_TAGS "$DIR/state/config.json"
+grep -q CH1_PLAY_ON_TALLY "$DIR/state/config.json"
+! grep -q NMOS_TAGS "$DIR/state/config.json" # only what the UI set is saved
 stop
 start
 "$CURL" -sf "http://127.0.0.1:${PORT}/api/v1/status" | grep -q '"play_on_tally":false'
 test ! -e "$DIR/state/config.json.bad"
 stop
 
-# 2. A state file that cannot be read (cut off: no closing brace).
+# 2. A 1.8.1 state file with the environment's keys in it: they are dropped (logged), the UI's stay.
+printf '{\n  "NMOS_TAGS": "{}",\n  "HOST_ID": "old",\n  "CH1_PLAY_ON_TALLY": "false"\n}\n' >"$DIR/state/config.json"
+start
+grep -q '"state_config_platform_keys_dropped".*"keys":"HOST_ID,NMOS_TAGS"' "$DIR/log.txt"
+grep -q CH1_PLAY_ON_TALLY "$DIR/state/config.json"
+! grep -q -e NMOS_TAGS -e HOST_ID "$DIR/state/config.json"
+"$CURL" -sf "http://127.0.0.1:${PORT}/api/v1/status" | grep -q '"play_on_tally":false'
+stop
+
+# 3. A state file that cannot be read (cut off: no closing brace).
 printf '{\n  "CH1_LABEL": "say \\"hi\\"",\n  "CH1_PLAY_ON_TALLY": "false"\n' >"$DIR/state/config.json"
 cp "$DIR/state/config.json" "$DIR/expected.bad"
 start

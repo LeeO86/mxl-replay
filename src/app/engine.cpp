@@ -171,9 +171,10 @@ Engine::CameraRuntime::CameraRuntime(std::string directory, std::uint64_t retent
 {
 }
 
-Engine::Engine(Config config, std::map<std::string, std::string> settings)
+Engine::Engine(Config config, std::map<std::string, std::string> settings, std::map<std::string, std::string> state)
     : config_(std::move(config))
-    , settings_(std::move(settings))
+    , settings_(std::move(state))
+    , effective_(std::move(settings))
     , ids_(makeNmosIds(config_.nmosSeed))
     , startedNs_(taiNowNs())
 {
@@ -269,7 +270,7 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         metrics_.inc("tsl_packets_total", {}, 0);
         metrics_.inc("tsl_errors_total", {}, 0);
     }
-    if (settings_.empty())
+    if (effective_.empty())
     {
         std::istringstream lines(exportKeyValue(config_));
         std::string line;
@@ -278,7 +279,7 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
             auto const eq = line.find('=');
             if (eq != std::string::npos)
             {
-                settings_[line.substr(0, eq)] = line.substr(eq + 1);
+                effective_[line.substr(0, eq)] = line.substr(eq + 1);
             }
         }
     }
@@ -1432,12 +1433,14 @@ bool Engine::setIdlePlaylist(int channel, std::string const& id, std::string& er
     if (id.empty())
     {
         settings_.erase(key);
+        effective_.erase(key);
         // The playlist plays on as an ordinary one.
         runtime.idle = false;
     }
     else
     {
         settings_[key] = id;
+        effective_[key] = id;
         // It takes over only an idle channel: one that plays its idle playlist, or one stopped or
         // ended (frozen or black). A live, scrubbed, playing, cued or paused channel arms it: it
         // starts at the next clip end, stop or playlist end.
@@ -1687,6 +1690,7 @@ bool Engine::setPlayOnTally(int channel, bool enabled, std::string& error)
     }
     config_.channelList[static_cast<std::size_t>(channel - 1)].playOnTally = enabled;
     settings_["CH" + std::to_string(channel) + "_PLAY_ON_TALLY"] = enabled ? "true" : "false";
+    effective_["CH" + std::to_string(channel) + "_PLAY_ON_TALLY"] = enabled ? "true" : "false";
     return saveSettings(error);
 }
 
@@ -2077,6 +2081,7 @@ bool Engine::deletePlaylist(std::string const& id)
         {
             cfg.idlePlaylist.clear();
             settings_.erase("CH" + std::to_string(i + 1) + "_IDLE_PLAYLIST");
+            effective_.erase("CH" + std::to_string(i + 1) + "_IDLE_PLAYLIST");
             changed = true;
         }
         if (channels_[i].playlistId == id)
@@ -2504,7 +2509,7 @@ std::string Engine::exportConfigJson() const
     std::ostringstream out;
     out << "{\"version\":1,\"secrets\":false,\"settings\":{";
     bool first = true;
-    for (auto const& [key, value] : settings_)
+    for (auto const& [key, value] : effective_)
     {
         if (!first)
         {
@@ -2569,7 +2574,9 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
         // An exported document, or a flat object of settings.
         auto const* settings = doc.get("settings");
         bool const flat = settings == nullptr && doc.get("clips") == nullptr && doc.get("playlists") == nullptr;
-        auto merged = settings_;
+        // `merged`: the effective settings after the import (checked); `state`: what the UI set, saved.
+        auto merged = effective_;
+        auto state = settings_;
         if (settings != nullptr || flat)
         {
             auto const& object = settings != nullptr ? *settings : doc;
@@ -2583,6 +2590,7 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             for (auto const& [key, value] : object.members)
             {
                 merged[key] = value.text;
+                state[key] = value.text;
             }
         }
         auto const loaded = loadConfig({}, {}, merged);
@@ -2593,7 +2601,7 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             "WIDGET_FRAME_ANCESTORS", "TSL_ENABLE", "TSL_UDP_PORT", "TSL_TCP_PORT"};
         for (auto const* key : restartKeys)
         {
-            auto const before = settings_.count(key) ? settings_.at(key) : std::string{};
+            auto const before = effective_.count(key) ? effective_.at(key) : std::string{};
             auto const after = merged.count(key) ? merged.at(key) : std::string{};
             if (before != after)
             {
@@ -2601,7 +2609,8 @@ Engine::ImportResult Engine::importConfigJson(std::string const& body)
             }
         }
         std::lock_guard lock{mutex_};
-        settings_ = merged;
+        effective_ = merged;
+        settings_ = state;
         if (loaded.config.inputs == config_.inputs)
         {
             for (std::size_t i = 0; i < config_.cameras.size(); ++i)
