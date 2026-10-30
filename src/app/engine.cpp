@@ -268,6 +268,7 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings, std::
         metrics_.inc("tally_plays_total", {{"channel", std::to_string(index)}}, 0);
         metrics_.inc("transitions_total", {{"channel", std::to_string(index)}, {"kind", "cut"}}, 0);
         metrics_.inc("transitions_total", {{"channel", std::to_string(index)}, {"kind", "mix"}}, 0);
+        metrics_.inc("read_ahead_bytes_total", {{"channel", std::to_string(index)}}, 0);
         (void)channel;
         channels_.push_back(std::move(runtime));
     }
@@ -289,11 +290,28 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings, std::
             }
         }
     }
+    // The rings are set once by openBuffer, before any channel plays: the loader reads them without the engine lock.
+    readAhead_ = std::make_unique<ReadAhead>([this](ReadAhead::Request const& request) {
+        auto const* ring = ringOf(request.camera);
+        auto const bytes = ring == nullptr ? 0 : ring->prefetch(request.fromNs, request.toNs);
+        metrics_.inc("read_ahead_bytes_total", {{"channel", std::to_string(request.channel)}}, static_cast<double>(bytes));
+        std::lock_guard lock{readAheadMutex_};
+        if (readAheadObserver_)
+        {
+            readAheadObserver_(request, bytes);
+        }
+    });
     logInfo("replay_ready", {{"storage", config_.storageDir}, {"state", config_.stateDir}, {"inputs", std::to_string(config_.inputs)},
         {"channels", std::to_string(config_.channels)}});
 }
 
 Engine::~Engine() = default;
+
+void Engine::setReadAheadObserver(std::function<void(ReadAhead::Request const&, std::uint64_t)> observer)
+{
+    std::lock_guard lock{readAheadMutex_};
+    readAheadObserver_ = std::move(observer);
+}
 
 void Engine::openBuffer()
 {
@@ -762,6 +780,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     {
         finishClip(channel);
     }
+    readAhead(channel);
     int const camera = runtime.scheduler.camera;
     auto const position = static_cast<std::uint64_t>(std::max<std::int64_t>(0, runtime.scheduler.positionNs));
     // Live: the recorder stores frame M-2 just as grain M starts. Wait briefly for it instead of
@@ -1255,12 +1274,9 @@ AheadFlow Engine::computeFlow(FlowAhead::Pair const& pair, int channel)
     return flow;
 }
 
-void Engine::finishClip(int channel)
+Engine::ClipEnd Engine::planClipEnd(ChannelRuntime const& runtime, Catalog::Playlist const& list) const
 {
-    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
-    auto clip = catalog_.clip(runtime.clipId);
-    // A playlist entry has its own end action and auto-advance.
-    auto const list = runtime.playlistId.empty() ? Catalog::Playlist{} : findPlaylist(catalog_, runtime.playlistId);
+    ClipEnd plan;
     // The idle playlist plays every entry on and starts again after the last (SPECIFICATION.md §7).
     if (runtime.idle && !list.id.empty())
     {
@@ -1272,20 +1288,26 @@ void Engine::finishClip(int channel)
         int const next = idleNext(present, runtime.playlistIndex);
         if (next >= 0)
         {
-            runtime.playlistIndex = next;
-            cueClip(channel, catalog_.clip(list.entries[static_cast<std::size_t>(next)].clipId), &list.entries[static_cast<std::size_t>(next)]);
-            runtime.idle = true;
-            runtime.scheduler.playing = true;
-            runtime.shot.state = ShotState::Playing;
-            return;
+            plan.action = EndAction::Next;
+            plan.idleNext = true;
+            plan.next = next;
+            plan.nextClip = catalog_.clip(list.entries[static_cast<std::size_t>(next)].clipId);
+            plan.autoAdvance = true;
+            return plan;
         }
     }
+    // A playlist entry has its own end action and auto-advance.
     PlaylistEntry const* entry = nullptr;
     if (runtime.playlistIndex >= 0 && runtime.playlistIndex < static_cast<int>(list.entries.size()))
     {
         entry = &list.entries[static_cast<std::size_t>(runtime.playlistIndex)];
     }
-    auto action = entry != nullptr ? entry->end : clip.id.empty() ? runtime.shot.end : clip.end;
+    auto action = entry != nullptr ? entry->end : EndAction::Freeze;
+    if (entry == nullptr)
+    {
+        auto const clip = catalog_.clip(runtime.clipId);
+        action = clip.id.empty() ? runtime.shot.end : clip.end;
+    }
     // A looped playlist plays over and over: its last playable entry's freeze or black wraps to the
     // first entry and plays on. An entry's own loop and return-to-live still win (SPECIFICATION §7).
     bool wraps = false;
@@ -1302,7 +1324,46 @@ void Engine::finishClip(int channel)
             wraps = true;
         }
     }
-    runtime.shot.end = action;
+    plan.action = action;
+    if (action == EndAction::Next && entry != nullptr)
+    {
+        // The next entry whose clip still exists; auto-advance plays it, otherwise it is cued. A looped
+        // playlist starts again at its first.
+        plan.autoAdvance = entry->autoAdvance || wraps;
+        int next = playlistNext(list.entries, runtime.playlistIndex);
+        ClipRef nextClip;
+        while (next >= 0 && (nextClip = catalog_.clip(list.entries[static_cast<std::size_t>(next)].clipId)).id.empty())
+        {
+            next = playlistNext(list.entries, next);
+        }
+        if (next < 0 && list.loop)
+        {
+            next = firstPlayable(catalog_, list, nextClip);
+        }
+        if (next >= 0)
+        {
+            plan.next = next;
+            plan.nextClip = nextClip;
+        }
+    }
+    return plan;
+}
+
+void Engine::finishClip(int channel)
+{
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    auto const list = runtime.playlistId.empty() ? Catalog::Playlist{} : findPlaylist(catalog_, runtime.playlistId);
+    auto const plan = planClipEnd(runtime, list);
+    if (plan.idleNext)
+    {
+        runtime.playlistIndex = plan.next;
+        cueClip(channel, plan.nextClip, &list.entries[static_cast<std::size_t>(plan.next)]);
+        runtime.idle = true;
+        runtime.scheduler.playing = true;
+        runtime.shot.state = ShotState::Playing;
+        return;
+    }
+    runtime.shot.end = plan.action;
     runtime.shot.finished();
     // The clip or the playlist ends here: the idle playlist plays, else the end action (freeze or black) stays.
     auto const ended = [&](bool black) {
@@ -1320,50 +1381,105 @@ void Engine::finishClip(int channel)
             runtime.scheduler.positionNs = static_cast<std::int64_t>(runtime.outNs);
         }
     };
-    if (action == EndAction::Loop)
+    if (plan.action == EndAction::Loop)
     {
         runtime.scheduler.positionNs = static_cast<std::int64_t>(runtime.inNs);
         runtime.scheduler.playing = true;
         runtime.shot.state = ShotState::Playing;
     }
-    else if (action == EndAction::Black)
+    else if (plan.action == EndAction::Black)
     {
         ended(true);
     }
-    else if (action == EndAction::ReturnToLive)
+    else if (plan.action == EndAction::ReturnToLive)
     {
         goLive(runtime);
     }
-    else if (action == EndAction::Next && entry != nullptr)
+    else if (plan.action == EndAction::Next && plan.next >= 0)
     {
-        // The next entry whose clip still exists; auto-advance plays it, otherwise it is cued. A looped
-        // playlist starts again at its first.
-        bool const autoAdvance = entry->autoAdvance || wraps;
-        int next = playlistNext(list.entries, runtime.playlistIndex);
-        ClipRef nextClip;
-        while (next >= 0 && (nextClip = catalog_.clip(list.entries[static_cast<std::size_t>(next)].clipId)).id.empty())
-        {
-            next = playlistNext(list.entries, next);
-        }
-        if (next < 0 && list.loop)
-        {
-            next = firstPlayable(catalog_, list, nextClip);
-        }
-        if (next < 0)
-        {
-            ended(false);
-        }
-        else
-        {
-            runtime.playlistIndex = next;
-            cueClip(channel, nextClip, &list.entries[static_cast<std::size_t>(next)]);
-            runtime.scheduler.playing = autoAdvance;
-            runtime.shot.state = autoAdvance ? ShotState::Playing : ShotState::Cued;
-        }
+        runtime.playlistIndex = plan.next;
+        cueClip(channel, plan.nextClip, &list.entries[static_cast<std::size_t>(plan.next)]);
+        runtime.scheduler.playing = plan.autoAdvance;
+        runtime.shot.state = plan.autoAdvance ? ShotState::Playing : ShotState::Cued;
     }
     else
     {
         ended(false);
+    }
+}
+
+void Engine::readAhead(int channel)
+{
+    auto& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    // Live and black read nothing old: the newest frames are still in the page cache.
+    if (runtime.liveMode || runtime.black)
+    {
+        runtime.readAheadCamera = -1;
+        runtime.readAheadNext.clear();
+        return;
+    }
+    auto const post = [&](int camera, std::uint64_t from, std::uint64_t to) { readAhead_->request({channel, camera, from, to}); };
+    double const speed = runtime.scheduler.speed;
+    auto const span = static_cast<std::uint64_t>(static_cast<double>(kReadAheadNs) * std::max(1.0, std::fabs(speed)));
+    auto const position = static_cast<std::uint64_t>(std::max<std::int64_t>(0, runtime.scheduler.positionNs));
+    int const camera = runtime.scheduler.camera;
+    // The frames ahead of the position (behind it backwards), read again when half of them are played.
+    bool const back = speed < 0;
+    std::uint64_t const from = back ? position - std::min(position, span) : position;
+    std::uint64_t const to = back ? position : position + span;
+    if (camera != runtime.readAheadCamera || position < runtime.readAheadFrom || position > runtime.readAheadTo)
+    {
+        post(camera, from, to);
+        runtime.readAheadCamera = camera;
+        runtime.readAheadFrom = from;
+        runtime.readAheadTo = to;
+    }
+    else if (!back && to > runtime.readAheadTo + span / 2)
+    {
+        post(camera, runtime.readAheadTo, to);
+        runtime.readAheadTo = to;
+    }
+    else if (back && from + span / 2 < runtime.readAheadFrom)
+    {
+        post(camera, from, runtime.readAheadFrom);
+        runtime.readAheadFrom = from;
+    }
+    // The first frames of the clip after OUT (the next entry, the idle playlist's, a loop's IN), once OUT is near:
+    // kReadAheadLeadNs before the playlist's longest transition starts.
+    if (runtime.clipId.empty() || !runtime.hasOut || !runtime.scheduler.playing || speed < kMinClipSpeed || position >= runtime.outNs)
+    {
+        return;
+    }
+    auto const transition = runtime.playlistId.empty() ? 0 : currentPlaylist(channel).id.empty() ? 0 : runtime.planMaxTransition;
+    auto const lead = static_cast<double>(kReadAheadLeadNs) + static_cast<double>(transition) * static_cast<double>(runtime.scheduler.framePeriodNs);
+    if (static_cast<double>(runtime.outNs - position) / speed > lead)
+    {
+        return;
+    }
+    auto const& idleId = config_.channelList[static_cast<std::size_t>(channel - 1)].idlePlaylist;
+    auto const key = runtime.clipId + "#" + runtime.playlistId + "#" + std::to_string(runtime.playlistIndex) + "#" + idleId + "#" +
+                     std::to_string(catalogVersion_) + "#" + std::to_string(runtime.outNs);
+    if (key == runtime.readAheadNext)
+    {
+        return;
+    }
+    runtime.readAheadNext = key;
+    auto const plan = planClipEnd(runtime, currentPlaylist(channel));
+    if (plan.idleNext || (plan.action == EndAction::Next && plan.next >= 0))
+    {
+        post(plan.nextClip.camera, plan.nextClip.inNs, plan.nextClip.inNs + kReadAheadNs);
+    }
+    else if (plan.action == EndAction::Loop)
+    {
+        post(camera, runtime.inNs, runtime.inNs + kReadAheadNs);
+    }
+    else if (plan.action != EndAction::ReturnToLive && !idleId.empty())
+    {
+        ClipRef first;
+        if (firstPlayable(catalog_, findPlaylist(catalog_, idleId), first) >= 0)
+        {
+            post(first.camera, first.inNs, first.inNs + kReadAheadNs);
+        }
     }
 }
 
