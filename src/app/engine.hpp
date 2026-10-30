@@ -10,6 +10,7 @@
 #include "ops/metrics.hpp"
 #include "ops/preview.hpp"
 #include "playout/flowahead.hpp"
+#include "playout/readahead.hpp"
 #include "playout/scheduler.hpp"
 #include "playout/shotbox.hpp"
 #include "playout/transition.hpp"
@@ -225,6 +226,14 @@ public:
     // rate is taken over the time since the last call, at least a second.
     void updateMetrics(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
+    // How far ahead the stored frames a channel plays are read (SPECIFICATION.md §5.3): kReadAheadNs of frames
+    // ahead of its position (times the speed above 1), and the first kReadAheadNs of the clip it plays after OUT
+    // once OUT is kReadAheadLeadNs (plus the playlist's longest transition) away.
+    static constexpr std::uint64_t kReadAheadNs = 1'000'000'000;
+    static constexpr std::uint64_t kReadAheadLeadNs = 2'000'000'000;
+    // Called on the loader thread after each read-ahead with the request and the bytes read (tests).
+    void setReadAheadObserver(std::function<void(ReadAhead::Request const&, std::uint64_t)> observer);
+
 private:
     struct PhaseSlot
     {
@@ -321,6 +330,20 @@ private:
         DuckRamp duck;
         bool auxRestart = false;
         double auxGainDb = -120;
+        // The frames read ahead of the position (camera -1: none), and what the clip after OUT was read for.
+        int readAheadCamera = -1;
+        std::uint64_t readAheadFrom = 0;
+        std::uint64_t readAheadTo = 0;
+        std::string readAheadNext;
+    };
+    // What finishClip does at OUT (planClipEnd; lock held).
+    struct ClipEnd
+    {
+        EndAction action = EndAction::Freeze; // a looped playlist's wrap is Next
+        bool idleNext = false;                // the idle playlist plays its entry `next`
+        int next = -1;                        // the playlist entry played or cued next; -1: none
+        ClipRef nextClip;
+        bool autoAdvance = false;
     };
 
     // Encode into `pending`; pushFrames() writes them after the engine lock is released.
@@ -337,6 +360,10 @@ private:
     // whether a frame exists; false with found set means it is not in the house format.
     bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated) const;
     void finishClip(int channel);
+    // What finishClip will do at OUT with the channel on `list` (lock held).
+    [[nodiscard]] ClipEnd planClipEnd(ChannelRuntime const& runtime, Catalog::Playlist const& list) const;
+    // Posts the stored frames the channel needs soon to the loader thread (lock held, no reads).
+    void readAhead(int channel);
     // The shotbox countdowns of a channel on `list` (SPECIFICATION.md §8.1): the time to the playlist's end, and to
     // OUT in `clipLeft`; -1 for none (lock held).
     std::int64_t countdowns(ChannelRuntime const& channel, Catalog::Playlist const& list, std::int64_t& clipLeft) const;
@@ -426,5 +453,9 @@ private:
     PreviewMosaic* mosaic_ = nullptr;
     std::uint64_t mosaicStep_ = 1;
     std::function<PreviewStatus()> previewStatus_;
+    std::mutex readAheadMutex_;
+    std::function<void(ReadAhead::Request const&, std::uint64_t)> readAheadObserver_;
+    // Last: its thread reads the rings and ends before they are destroyed.
+    std::unique_ptr<ReadAhead> readAhead_;
 };
 } // namespace replay

@@ -198,7 +198,10 @@ of sequences beyond playlists, compressed outputs, HDR.
   two grains late continues at the current grain (a resync): counted per channel in
   `output_resyncs_total`, logged as `output_resync` at most once per 10 s (1.4.0). The playout
   never waits for an optical flow (§5.3, 1.4.1), and its GPU work goes before the recording's,
-  which goes before the flows'. When nothing is
+  which goes before the flows'. Nor does it wait for the disk at a transition (1.8.3): a loader
+  thread reads the stored frames a channel needs soon (1 s ahead of its position, the first
+  second of a cued shot, and from 2 s before OUT the first second of the clip it plays after OUT)
+  into the page cache, counted in `read_ahead_bytes_total{channel}`. When nothing is
   playing, a channel shows its idle source (configurable: last frame, black, or a
   live input "E2E").
 - A grain that shows the same stored picture as the previous grain (a repeated source frame
@@ -382,7 +385,8 @@ The flow step (1–5) is a module behind one interface:
   format (raster and rate: house frame n shows the source frame whose start is nearest
   to n / rate, so the duration and the audio sync stay; a repeated frame is stored once
   in memory; a file that cannot be decoded or scaled fails with a reason; 1.8.1; streamed
-  to disk and converted frame by frame with bounded memory, 1.8.2) and stored as JPEG frame sequence + PCM, so they behave exactly like buffer
+  to disk and converted frame by frame with bounded memory, 1.8.2; logged as `upload_started`,
+  `upload_stored` and `upload_failed` with the file name and no other client data, 1.8.3) and stored as JPEG frame sequence + PCM, so they behave exactly like buffer
   clips (any speed, interpolation, frame-accurate). A file with an audio stream and no
   video (WAV, MP3, AAC, FLAC: anything FFmpeg decodes) is an **audio item** (1.6.0):
   resampled to 48 kHz stereo float and kept as `<library>/audio/<id>.f32` (ids `audio-N`;
@@ -693,7 +697,7 @@ measured, 1.4.1), `playout_seconds{channel,stage}` and `playout_repeated_picture
 `flow_cache_hits_total`; storage `write_bytes_per_second` (what the recorder writes,
 0 when nothing records), `storage_measured_bytes_per_second` (the write test at
 start), `read_bytes_per_second`, `free_bytes`, `protected_bytes`; GPU SM/memory/OFA
-utilisation; per channel `output_resyncs_total` (§5.1) and `interpolation_fallbacks_total`
+utilisation; per channel `output_resyncs_total` and `read_ahead_bytes_total` (§5.1) and `interpolation_fallbacks_total`
 (§5.3); previews `preview_mode{mode}`,
 and in WebRTC mode `preview_publish_mode{mode}` (own, shared),
 `preview_publish_state{stream,state}`, `preview_encoder{encoder}`, `preview_frames_total`,

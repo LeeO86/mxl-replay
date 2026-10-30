@@ -48,6 +48,11 @@ struct HttpBodyFiles
     std::function<std::optional<HttpResponse>(HttpRequest const& request, std::uint64_t length)> admit;
     std::size_t maxActive = 0;
     int stallSeconds = 30;
+    // Called on the server thread when a body is accepted and starts to arrive (`length` bytes), and when one
+    // is answered without the handler (`status` 400, 409, 411, the admit's answer, 500 when it cannot be
+    // written) or dropped (`status` 0: it stopped arriving).
+    std::function<void(HttpRequest const& request, std::uint64_t length)> started;
+    std::function<void(HttpRequest const& request, std::uint64_t length, int status, std::string const& reason)> failed;
 };
 
 [[nodiscard]] int httpGetStatus(std::string const& host, int port, std::string const& path, int timeoutMs);
