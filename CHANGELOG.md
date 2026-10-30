@@ -1,8 +1,9 @@
 # Changelog
 
-## 1.8.4 (unreleased)
+## 1.8.4 (2026-10-30)
 
 - Fix: histograms (`playout_seconds`, `frame_gpu_seconds`, …) had no `le="+Inf"` bucket, so Prometheus' `histogram_quantile` returned NaN. Every histogram now ends with it (equal to `_count`).
+- The Compose and Kubernetes examples use the `1.8.4` image.
 
 ## 1.8.3 (2026-10-30)
 
