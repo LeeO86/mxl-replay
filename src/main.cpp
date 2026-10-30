@@ -156,7 +156,13 @@ int main(int argc, char** argv)
         // hours of buffer); /readyz and the API answer 503 until the buffer is open.
         if (engine.config().webEnable)
         {
-            server.start(engine.config().webPort, [&](replay::HttpRequest const& request) { return replay::handleApi(engine, request, indexHtml); });
+            // Upload bodies go to a file in the storage directory as they arrive, not into memory (1.8.2).
+            replay::HttpBodyFiles uploads;
+            uploads.match = [](std::string const& method, std::string const& path) { return method == "POST" && path == "/api/v1/uploads"; };
+            uploads.directory = engine.uploadDirectory();
+            uploads.maxBytes = static_cast<std::uint64_t>(engine.config().uploadMaxMb) * 1024 * 1024;
+            server.start(
+                engine.config().webPort, [&](replay::HttpRequest const& request) { return replay::handleApi(engine, request, indexHtml); }, uploads);
             replay::logInfo("web_listen", {{"port", std::to_string(server.port())}});
         }
         engine.openBuffer();
@@ -262,6 +268,7 @@ int main(int argc, char** argv)
                 replay::logError("mxl_cleanup_refused", {{"dir", engine.config().outputDomainDir}, {"error", error}});
             }
         }
+        engine.stopUploads();
         server.stop();
         if (publisher)
         {

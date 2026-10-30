@@ -106,6 +106,11 @@ jobs:
           chmod +x tests/integration/replay.sh
           tests/integration/replay.sh build/mxl-replay
 
+      - name: Integration (uploads)
+        run: |
+          chmod +x tests/integration/upload.sh
+          tests/integration/upload.sh build/mxl-replay
+
       - name: Integration (WebRTC preview)
         run: |
           curl -fsSL -o /tmp/mediamtx.tgz https://github.com/bluenviron/mediamtx/releases/download/v1.20.1/mediamtx_v1.20.1_linux_amd64.tar.gz

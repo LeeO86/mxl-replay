@@ -90,6 +90,8 @@ struct Config
     std::string storageDir = "/data/replay";
     double bufferHours = 2;
     int jpegQuality = 92;
+    // The largest upload body accepted, in MB (REPLAY_UPLOAD_MAX_MB; 0: no limit).
+    int uploadMaxMb = 8192;
     int protectMaxPct = 50;
     FlowModuleKind flowModule = FlowModuleKind::DisCuda;
     InterpPreset preset = InterpPreset::Balanced;

@@ -10,6 +10,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <memory>
 #include <atomic>
 #include <cctype>
 #include <cstdlib>
@@ -63,6 +65,8 @@ std::string statusText(int status)
         return "Not Found";
     case 409:
         return "Conflict";
+    case 413:
+        return "Payload Too Large";
     case 500:
         return "Internal Server Error";
     case 503:
@@ -71,6 +75,78 @@ std::string statusText(int status)
         return "Error";
     }
 }
+std::string responseText(HttpResponse const& response)
+{
+    std::string extra;
+    for (auto const& [name, value] : response.headers)
+    {
+        extra += "\r\n" + name + ": " + value;
+    }
+    return "HTTP/1.1 " + std::to_string(response.status) + " " + statusText(response.status) + "\r\nContent-Type: " + response.contentType +
+           "\r\nContent-Length: " + std::to_string(response.body.size()) +
+           (response.cacheControl.empty() ? std::string{} : "\r\nCache-Control: " + response.cacheControl) + extra + "\r\nConnection: close\r\n\r\n" +
+           response.body;
+}
+
+HttpResponse errorResponse(int status, std::string const& message)
+{
+    HttpResponse response;
+    response.status = status;
+    response.contentType = "application/json";
+    response.body = "{\"error\":\"" + jsonEscape(message) + "\"}";
+    return response;
+}
+
+// A request body written to a file as it arrives (HttpBodyFiles). Removes the file unless it was handed on.
+struct BodyFile
+{
+    HttpRequest request;
+    int fd = -1;
+    std::string path;
+    std::uint64_t remaining = 0;
+    bool tooLarge = false;
+    std::string error;
+
+    BodyFile() = default;
+    BodyFile(BodyFile const&) = delete;
+    BodyFile& operator=(BodyFile const&) = delete;
+    ~BodyFile()
+    {
+        if (fd >= 0)
+        {
+            ::close(fd);
+        }
+        if (!path.empty())
+        {
+            ::unlink(path.c_str());
+        }
+    }
+
+    // Keeps reading past a write error or the size limit, so the client gets the answer, not a reset.
+    void write(char const* data, std::size_t size)
+    {
+        remaining -= size;
+        while (fd >= 0 && size > 0)
+        {
+            auto const n = ::write(fd, data, size);
+            if (n < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            if (n <= 0)
+            {
+                error = std::string("the upload could not be written: ") + std::strerror(errno);
+                ::close(fd);
+                fd = -1;
+                ::unlink(path.c_str());
+                path.clear();
+                return;
+            }
+            data += n;
+            size -= static_cast<std::size_t>(n);
+        }
+    }
+};
 } // namespace
 
 struct HttpServer::Impl
@@ -80,15 +156,69 @@ struct HttpServer::Impl
     std::atomic<bool> run{false};
     std::thread thread;
     HttpHandler handler;
+    HttpBodyFiles bodyFiles;
     struct Conn
     {
         int fd = -1;
         bool websocket = false;
         std::string buffer;
         bool closing = false; // shut down by broadcast; the loop closes it
+        std::shared_ptr<BodyFile> body; // set while a body goes to a file
     };
     std::mutex connMu;
     std::vector<Conn> conns;
+    // Handlers of requests with a body file run here, so a long one (an upload) does not hold the loop.
+    struct Worker
+    {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::mutex workerMu;
+    std::vector<Worker> workers;
+
+    HttpResponse handle(HttpRequest const& request)
+    {
+        // A handler that throws answers 500; it must not end the process.
+        try
+        {
+            return handler ? handler(request) : HttpResponse{};
+        }
+        catch (std::exception const& ex)
+        {
+            return errorResponse(500, ex.what());
+        }
+    }
+
+    void startWorker(int fd, HttpRequest request)
+    {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        std::lock_guard lock{workerMu};
+        workers.push_back(Worker{std::thread([this, fd, request = std::move(request), done] {
+            auto const message = responseText(handle(request));
+            sendAll(fd, message.data(), message.size());
+            ::close(fd);
+            ::unlink(request.bodyPath.c_str());
+            done->store(true);
+        }),
+            done});
+    }
+
+    void reapWorkers(bool all)
+    {
+        std::lock_guard lock{workerMu};
+        for (auto it = workers.begin(); it != workers.end();)
+        {
+            if (all || it->done->load())
+            {
+                it->thread.join();
+                it = workers.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
 
     void loop()
     {
@@ -119,13 +249,34 @@ struct HttpServer::Impl
                     conns.push_back(Conn{fd, false, {}, false});
                 }
             }
+            reapWorkers(false);
             struct Job
             {
                 int fd = -1;
                 HttpRequest request;
+                bool fixed = false; // `response` is the answer (no handler)
+                HttpResponse response;
             };
             std::vector<Job> jobs;
             std::vector<int> drop;
+            std::vector<int> handedOff; // owned by a worker now: removed from conns, not closed
+            // A body file is complete: its handler runs on a worker, or a refusal is sent.
+            auto finishBody = [&](Conn& conn) {
+                auto body = std::move(conn.body);
+                if (body->tooLarge || !body->error.empty())
+                {
+                    jobs.push_back(Job{conn.fd, {}, true,
+                        body->tooLarge ? errorResponse(413, "the upload is larger than " + std::to_string(bodyFiles.maxBytes / (1024 * 1024)) + " MB (REPLAY_UPLOAD_MAX_MB)")
+                                       : errorResponse(500, body->error)});
+                    return;
+                }
+                ::close(body->fd);
+                body->fd = -1;
+                body->request.bodyPath = body->path;
+                body->path.clear(); // the worker removes it
+                startWorker(conn.fd, std::move(body->request));
+                handedOff.push_back(conn.fd);
+            };
             {
                 std::lock_guard lock{connMu};
                 for (std::size_t i = 1; i < fds.size() && i - 1 < conns.size(); ++i)
@@ -135,11 +286,20 @@ struct HttpServer::Impl
                         continue;
                     }
                     auto& conn = conns[i - 1];
-                    char buf[8192];
+                    char buf[65536];
                     auto const n = ::recv(conn.fd, buf, sizeof(buf), 0);
                     if (n <= 0)
                     {
                         drop.push_back(conn.fd);
+                        continue;
+                    }
+                    if (conn.body)
+                    {
+                        conn.body->write(buf, std::min<std::size_t>(static_cast<std::size_t>(n), conn.body->remaining));
+                        if (conn.body->remaining == 0)
+                        {
+                            finishBody(conn);
+                        }
                         continue;
                     }
                     conn.buffer.append(buf, buf + n);
@@ -204,6 +364,39 @@ struct HttpServer::Impl
                             bodyLen = static_cast<std::size_t>(std::strtoul(value.c_str(), nullptr, 10));
                         }
                     }
+                    if (bodyLen > 0 && bodyFiles.match && bodyFiles.match(request.method, request.path))
+                    {
+                        // To a file in bodyFiles.directory as it arrives, not into memory (1.8.2).
+                        auto body = std::make_shared<BodyFile>();
+                        body->remaining = bodyLen;
+                        if (bodyFiles.maxBytes > 0 && bodyLen > bodyFiles.maxBytes)
+                        {
+                            body->tooLarge = true;
+                        }
+                        else
+                        {
+                            std::string pattern = bodyFiles.directory + "/body-XXXXXX";
+                            body->fd = ::mkstemp(pattern.data());
+                            if (body->fd < 0)
+                            {
+                                body->error = std::string("the upload could not be written: ") + std::strerror(errno);
+                            }
+                            else
+                            {
+                                body->path = pattern;
+                            }
+                        }
+                        body->request = std::move(request);
+                        auto const have = std::min<std::size_t>(conn.buffer.size() - (headerEnd + 4), bodyLen);
+                        body->write(conn.buffer.data() + headerEnd + 4, have);
+                        conn.buffer.clear();
+                        conn.body = std::move(body);
+                        if (conn.body->remaining == 0)
+                        {
+                            finishBody(conn);
+                        }
+                        continue;
+                    }
                     if (conn.buffer.size() < headerEnd + 4 + bodyLen)
                     {
                         continue;
@@ -216,19 +409,7 @@ struct HttpServer::Impl
             std::vector<int> upgraded;
             for (auto const& job : jobs)
             {
-                HttpResponse response;
-                // A handler that throws answers 500; it must not end the process.
-                try
-                {
-                    response = handler ? handler(job.request) : HttpResponse{};
-                }
-                catch (std::exception const& ex)
-                {
-                    response = HttpResponse{};
-                    response.status = 500;
-                    response.contentType = "application/json";
-                    response.body = "{\"error\":\"" + jsonEscape(ex.what()) + "\"}";
-                }
+                HttpResponse response = job.fixed ? job.response : handle(job.request);
                 if (response.websocket)
                 {
                     auto const keyIt = job.request.headers.find("sec-websocket-key");
@@ -247,15 +428,7 @@ struct HttpServer::Impl
                     }
                     continue;
                 }
-                std::string extra;
-                for (auto const& [name, value] : response.headers)
-                {
-                    extra += "\r\n" + name + ": " + value;
-                }
-                std::string message = "HTTP/1.1 " + std::to_string(response.status) + " " + statusText(response.status) + "\r\nContent-Type: " +
-                                      response.contentType + "\r\nContent-Length: " + std::to_string(response.body.size()) +
-                                      (response.cacheControl.empty() ? std::string{} : "\r\nCache-Control: " + response.cacheControl) + extra +
-                                      "\r\nConnection: close\r\n\r\n" + response.body;
+                auto const message = responseText(response);
                 sendAll(job.fd, message.data(), message.size());
                 drop.push_back(job.fd);
             }
@@ -272,7 +445,10 @@ struct HttpServer::Impl
                 ::close(fd);
             }
             conns.erase(std::remove_if(conns.begin(), conns.end(),
-                            [&](Conn const& conn) { return std::find(drop.begin(), drop.end(), conn.fd) != drop.end(); }),
+                            [&](Conn const& conn) {
+                                return std::find(drop.begin(), drop.end(), conn.fd) != drop.end() ||
+                                       std::find(handedOff.begin(), handedOff.end(), conn.fd) != handedOff.end();
+                            }),
                 conns.end());
         }
     }
@@ -289,10 +465,11 @@ HttpServer::~HttpServer()
     delete impl_;
 }
 
-void HttpServer::start(int port, HttpHandler handler)
+void HttpServer::start(int port, HttpHandler handler, HttpBodyFiles bodyFiles)
 {
     stop();
     impl_->handler = std::move(handler);
+    impl_->bodyFiles = std::move(bodyFiles);
     impl_->listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (impl_->listenFd < 0)
     {
@@ -344,6 +521,7 @@ void HttpServer::stop()
     {
         impl_->thread.join();
     }
+    impl_->reapWorkers(true);
     std::lock_guard lock{impl_->connMu};
     for (auto& conn : impl_->conns)
     {

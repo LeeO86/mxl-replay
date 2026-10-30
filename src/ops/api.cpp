@@ -835,13 +835,16 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
     }
     if (path == "/api/v1/uploads" && method == "POST")
     {
-        // The file is the whole body; its name comes from the query (?name=…).
-        if (request.body.empty())
+        // The file is the whole body; its name comes from the query (?name=…). The server writes it to a
+        // file as it arrives (1.8.2, bodyPath); a body in memory still works (tests, other servers).
+        if (request.body.empty() && request.bodyPath.empty())
         {
             return error(400, "the body must be the file");
         }
         std::string problem;
-        auto const id = engine.upload(reinterpret_cast<std::uint8_t const*>(request.body.data()), request.body.size(), queryValue(request.query, "name"), problem);
+        auto const name = queryValue(request.query, "name");
+        auto const id = !request.bodyPath.empty() ? engine.uploadFile(request.bodyPath, name, problem)
+                                                  : engine.upload(reinterpret_cast<std::uint8_t const*>(request.body.data()), request.body.size(), name, problem);
         if (id.empty())
         {
             return error(400, problem);

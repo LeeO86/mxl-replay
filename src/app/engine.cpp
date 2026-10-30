@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -232,6 +233,9 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
     }
     libraryDir_ = config_.storageDir + "/library";
     std::filesystem::create_directories(libraryDir_, ec);
+    // Upload bodies a crash (or an OOM kill) left behind.
+    std::filesystem::remove_all(uploadDirectory(), ec);
+    std::filesystem::create_directories(uploadDirectory(), ec);
     loadRoutes();
     gpu_ = cudaFlowAvailable();
     auto const period = framePeriodNs(config_.format.rateNum, config_.format.rateDen);
@@ -2159,102 +2163,134 @@ void Engine::playPlaylist(int channel, std::string const& id, bool play)
 
 std::string Engine::upload(std::uint8_t const* data, std::size_t size, std::string const& name, std::string& error)
 {
-    auto converted = convertUpload(data, size, config_.format);
-    if (converted.frames.empty() && converted.audioOnly && !converted.audio.empty())
-    {
-        // An audio item (1.6.0): 48 kHz stereo float, written to a file of the library and read per grain.
-        std::lock_guard serial{uploadMutex_};
-        std::string id;
+    return storeUpload(UploadSource{{}, data, size}, name, error);
+}
+
+std::string Engine::uploadFile(std::string const& path, std::string const& name, std::string& error)
+{
+    return storeUpload(UploadSource{path, nullptr, 0}, name, error);
+}
+
+std::string Engine::storeUpload(UploadSource const& source, std::string const& name, std::string& error)
+{
+    // One upload at a time: its frames go to the library ring while the file is read (1.8.2), on the
+    // frame grid after the ring's newest frame (a camera ring only appends, so frames older than its
+    // live recording would be refused).
+    std::lock_guard serial{uploadMutex_};
+    auto const period = static_cast<std::uint64_t>(framePeriodNs(config_.format.rateNum, config_.format.rateDen));
+    auto const origin = (library_->newestNs() / period + 1) * period;
+    // Protected from the first frame on (the library keeps only segments a clip touches); the end is
+    // known when the file is read.
+    constexpr std::uint64_t kOpenEnd = std::numeric_limits<std::uint64_t>::max();
+    library_->protect(origin, kOpenEnd);
+    std::string audioId;
+    std::string audioPath;
+    std::ofstream audioFile;
+    std::string problem;
+    std::vector<std::uint8_t> jpeg;
+    std::uint32_t encoded = 0;
+    bool haveJpeg = false;
+    UploadSink sink;
+    sink.frame = [&](std::uint64_t n, std::uint32_t sourceFrame, Frame10 const& picture, std::vector<float> const& audio) {
+        if (uploadsStopped_.load())
         {
-            std::lock_guard lock{mutex_};
-            id = std::string(kAudioItemPrefix) + std::to_string(clipSerial_++);
+            problem = "shutting down";
+            return false;
         }
-        std::error_code ec;
-        std::filesystem::create_directories(libraryDir_ + "/audio", ec);
-        auto const path = audioItemPath(id);
+        // House frame n shows source frame `sourceFrame`; a repeated source frame is encoded once (1.8.1).
+        if (!haveJpeg || sourceFrame != encoded)
         {
-            std::ofstream file(path + ".tmp", std::ios::binary | std::ios::trunc);
-            file.write(reinterpret_cast<char const*>(converted.audio.data()), static_cast<std::streamsize>(converted.audio.size() * sizeof(float)));
-            if (!file)
+            jpeg = gpuEncodeFrame10(picture, config_.jpegQuality);
+            if (jpeg.empty())
             {
-                error = "audio could not be stored";
-                std::filesystem::remove(path + ".tmp", ec);
-                return {};
+                jpeg = encodeJpeg422(picture, config_.jpegQuality);
             }
+            encoded = sourceFrame;
+            haveJpeg = true;
         }
-        std::filesystem::rename(path + ".tmp", path, ec);
+        StoredFrame frame;
+        frame.taiNs = origin + n * period;
+        frame.jpeg = jpeg;
+        frame.audio = audio;
+        if (!library_->push(std::move(frame)))
+        {
+            problem = "upload could not be stored (frame " + std::to_string(n) + ")";
+            return false;
+        }
+        return true;
+    };
+    sink.audio = [&](float const* samples, std::size_t count) {
+        if (uploadsStopped_.load())
+        {
+            problem = "shutting down";
+            return false;
+        }
+        // An audio item (1.6.0): 48 kHz stereo float, written to a file of the library and read per grain.
+        if (audioId.empty())
+        {
+            {
+                std::lock_guard lock{mutex_};
+                audioId = std::string(kAudioItemPrefix) + std::to_string(clipSerial_++);
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(libraryDir_ + "/audio", ec);
+            audioPath = audioItemPath(audioId);
+            audioFile.open(audioPath + ".tmp", std::ios::binary | std::ios::trunc);
+        }
+        audioFile.write(reinterpret_cast<char const*>(samples), static_cast<std::streamsize>(count * sizeof(float)));
+        if (!audioFile)
+        {
+            problem = "audio could not be stored";
+            return false;
+        }
+        return true;
+    };
+    auto const result = streamUpload(source, config_.format, sink);
+    std::error_code ec;
+    if (result.audioOnly)
+    {
+        library_->unprotect(origin, kOpenEnd);
+        audioFile.close();
+        if (result.stopped || !result.error.empty() || result.audioSamples == 0 || !audioFile)
+        {
+            if (!audioPath.empty())
+            {
+                std::filesystem::remove(audioPath + ".tmp", ec);
+            }
+            error = !problem.empty() ? problem : !result.error.empty() ? result.error : "audio could not be stored";
+            return {};
+        }
+        std::filesystem::rename(audioPath + ".tmp", audioPath, ec);
         if (ec)
         {
             error = "audio could not be stored";
             return {};
         }
         Catalog::AudioItem item;
-        item.id = id;
-        item.name = name.empty() ? id : name;
-        item.samples = static_cast<std::int64_t>(converted.audio.size() / 2);
+        item.id = audioId;
+        item.name = name.empty() ? audioId : name;
+        item.samples = static_cast<std::int64_t>(result.audioSamples);
         item.createdNs = taiNowNs();
         std::lock_guard lock{mutex_};
         catalog_.upsertAudioItem(item);
         ++catalogVersion_;
         error.clear();
-        return id;
+        return audioId;
     }
-    if (converted.frames.empty() || converted.order.empty())
+    if (result.stopped || result.frames == 0 || (!result.error.empty() && result.error != "scaled"))
     {
-        error = converted.error.empty() ? "upload failed" : converted.error;
+        // Frames already stored are released and expire with their segments.
+        library_->unprotect(origin, kOpenEnd);
+        error = !problem.empty() ? problem : !result.error.empty() ? result.error : "upload failed";
         return {};
     }
     error.clear();
-    auto const period = static_cast<std::uint64_t>(framePeriodNs(config_.format.rateNum, config_.format.rateDen));
-    // Uploads go to the library ring, on the frame grid after its newest frame: a camera
-    // ring only appends, so frames older than its live recording would be refused.
-    std::lock_guard serial{uploadMutex_};
-    auto const origin = (library_->newestNs() / period + 1) * period;
     ClipRef clip;
     clip.camera = kLibraryCamera;
     clip.inNs = origin;
-    clip.outNs = origin + static_cast<std::uint64_t>(converted.order.size() - 1) * period;
-    // Protected first: the library ring keeps only segments a clip touches.
+    clip.outNs = origin + (result.frames - 1) * period;
     library_->protect(clip.inNs, clip.outNs);
-    std::size_t stored = 0;
-    // House frame i shows source frame order[i]; a repeated source frame is encoded once (1.8.1).
-    std::vector<std::uint8_t> jpeg;
-    std::size_t encoded = converted.frames.size();
-    for (std::size_t i = 0; i < converted.order.size(); ++i)
-    {
-        auto const source = static_cast<std::size_t>(converted.order[i]);
-        if (source != encoded)
-        {
-            jpeg = gpuEncodeFrame10(converted.frames[source], config_.jpegQuality);
-            if (jpeg.empty())
-            {
-                jpeg = encodeJpeg422(converted.frames[source], config_.jpegQuality);
-            }
-            encoded = source;
-        }
-        StoredFrame frame;
-        frame.taiNs = origin + static_cast<std::uint64_t>(i) * period;
-        frame.jpeg = jpeg;
-        if (!converted.audio.empty())
-        {
-            int const samples = audioSamplesForFrame(i, config_.format.rateNum, config_.format.rateDen, 48000);
-            // The cadence's own offset: at 29.97 the frames have 1601 or 1602 samples.
-            std::size_t const offset = static_cast<std::size_t>(audioSamplesUntil(i, config_.format.rateNum, config_.format.rateDen, 48000)) *
-                                       static_cast<std::size_t>(converted.channels);
-            if (offset < converted.audio.size())
-            {
-                frame.audio.assign(converted.audio.begin() + static_cast<std::ptrdiff_t>(offset),
-                    converted.audio.begin() + static_cast<std::ptrdiff_t>(std::min(converted.audio.size(), offset + static_cast<std::size_t>(samples * converted.channels))));
-            }
-        }
-        stored += library_->push(std::move(frame)) ? 1 : 0;
-    }
-    if (stored == 0)
-    {
-        library_->unprotect(clip.inNs, clip.outNs);
-        error = "upload could not be stored";
-        return {};
-    }
+    library_->unprotect(origin, kOpenEnd);
     std::lock_guard lock{mutex_};
     clip.id = "upload-" + std::to_string(clipSerial_++);
     clip.name = name.empty() ? clip.id : name;

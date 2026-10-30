@@ -352,7 +352,7 @@ std::map<std::string, std::vector<std::string>> parseNmosTags(std::string const&
 
 std::vector<std::string> configKeys()
 {
-    return {"HOST_ID", "REPLAY_FORMAT", "REPLAY_INPUTS", "REPLAY_CHANNELS", "REPLAY_STORAGE_DIR", "REPLAY_BUFFER_HOURS", "REPLAY_JPEG_QUALITY",
+    return {"HOST_ID", "REPLAY_FORMAT", "REPLAY_INPUTS", "REPLAY_CHANNELS", "REPLAY_STORAGE_DIR", "REPLAY_BUFFER_HOURS", "REPLAY_JPEG_QUALITY", "REPLAY_UPLOAD_MAX_MB",
         "REPLAY_PROTECT_MAX_PCT", "REPLAY_FLOW_MODULE", "REPLAY_INTERP_PRESET", "REPLAY_SLOWMO_AUDIO", "REPLAY_RAMP_FRAMES", "REPLAY_HFR_SNAP",
         "REPLAY_SEGMENT_SECONDS", "REPLAY_LIVE_DELAY_FRAMES", "REPLAY_PLAY_ON_FIRST_CLICK", "REPLAY_ALLOW_CPU_INTERP", "REPLAY_STORAGE_MIN_MBPS",
         "REPLAY_INPUT_STALL_S", "REPLAY_ODIRECT", "REPLAY_SYNTHETIC", "REPLAY_STATE_DIR", "MXL_DOMAIN_SCAN_PATH", "MXL_OUTPUT_DOMAIN_DIR",
@@ -596,6 +596,7 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     cfg.storageDir = take(values, "REPLAY_STORAGE_DIR", "/data/replay");
     cfg.bufferHours = parseDouble("REPLAY_BUFFER_HOURS", take(values, "REPLAY_BUFFER_HOURS", "2"), 0.01, 48);
     cfg.jpegQuality = parseInt("REPLAY_JPEG_QUALITY", take(values, "REPLAY_JPEG_QUALITY", "92"), 1, 100);
+    cfg.uploadMaxMb = parseInt("REPLAY_UPLOAD_MAX_MB", take(values, "REPLAY_UPLOAD_MAX_MB", "8192"), 0, 1048576);
     cfg.protectMaxPct = parseInt("REPLAY_PROTECT_MAX_PCT", take(values, "REPLAY_PROTECT_MAX_PCT", "50"), 1, 100);
     auto const flow = lower(take(values, "REPLAY_FLOW_MODULE", "dis-cuda"));
     if (flow == "ofa")
@@ -890,6 +891,7 @@ std::string exportKeyValue(Config const& config)
     out << "REPLAY_STORAGE_DIR=" << config.storageDir << "\n";
     out << "REPLAY_BUFFER_HOURS=" << config.bufferHours << "\n";
     out << "REPLAY_JPEG_QUALITY=" << config.jpegQuality << "\n";
+    out << "REPLAY_UPLOAD_MAX_MB=" << config.uploadMaxMb << "\n";
     out << "REPLAY_PROTECT_MAX_PCT=" << config.protectMaxPct << "\n";
     out << "REPLAY_FLOW_MODULE=" << flowModuleName(config.flowModule) << "\n";
     out << "REPLAY_INTERP_PRESET=" << presetName(config.preset) << "\n";
