@@ -1,6 +1,7 @@
 #include "ops/httpserver.hpp"
 
 #include "config/config.hpp"
+#include "util/json.hpp"
 #include "util/logging.hpp"
 #include "util/sha1.hpp"
 
@@ -103,6 +104,20 @@ HttpResponse errorResponse(int status, std::string const& message)
     return response;
 }
 
+// The "error" of a JSON error answer; its body when it has none.
+std::string errorText(HttpResponse const& response)
+{
+    Json json;
+    if (parseJson(response.body, json))
+    {
+        if (auto const* error = json.get("error"); error != nullptr && error->kind == Json::Kind::String)
+        {
+            return error->text;
+        }
+    }
+    return response.body;
+}
+
 // A request body written to a file as it arrives (HttpBodyFiles). Removes the file unless it was handed on.
 struct BodyFile
 {
@@ -110,6 +125,7 @@ struct BodyFile
     int fd = -1;
     std::string path;
     std::uint64_t remaining = 0;
+    std::uint64_t length = 0; // the Content-Length
     // Refused (HttpBodyFiles::admit, busy): the body is read and dropped, then this is the answer.
     std::optional<HttpResponse> refusal;
     std::string error;
@@ -287,6 +303,10 @@ struct HttpServer::Impl
             // A body file is complete: its handler runs on a worker, or a refusal is sent.
             auto finishBody = [&](Conn& conn) {
                 auto body = std::move(conn.body);
+                if (!body->refusal && !body->error.empty() && bodyFiles.failed)
+                {
+                    bodyFiles.failed(body->request, body->length, 500, body->error);
+                }
                 if (body->refusal || !body->error.empty())
                 {
                     jobs.push_back(Job{conn.fd, {}, true, body->refusal ? *body->refusal : errorResponse(500, body->error)});
@@ -404,17 +424,25 @@ struct HttpServer::Impl
                             lengthSeen = true;
                         }
                     }
+                    bool const bodyFile = bodyFiles.match && bodyFiles.match(request.method, request.path);
+                    // A body-file request answered here: the answer, and the `failed` hook.
+                    auto const refuse = [&](HttpResponse const& response, std::string const& reason) {
+                        if (bodyFile && bodyFiles.failed)
+                        {
+                            bodyFiles.failed(request, bodyLen, response.status, reason);
+                        }
+                        jobs.push_back(Job{conn.fd, {}, true, response});
+                        conn.buffer.clear();
+                    };
                     if (badLength)
                     {
-                        jobs.push_back(Job{conn.fd, {}, true, errorResponse(400, "invalid Content-Length")});
-                        conn.buffer.clear();
+                        refuse(errorResponse(400, "invalid Content-Length"), "invalid Content-Length");
                         continue;
                     }
-                    bool const bodyFile = bodyFiles.match && bodyFiles.match(request.method, request.path);
                     if (bodyFile && request.headers.count("transfer-encoding") != 0)
                     {
-                        jobs.push_back(Job{conn.fd, {}, true, errorResponse(411, "the upload needs a Content-Length (no chunked transfer)")});
-                        conn.buffer.clear();
+                        static char const kChunked[] = "the upload needs a Content-Length (no chunked transfer)";
+                        refuse(errorResponse(411, kChunked), kChunked);
                         continue;
                     }
                     if (bodyLen > 0 && bodyFile)
@@ -432,6 +460,10 @@ struct HttpServer::Impl
                         }
                         auto const expect = request.headers.find("expect");
                         bool const continues = expect != request.headers.end() && lower(expect->second) == "100-continue";
+                        if (body->refusal && bodyFiles.failed)
+                        {
+                            bodyFiles.failed(request, bodyLen, body->refusal->status, errorText(*body->refusal));
+                        }
                         if (continues && body->refusal)
                         {
                             // The client waits for 100 Continue: answer now, it does not send the body.
@@ -455,8 +487,13 @@ struct HttpServer::Impl
                             else
                             {
                                 body->path = pattern;
+                                if (bodyFiles.started)
+                                {
+                                    bodyFiles.started(request, bodyLen);
+                                }
                             }
                         }
+                        body->length = bodyLen;
                         body->request = std::move(request);
                         auto const have = std::min<std::size_t>(conn.buffer.size() - (headerEnd + 4), bodyLen);
                         body->write(conn.buffer.data() + headerEnd + 4, have);
@@ -483,6 +520,10 @@ struct HttpServer::Impl
                         std::find(drop.begin(), drop.end(), conn.fd) == drop.end())
                     {
                         logWarn("upload_stalled", {{"path", conn.body->request.path}, {"remaining_bytes", std::to_string(conn.body->remaining)}});
+                        if (!conn.body->refusal && bodyFiles.failed)
+                        {
+                            bodyFiles.failed(conn.body->request, conn.body->length, 0, "the body stopped arriving");
+                        }
                         drop.push_back(conn.fd);
                     }
                 }

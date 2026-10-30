@@ -10,7 +10,11 @@
 #include "util/logging.hpp"
 #include "version.hpp"
 
+#include <sys/resource.h>
+
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -838,21 +842,61 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
     if (path == "/api/v1/uploads" && method == "POST")
     {
         // The file is the whole body; its name comes from the query (?name=…). The server writes it to a
-        // file as it arrives (1.8.2, bodyPath); a body in memory still works (tests, other servers).
+        // file as it arrives (1.8.2, bodyPath) and logs upload_started; a body in memory still works (tests,
+        // other servers) and is logged here.
+        std::uint64_t bytes = request.body.size();
+        if (!request.bodyPath.empty())
+        {
+            std::error_code ec;
+            bytes = std::filesystem::file_size(request.bodyPath, ec);
+        }
+        else if (!request.body.empty())
+        {
+            logUploadStarted(request, bytes);
+        }
+        auto const failed = [&](int status, std::string const& reason) {
+            logUploadFailed(request, bytes, status, reason);
+            return error(status, reason);
+        };
         if (request.body.empty() && request.bodyPath.empty())
         {
-            return error(400, "the body must be the file");
+            return failed(400, "the body must be the file");
         }
         std::string problem;
         auto const name = queryValue(request.query, "name");
+        auto const begun = std::chrono::steady_clock::now();
         auto const id = !request.bodyPath.empty() ? engine.uploadFile(request.bodyPath, name, problem)
                                                   : engine.upload(reinterpret_cast<std::uint8_t const*>(request.body.data()), request.body.size(), name, problem);
         if (id.empty())
         {
-            return problem.rfind(kUploadTooLarge, 0) == 0 ? error(413, problem.substr(std::strlen(kUploadTooLarge))) : error(400, problem);
+            return problem.rfind(kUploadTooLarge, 0) == 0 ? failed(413, problem.substr(std::strlen(kUploadTooLarge))) : failed(400, problem);
         }
+        auto const convertMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begun).count();
         // An audio-only file is an audio item (1.6.0).
-        return json(201, std::string("{\"id\":\"") + jsonEscape(id) + "\",\"kind\":\"" + (id.rfind(kAudioItemPrefix, 0) == 0 ? "audio" : "clip") + "\"}");
+        bool const audio = id.rfind(kAudioItemPrefix, 0) == 0;
+        std::uint64_t frames = 0;
+        double seconds = 0;
+        if (audio)
+        {
+            seconds = static_cast<double>(engine.audioItem(id).samples) / 48000.0;
+        }
+        else if (auto const clip = engine.clip(id); !clip.id.empty())
+        {
+            auto const period = static_cast<std::uint64_t>(framePeriodNs(engine.config().format.rateNum, engine.config().format.rateDen));
+            frames = (clip.outNs - clip.inNs) / period + 1;
+            seconds = static_cast<double>(frames * period) / 1e9;
+        }
+        // The process's peak resident memory so far (the 1.8.2 fix keeps it flat while an upload converts).
+        rusage usage{};
+        ::getrusage(RUSAGE_SELF, &usage);
+        std::ostringstream secondsText;
+        secondsText.setf(std::ios::fixed);
+        secondsText.precision(2);
+        secondsText << seconds;
+        logInfo("upload_stored", {{"id", id}, {"kind", audio ? "audio" : "clip"}, {"name", name}, {"bytes", std::to_string(bytes)},
+                                     {"frames", std::to_string(frames)}, {"seconds", secondsText.str()}, {"convert_ms", std::to_string(convertMs)},
+                                     {"peak_rss_mb", std::to_string(usage.ru_maxrss / 1024)}});
+        return json(201, std::string("{\"id\":\"") + jsonEscape(id) + "\",\"kind\":\"" + (audio ? "audio" : "clip") + "\"}");
     }
 
     // Everything below takes a JSON object (or nothing) as its body.
@@ -1204,5 +1248,17 @@ HttpResponse handleApi(Engine& engine, HttpRequest const& request, std::string c
         engine.planFlows();
     }
     return response;
+}
+void logUploadStarted(HttpRequest const& request, std::uint64_t bytes)
+{
+    auto const type = request.headers.find("content-type");
+    logInfo("upload_started", {{"name", queryValue(request.query, "name")}, {"bytes", std::to_string(bytes)},
+                                  {"content_type", type == request.headers.end() ? std::string{} : type->second}});
+}
+
+void logUploadFailed(HttpRequest const& request, std::uint64_t bytes, int status, std::string const& reason)
+{
+    logWarn("upload_failed", {{"name", queryValue(request.query, "name")}, {"bytes", std::to_string(bytes)}, {"http_status", std::to_string(status)},
+                                 {"reason", reason}});
 }
 } // namespace replay
