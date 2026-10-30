@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.8.3 (unreleased)
+
+- Uploads are logged. Before, an upload logged nothing (only `upload_stalled`). Now `upload_started` (`name`, `bytes`, `content_type`) when its body starts to arrive, `upload_stored` (`id`, `kind`, `name`, `bytes`, `frames`, `seconds`, `convert_ms`, `peak_rss_mb`) when it is stored, and `upload_failed` (`name`, `bytes`, `http_status`, `reason`) for every error answer: before the body (400 invalid `Content-Length`, 409 one at a time, 411 chunked, 413 over `REPLAY_UPLOAD_MAX_MB`, 507 no room), after it (400 or 413 from the conversion, 500 when the body could not be written) or a dropped body (`http_status` 0, after `upload_stalled`). `convert_ms` is the conversion after the body arrived; `peak_rss_mb` the process's peak resident memory so far. Only the file name (`?name=`) is logged from the client.
+- New tests: the server's hooks for an accepted, a refused (400, 411, 409, 507) and a stalled upload body; the API's `upload_stored` and `upload_failed` lines.
+
 ## 1.8.2 (2026-10-30)
 
 - Fix: after a settings save with `NMOS_TAGS` in the environment, the replay could not start again (exit 78, `config file has a non-string key`, in a loop). The save wrote `REPLAY_STATE_DIR/config.json` correctly, with `NMOS_TAGS` as JSON inside an escaped JSON string, but the reader ended a value at the first `"` and did not know `\"`. The state file (and `REPLAY_CONFIG_FILE` in JSON) is now read with replay's JSON parser: `\"`, `\\`, `\uXXXX` and JSON inside a string round-trip. `NMOS_TAGS` is read with it too (`\n` and `\u` escapes in tags were kept as letters).

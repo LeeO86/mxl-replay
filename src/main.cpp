@@ -168,6 +168,8 @@ int main(int argc, char** argv)
                 response.body = "{\"error\":\"" + replay::jsonEscape(reason) + "\"}";
                 return response;
             };
+            uploads.started = replay::logUploadStarted;
+            uploads.failed = replay::logUploadFailed;
             server.start(
                 engine.config().webPort, [&](replay::HttpRequest const& request) { return replay::handleApi(engine, request, indexHtml); }, uploads);
             replay::logInfo("web_listen", {{"port", std::to_string(server.port())}});

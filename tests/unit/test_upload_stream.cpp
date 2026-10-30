@@ -32,6 +32,8 @@ extern "C"
 #include <mutex>
 #include <optional>
 #include <limits>
+#include <iostream>
+#include <sstream>
 #include <thread>
 
 using namespace replay;
@@ -358,11 +360,28 @@ TEST_CASE("the upload API takes a body file")
     request.path = "/api/v1/uploads";
     request.query = "name=from-file";
     request.bodyPath = (dir / "clip.nut").string();
+    // The log lines (1.8.3): upload_stored with what was stored, upload_failed with the answer.
+    std::ostringstream log;
+    auto* const cerr = std::cerr.rdbuf(log.rdbuf());
     auto const response = handleApi(*engine, request, "");
     CHECK(response.status == 201);
     CHECK(response.body.find("\"kind\":\"clip\"") != std::string::npos);
     request.bodyPath.clear();
     CHECK(handleApi(*engine, request, "").status == 400); // no body at all
+    request.body = "not a media file";
+    CHECK(handleApi(*engine, request, "").status == 400);
+    std::cerr.rdbuf(cerr);
+    auto const lines = log.str();
+    auto const size = std::to_string(std::filesystem::file_size(dir / "clip.nut"));
+    CHECK(lines.find("\"event\":\"upload_stored\",\"id\":\"upload-") != std::string::npos);
+    CHECK(lines.find("\"kind\":\"clip\",\"name\":\"from-file\",\"bytes\":\"" + size + "\",\"frames\":\"") != std::string::npos);
+    CHECK(lines.find("\"convert_ms\":\"") != std::string::npos);
+    CHECK(lines.find("\"peak_rss_mb\":\"") != std::string::npos);
+    CHECK(lines.find("\"event\":\"upload_failed\",\"name\":\"from-file\",\"bytes\":\"0\",\"http_status\":\"400\",\"reason\":\"the body must be the file\"") !=
+          std::string::npos);
+    // A body in memory (not through the server's body file) is logged as started here.
+    CHECK(lines.find("\"event\":\"upload_started\",\"name\":\"from-file\",\"bytes\":\"16\",\"content_type\":\"\"") != std::string::npos);
+    CHECK(lines.find("\"bytes\":\"16\",\"http_status\":\"400\"") != std::string::npos);
     CHECK(loadConfig({{"REPLAY_UPLOAD_MAX_MB", "0"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}).config.uploadMaxMb == 0);
     CHECK(loadConfig({{"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}).config.uploadMaxMb == 8192);
     CHECK_THROWS_AS((void)loadConfig({{"REPLAY_UPLOAD_MAX_MB", "-1"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
@@ -446,6 +465,17 @@ TEST_CASE("http server checks upload requests: length, chunked, one at a time, 1
         full.body = "no room";
         return full;
     };
+    // What the hooks saw: "started <length>" and "failed <status> <reason>".
+    std::mutex eventsMu;
+    std::vector<std::string> events;
+    files.started = [&](HttpRequest const&, std::uint64_t length) {
+        std::lock_guard lock{eventsMu};
+        events.push_back("started " + std::to_string(length));
+    };
+    files.failed = [&](HttpRequest const&, std::uint64_t length, int status, std::string const& reason) {
+        std::lock_guard lock{eventsMu};
+        events.push_back("failed " + std::to_string(length) + " " + std::to_string(status) + " " + reason);
+    };
     server.start(
         0,
         [&](HttpRequest const& request) {
@@ -497,6 +527,10 @@ TEST_CASE("http server checks upload requests: length, chunked, one at a time, 1
     CHECK(stalled.empty()); // closed without an answer
     CHECK(filesIn(dir) == 0);
     server.stop();
+    // Only the upload path's requests: /other's bad lengths are not uploads.
+    CHECK(events == std::vector<std::string>{"failed 4 400 invalid Content-Length", "failed 0 411 the upload needs a Content-Length (no chunked transfer)",
+                        "failed 999 507 no room", "failed 999 507 no room", "started 5", "started 4", "failed 4 409 an upload is already running; try again when it is stored",
+                        "started 100000", "failed 100000 0 the body stopped arriving"});
     std::filesystem::remove_all(dir);
 }
 
