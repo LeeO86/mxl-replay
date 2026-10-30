@@ -171,6 +171,12 @@ public:
     std::string uploadFile(std::string const& path, std::string const& name, std::string& error);
     // Where the HTTP server writes upload bodies (in the storage directory; emptied at start).
     [[nodiscard]] std::string uploadDirectory() const { return config_.storageDir + "/incoming"; }
+    // Whether an upload body of `bytes` may come in: {0, ""}, or {413, reason} over REPLAY_UPLOAD_MAX_MB,
+    // or {507, reason} when the disk cannot take the body, about kUploadExpansion times it in frames,
+    // the camera buffers' remaining growth and kUploadReserveBytes.
+    [[nodiscard]] std::pair<int, std::string> admitUpload(std::uint64_t bytes) const;
+    static constexpr std::uint64_t kUploadExpansion = 8;
+    static constexpr std::uint64_t kUploadReserveBytes = 1ull << 30;
     // Stops a running upload (shutdown): it fails with "shutting down" after its current frame.
     void stopUploads() { uploadsStopped_.store(true); }
     std::string exportClip(std::string const& id, std::string& error);
@@ -377,6 +383,7 @@ private:
     // One upload at a time: each starts after the library's newest frame.
     std::mutex uploadMutex_;
     std::atomic<bool> uploadsStopped_{false};
+    std::uint64_t cameraBudgetBytes_ = 0; // the camera buffers' size on disk (estimate at start)
     std::string storeUpload(UploadSource const& source, std::string const& name, std::string& error);
     struct Preview
     {

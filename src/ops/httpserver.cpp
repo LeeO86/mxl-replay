@@ -10,9 +10,11 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <cerrno>
-#include <memory>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <memory>
+#include <optional>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -65,8 +67,12 @@ std::string statusText(int status)
         return "Not Found";
     case 409:
         return "Conflict";
+    case 411:
+        return "Length Required";
     case 413:
         return "Payload Too Large";
+    case 507:
+        return "Insufficient Storage";
     case 500:
         return "Internal Server Error";
     case 503:
@@ -104,7 +110,8 @@ struct BodyFile
     int fd = -1;
     std::string path;
     std::uint64_t remaining = 0;
-    bool tooLarge = false;
+    // Refused (HttpBodyFiles::admit, busy): the body is read and dropped, then this is the answer.
+    std::optional<HttpResponse> refusal;
     std::string error;
 
     BodyFile() = default;
@@ -164,6 +171,7 @@ struct HttpServer::Impl
         std::string buffer;
         bool closing = false; // shut down by broadcast; the loop closes it
         std::shared_ptr<BodyFile> body; // set while a body goes to a file
+        std::chrono::steady_clock::time_point lastData = std::chrono::steady_clock::now();
     };
     std::mutex connMu;
     std::vector<Conn> conns;
@@ -201,6 +209,22 @@ struct HttpServer::Impl
             done->store(true);
         }),
             done});
+    }
+
+    // Requests with a body file in progress: received or handled.
+    std::size_t activeBodies()
+    {
+        std::size_t count = 0;
+        for (auto const& conn : conns)
+        {
+            count += conn.body && !conn.body->refusal ? 1 : 0;
+        }
+        std::lock_guard lock{workerMu};
+        for (auto const& worker : workers)
+        {
+            count += worker.done->load() ? 0 : 1;
+        }
+        return count;
     }
 
     void reapWorkers(bool all)
@@ -263,11 +287,9 @@ struct HttpServer::Impl
             // A body file is complete: its handler runs on a worker, or a refusal is sent.
             auto finishBody = [&](Conn& conn) {
                 auto body = std::move(conn.body);
-                if (body->tooLarge || !body->error.empty())
+                if (body->refusal || !body->error.empty())
                 {
-                    jobs.push_back(Job{conn.fd, {}, true,
-                        body->tooLarge ? errorResponse(413, "the upload is larger than " + std::to_string(bodyFiles.maxBytes / (1024 * 1024)) + " MB (REPLAY_UPLOAD_MAX_MB)")
-                                       : errorResponse(500, body->error)});
+                    jobs.push_back(Job{conn.fd, {}, true, body->refusal ? *body->refusal : errorResponse(500, body->error)});
                     return;
                 }
                 ::close(body->fd);
@@ -278,7 +300,8 @@ struct HttpServer::Impl
                 handedOff.push_back(conn.fd);
             };
             {
-                std::lock_guard lock{connMu};
+                std::unique_lock lock{connMu};
+                auto const now = std::chrono::steady_clock::now();
                 for (std::size_t i = 1; i < fds.size() && i - 1 < conns.size(); ++i)
                 {
                     if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0)
@@ -293,9 +316,14 @@ struct HttpServer::Impl
                         drop.push_back(conn.fd);
                         continue;
                     }
+                    conn.lastData = now;
                     if (conn.body)
                     {
-                        conn.body->write(buf, std::min<std::size_t>(static_cast<std::size_t>(n), conn.body->remaining));
+                        // Only this thread changes `conns`: the disk write does not hold up broadcast().
+                        auto const body = conn.body;
+                        lock.unlock();
+                        body->write(buf, std::min<std::size_t>(static_cast<std::size_t>(n), body->remaining));
+                        lock.lock();
                         if (conn.body->remaining == 0)
                         {
                             finishBody(conn);
@@ -319,6 +347,8 @@ struct HttpServer::Impl
                     }
                     std::string const head = conn.buffer.substr(0, headerEnd);
                     std::size_t bodyLen = 0;
+                    bool badLength = false;
+                    bool lengthSeen = false;
                     HttpRequest request;
                     std::istringstream lines(head);
                     std::string requestLine;
@@ -361,19 +391,60 @@ struct HttpServer::Impl
                         request.headers[key] = value;
                         if (key == "content-length")
                         {
-                            bodyLen = static_cast<std::size_t>(std::strtoul(value.c_str(), nullptr, 10));
+                            // Digits only, and the same value when repeated (RFC 9110 §8.6).
+                            while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+                            {
+                                value.pop_back();
+                            }
+                            bool const digits = !value.empty() && value.size() <= 15 &&
+                                                std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; });
+                            auto const parsed = digits ? static_cast<std::size_t>(std::stoull(value)) : 0;
+                            badLength = badLength || !digits || (lengthSeen && parsed != bodyLen);
+                            bodyLen = parsed;
+                            lengthSeen = true;
                         }
                     }
-                    if (bodyLen > 0 && bodyFiles.match && bodyFiles.match(request.method, request.path))
+                    if (badLength)
+                    {
+                        jobs.push_back(Job{conn.fd, {}, true, errorResponse(400, "invalid Content-Length")});
+                        conn.buffer.clear();
+                        continue;
+                    }
+                    bool const bodyFile = bodyFiles.match && bodyFiles.match(request.method, request.path);
+                    if (bodyFile && request.headers.count("transfer-encoding") != 0)
+                    {
+                        jobs.push_back(Job{conn.fd, {}, true, errorResponse(411, "the upload needs a Content-Length (no chunked transfer)")});
+                        conn.buffer.clear();
+                        continue;
+                    }
+                    if (bodyLen > 0 && bodyFile)
                     {
                         // To a file in bodyFiles.directory as it arrives, not into memory (1.8.2).
                         auto body = std::make_shared<BodyFile>();
                         body->remaining = bodyLen;
-                        if (bodyFiles.maxBytes > 0 && bodyLen > bodyFiles.maxBytes)
+                        if (bodyFiles.maxActive > 0 && activeBodies() >= bodyFiles.maxActive)
                         {
-                            body->tooLarge = true;
+                            body->refusal = errorResponse(409, "an upload is already running; try again when it is stored");
                         }
-                        else
+                        else if (bodyFiles.admit)
+                        {
+                            body->refusal = bodyFiles.admit(request, bodyLen);
+                        }
+                        auto const expect = request.headers.find("expect");
+                        bool const continues = expect != request.headers.end() && lower(expect->second) == "100-continue";
+                        if (continues && body->refusal)
+                        {
+                            // The client waits for 100 Continue: answer now, it does not send the body.
+                            jobs.push_back(Job{conn.fd, {}, true, *body->refusal});
+                            conn.buffer.clear();
+                            continue;
+                        }
+                        if (continues)
+                        {
+                            static char const kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                            sendAll(conn.fd, kContinue, sizeof(kContinue) - 1);
+                        }
+                        if (!body->refusal)
                         {
                             std::string pattern = bodyFiles.directory + "/body-XXXXXX";
                             body->fd = ::mkstemp(pattern.data());
@@ -404,6 +475,16 @@ struct HttpServer::Impl
                     request.body = conn.buffer.substr(headerEnd + 4, bodyLen);
                     conn.buffer.erase(0, headerEnd + 4 + bodyLen);
                     jobs.push_back(Job{conn.fd, std::move(request)});
+                }
+                // A body that stopped arriving: the connection is closed and its file removed.
+                for (auto const& conn : conns)
+                {
+                    if (conn.body && bodyFiles.stallSeconds > 0 && now - conn.lastData > std::chrono::seconds(bodyFiles.stallSeconds) &&
+                        std::find(drop.begin(), drop.end(), conn.fd) == drop.end())
+                    {
+                        logWarn("upload_stalled", {{"path", conn.body->request.path}, {"remaining_bytes", std::to_string(conn.body->remaining)}});
+                        drop.push_back(conn.fd);
+                    }
                 }
             }
             std::vector<int> upgraded;

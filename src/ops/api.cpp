@@ -1,6 +1,7 @@
 #include "ops/api.hpp"
 
 #include "config/config.hpp"
+#include "media/convert.hpp"
 #include "media/timebase.hpp"
 #include "ops/httpserver.hpp"
 #include "ops/preview.hpp"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <sstream>
 
 namespace replay
@@ -847,7 +849,7 @@ HttpResponse respond(Engine& engine, HttpRequest const& request, std::string con
                                                   : engine.upload(reinterpret_cast<std::uint8_t const*>(request.body.data()), request.body.size(), name, problem);
         if (id.empty())
         {
-            return error(400, problem);
+            return problem.rfind(kUploadTooLarge, 0) == 0 ? error(413, problem.substr(std::strlen(kUploadTooLarge))) : error(400, problem);
         }
         // An audio-only file is an audio item (1.6.0).
         return json(201, std::string("{\"id\":\"") + jsonEscape(id) + "\",\"kind\":\"" + (id.rfind(kAudioItemPrefix, 0) == 0 ? "audio" : "clip") + "\"}");

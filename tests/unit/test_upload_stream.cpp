@@ -4,9 +4,11 @@
 #include "config/config.hpp"
 #include "media/convert.hpp"
 #include "media/format.hpp"
+#include "media/jpeg.hpp"
 #include "media/timebase.hpp"
 #include "ops/api.hpp"
 #include "ops/httpserver.hpp"
+#include "record/ring.hpp"
 
 #include <doctest/doctest.h>
 
@@ -28,6 +30,8 @@ extern "C"
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
+#include <limits>
 #include <thread>
 
 using namespace replay;
@@ -278,7 +282,16 @@ TEST_CASE("http server writes a matching body to a file and answers other reques
     HttpBodyFiles files;
     files.match = [](std::string const& method, std::string const& path) { return method == "POST" && path == "/upload"; };
     files.directory = dir.string();
-    files.maxBytes = 3 * 1024 * 1024;
+    files.admit = [](HttpRequest const&, std::uint64_t length) -> std::optional<HttpResponse> {
+        if (length <= 3 * 1024 * 1024)
+        {
+            return std::nullopt;
+        }
+        HttpResponse refused;
+        refused.status = 413;
+        refused.body = "too large for the test";
+        return refused;
+    };
     server.start(
         0,
         [&](HttpRequest const& request) {
@@ -327,7 +340,7 @@ TEST_CASE("http server writes a matching body to a file and answers other reques
     std::string const big(3 * 1024 * 1024 + 1, 'x');
     auto const refused = httpRequest(server.port(), "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: " + std::to_string(big.size()), big);
     CHECK(refused.find("413 Payload Too Large") != std::string::npos);
-    CHECK(refused.find("REPLAY_UPLOAD_MAX_MB") != std::string::npos);
+    CHECK(refused.find("too large for the test") != std::string::npos);
     CHECK(filesIn(dir) == 0);
     // Other bodies stay in memory.
     CHECK(httpRequest(server.port(), "POST /other HTTP/1.1\r\nHost: x\r\nContent-Length: 3", "abc").find("done /other") != std::string::npos);
@@ -354,5 +367,245 @@ TEST_CASE("the upload API takes a body file")
     CHECK(loadConfig({{"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}).config.uploadMaxMb == 8192);
     CHECK_THROWS_AS((void)loadConfig({{"REPLAY_UPLOAD_MAX_MB", "-1"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
     engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+namespace
+{
+// Sends `head` (and `body`), then reads the answer; `waitMs` before the body (Expect: 100-continue).
+std::string httpExchange(int port, std::string const& head, std::string const& body, bool readFirst)
+{
+    int const fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<std::uint16_t>(port));
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    timeval timeout{5, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+    {
+        ::close(fd);
+        return {};
+    }
+    auto const request = head + "\r\n\r\n";
+    ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+    std::string response;
+    char buf[4096];
+    if (readFirst)
+    {
+        auto const n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n > 0)
+        {
+            response.append(buf, buf + n);
+        }
+        if (response.rfind("HTTP/1.1 100", 0) != 0)
+        {
+            ::close(fd);
+            return response; // answered before the body
+        }
+    }
+    ::send(fd, body.data(), body.size(), MSG_NOSIGNAL);
+    ssize_t n = 0;
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0)
+    {
+        response.append(buf, buf + n);
+    }
+    ::close(fd);
+    return response;
+}
+
+std::vector<std::uint8_t> smallJpeg()
+{
+    Frame10 still;
+    still.allocate(64, 32);
+    still.fill(700, 512, 512);
+    return encodeJpeg422(still, 90);
+}
+} // namespace
+
+TEST_CASE("http server checks upload requests: length, chunked, one at a time, 100-continue, a stalled body")
+{
+    auto const dir = freshUploadDir("mxl-replay-body-checks");
+    std::mutex mu;
+    std::condition_variable cv;
+    bool release = false;
+    std::atomic<bool> inHandler{false};
+    HttpServer server;
+    HttpBodyFiles files;
+    files.match = [](std::string const& method, std::string const& path) { return method == "POST" && path == "/upload"; };
+    files.directory = dir.string();
+    files.maxActive = 1;
+    files.stallSeconds = 1;
+    files.admit = [](HttpRequest const&, std::uint64_t length) -> std::optional<HttpResponse> {
+        if (length != 999)
+        {
+            return std::nullopt;
+        }
+        HttpResponse full;
+        full.status = 507;
+        full.body = "no room";
+        return full;
+    };
+    server.start(
+        0,
+        [&](HttpRequest const& request) {
+            if (request.query == "block")
+            {
+                inHandler.store(true);
+                std::unique_lock lock{mu};
+                cv.wait_for(lock, std::chrono::seconds(10), [&] { return release; });
+            }
+            HttpResponse response;
+            response.body = "done " + std::to_string(request.body.size()) + " " + (request.bodyPath.empty() ? "memory" : "file");
+            return response;
+        },
+        files);
+    int const port = server.port();
+    // Content-Length must be digits (any request), and the same when repeated.
+    for (auto const* length : {"abc", "-5", "12x", "99999999999999999999"})
+    {
+        CHECK(httpRequest(port, std::string("POST /other HTTP/1.1\r\nContent-Length: ") + length, "abc").find("400 Bad Request") != std::string::npos);
+    }
+    CHECK(httpRequest(port, "POST /upload HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4", "abcd").find("400 Bad Request") != std::string::npos);
+    CHECK(httpRequest(port, "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked", "3\r\nabc\r\n0\r\n\r\n").find("411 Length Required") != std::string::npos);
+    // admit refuses: the body is read and dropped, then 507; with Expect: 100-continue at once, no body sent.
+    CHECK(httpRequest(port, "POST /upload HTTP/1.1\r\nContent-Length: 999", std::string(999, 'x')).find("507 Insufficient Storage") != std::string::npos);
+    CHECK(httpExchange(port, "POST /upload HTTP/1.1\r\nContent-Length: 999\r\nExpect: 100-continue", std::string(999, 'x'), true).find("HTTP/1.1 507") == 0);
+    // Accepted with Expect: 100-continue: 100 first, then the answer.
+    auto const continued = httpExchange(port, "POST /upload HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue", "hello", true);
+    CHECK(continued.rfind("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK", 0) == 0);
+    CHECK(continued.find("done 0 file") != std::string::npos);
+    // One at a time: a second upload while the first is handled gets 409.
+    std::string first;
+    std::thread uploader([&] { first = httpRequest(port, "POST /upload?block HTTP/1.1\r\nContent-Length: 4", "abcd"); });
+    for (int i = 0; i < 500 && !inHandler.load(); ++i)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(inHandler.load());
+    auto const second = httpRequest(port, "POST /upload HTTP/1.1\r\nContent-Length: 4", "abcd");
+    CHECK(second.find("409 Conflict") != std::string::npos);
+    {
+        std::lock_guard lock{mu};
+        release = true;
+    }
+    cv.notify_all();
+    uploader.join();
+    CHECK(first.find("200 OK") != std::string::npos);
+    // A body that stops arriving is dropped after stallSeconds, with its file.
+    auto const stalled = httpExchange(port, "POST /upload HTTP/1.1\r\nContent-Length: 100000", "only a part", false);
+    CHECK(stalled.empty()); // closed without an answer
+    CHECK(filesIn(dir) == 0);
+    server.stop();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a damaged JPEG fails the decoders instead of ending the process")
+{
+    auto const good = smallJpeg();
+    Frame10 frame;
+    REQUIRE(decodeJpeg422(good.data(), good.size(), frame));
+    std::vector<std::vector<std::uint8_t>> damaged;
+    for (std::size_t cut : {4u, 20u, 100u, 200u})
+    {
+        damaged.emplace_back(good.begin(), good.begin() + static_cast<std::ptrdiff_t>(std::min(cut, good.size())));
+    }
+    std::vector<std::uint8_t> junk{0xff, 0xd8};
+    junk.insert(junk.end(), 500, 0x42);
+    damaged.push_back(junk);
+    auto badFrame = good;
+    for (std::size_t i = 2; i + 1 < badFrame.size(); ++i)
+    {
+        if (badFrame[i] == 0xff && badFrame[i + 1] == 0xc0) // SOF0: precision 0 is an error
+        {
+            badFrame[i + 4] = 0;
+            break;
+        }
+    }
+    damaged.push_back(badFrame);
+    std::vector<std::uint8_t> v210(static_cast<std::size_t>((64 + 5) / 6 * 16 * 32));
+    for (auto const& bytes : damaged)
+    {
+        Frame10 out;
+        (void)decodeJpeg422(bytes.data(), bytes.size(), out); // a cut-off file may still decode (grey rest)
+        (void)decodeJpegPreview(bytes.data(), bytes.size(), 16, out);
+        (void)decodeJpegToV210(bytes.data(), bytes.size(), 64, 32, 0, v210.data());
+    }
+    CHECK_FALSE(decodeJpeg422(junk.data(), junk.size(), frame));
+    CHECK_FALSE(decodeJpeg422(badFrame.data(), badFrame.size(), frame));
+    CHECK_FALSE(decodeJpegToV210(badFrame.data(), badFrame.size(), 64, 32, 0, v210.data()));
+    // The thread's decoder still works after an error.
+    CHECK(decodeJpegToV210(good.data(), good.size(), 64, 32, 0, v210.data()));
+}
+
+TEST_CASE("an upload of a damaged JPEG answers 400, a still over 64 MB 413")
+{
+    auto const dir = freshUploadDir("mxl-replay-upload-jpeg");
+    auto engine = uploadEngine(dir);
+    std::vector<std::uint8_t> junk{0xff, 0xd8};
+    junk.insert(junk.end(), 500, 0x42);
+    {
+        std::ofstream out(dir / "junk.jpg", std::ios::binary);
+        out.write(reinterpret_cast<char const*>(junk.data()), static_cast<std::streamsize>(junk.size()));
+    }
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/v1/uploads";
+    request.bodyPath = (dir / "junk.jpg").string();
+    CHECK(handleApi(*engine, request, "").status == 400);
+    {
+        std::ofstream out(dir / "big.jpg", std::ios::binary);
+        out.write(reinterpret_cast<char const*>(junk.data()), 2);
+        std::vector<char> pad(1024 * 1024, 0);
+        for (int i = 0; i < 64; ++i)
+        {
+            out.write(pad.data(), static_cast<std::streamsize>(pad.size()));
+        }
+    }
+    request.bodyPath = (dir / "big.jpg").string();
+    auto const big = handleApi(*engine, request, "");
+    CHECK(big.status == 413);
+    CHECK(big.body.find("64 MB") != std::string::npos);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("discardFrom removes a failed upload's segments, the open one too, and keeps protected ones")
+{
+    auto const dir = freshUploadDir("mxl-replay-ring-discard");
+    constexpr std::uint64_t kS = 1000000000ull;
+    auto frame = [](std::uint64_t tai) {
+        StoredFrame f;
+        f.taiNs = tai;
+        f.jpeg = {1, 2, 3, 4};
+        return f;
+    };
+    {
+        FrameRing ring(dir.string(), 1, 1); // the library: 1 ns retention, 1 s segments
+        for (std::uint64_t i = 0; i < 20; ++i)
+        {
+            REQUIRE(ring.push(frame(100 * kS + i * kS / 10))); // a clip: 100.0 … 101.9 s
+        }
+        ring.protect(100 * kS, 101 * kS + 9 * kS / 10);
+        auto const keptSegments = ring.segmentCount();
+        auto const origin = 102 * kS;
+        ring.protect(origin, std::numeric_limits<std::uint64_t>::max());
+        for (std::uint64_t i = 0; i < 35; ++i)
+        {
+            REQUIRE(ring.push(frame(origin + i * kS / 10))); // the failed upload: 3.5 s
+        }
+        CHECK(ring.segmentCount() > keptSegments);
+        ring.unprotect(origin, std::numeric_limits<std::uint64_t>::max());
+        // The clip's last segment (101.1 … 102.1 s) also holds the upload's first two frames: it stays
+        // for the clip. Every segment that starts in the upload goes, the open one included.
+        CHECK(ring.discardFrom(origin) == 33);
+        CHECK(ring.size() == 22);
+        CHECK(ring.segmentCount() == keptSegments);
+        CHECK(ring.newestNs() == origin + kS / 10);
+        CHECK(ring.push(frame(origin + 2 * kS / 10))); // the next upload opens a new segment
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the janitor deletes the files
+    FrameRing again(dir.string(), 1, 1);
+    CHECK(again.size() == 23);
     std::filesystem::remove_all(dir);
 }

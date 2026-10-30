@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -36,12 +37,17 @@ using HttpHandler = std::function<HttpResponse(HttpRequest const&)>;
 
 // Requests whose body is written to a file in `directory` as it arrives, instead of memory (1.8.2:
 // uploads). Their handler runs on a thread of its own, so the other requests are answered meanwhile.
-// A body larger than `maxBytes` (0: no limit) is read and dropped, and answered 413.
+// Such a request needs a Content-Length (else 411). `admit` may refuse it from its headers and length
+// (a response, e.g. 413 or 507); more than `maxActive` at a time (0: no limit) get 409. A refused body
+// is read and dropped, then answered, unless the client sent `Expect: 100-continue` (answered at once).
+// A body that stops arriving for `stallSeconds` (0: never) is dropped with its file.
 struct HttpBodyFiles
 {
     std::function<bool(std::string const& method, std::string const& path)> match;
     std::string directory;
-    std::uint64_t maxBytes = 0;
+    std::function<std::optional<HttpResponse>(HttpRequest const& request, std::uint64_t length)> admit;
+    std::size_t maxActive = 0;
+    int stallSeconds = 30;
 };
 
 [[nodiscard]] int httpGetStatus(std::string const& host, int port, std::string const& path, int timeoutMs);

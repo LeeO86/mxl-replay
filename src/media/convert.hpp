@@ -143,6 +143,10 @@ struct UploadResult
     std::string error;    // "scaled" for a still image of another size (not an error)
 };
 
+// A still image is decoded whole: one larger than this is refused (an error starting with kUploadTooLarge).
+inline constexpr std::size_t kMaxStillBytes = 64u * 1024u * 1024u;
+inline constexpr char const kUploadTooLarge[] = "too large: ";
+
 // JPEG, or any container FFmpeg can open, scaled to the house raster and converted to the house rate,
 // one house frame at a time (1.8.2): memory does not grow with the length of the file. The audio is read
 // by a second demuxer, so it does not matter how the file interleaves it with the video.

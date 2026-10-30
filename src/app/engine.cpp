@@ -213,6 +213,7 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         freeBytes += segmentBytes(config_.storageDir + "/cam" + std::to_string(camera.index));
     }
     double required = 0;
+    cameraBudgetBytes_ = 0;
     for (auto const& camera : config_.cameras)
     {
         int const fpsNum = camera.nativeFps > 0 ? camera.nativeFps : config_.format.rateNum;
@@ -220,6 +221,7 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings)
         required += bytesPerHourEstimate(config_.format.width, config_.format.height, fpsNum, fpsDen, config_.jpegQuality) * camera.bufferHours;
         required += 48000.0 * 2.0 * 4.0 * 3600.0 * camera.bufferHours;
     }
+    cameraBudgetBytes_ = static_cast<std::uint64_t>(required);
     if (static_cast<double>(freeBytes) < required)
     {
         throw StartupError(78, "buffer does not fit on " + config_.storageDir + ": need " + std::to_string(static_cast<std::uint64_t>(required)) +
@@ -2279,8 +2281,9 @@ std::string Engine::storeUpload(UploadSource const& source, std::string const& n
     }
     if (result.stopped || result.frames == 0 || (!result.error.empty() && result.error != "scaled"))
     {
-        // Frames already stored are released and expire with their segments.
+        // The frames already stored are removed with their segments (not kept until the next upload).
         library_->unprotect(origin, kOpenEnd);
+        library_->discardFrom(origin);
         error = !problem.empty() ? problem : !result.error.empty() ? result.error : "upload failed";
         return {};
     }
@@ -3013,6 +3016,32 @@ void Engine::updateMetrics(std::chrono::steady_clock::time_point now)
             metrics_.set("preview_mediamtx_restarts_total", {}, static_cast<double>(preview.mediamtxRestarts));
         }
     }
+}
+
+std::pair<int, std::string> Engine::admitUpload(std::uint64_t bytes) const
+{
+    auto const cap = static_cast<std::uint64_t>(config_.uploadMaxMb) * 1024 * 1024;
+    if (cap > 0 && bytes > cap)
+    {
+        return {413, "the upload is larger than " + std::to_string(config_.uploadMaxMb) + " MB (REPLAY_UPLOAD_MAX_MB)"};
+    }
+    // The body, its JPEG frames (estimated), what the camera buffers still grow into, and a reserve:
+    // an upload must not take the disk the recording needs.
+    std::uint64_t cameraBytes = 0;
+    for (auto const& camera : config_.cameras)
+    {
+        cameraBytes += segmentBytes(config_.storageDir + "/cam" + std::to_string(camera.index));
+    }
+    auto const cameraGrowth = cameraBudgetBytes_ > cameraBytes ? cameraBudgetBytes_ - cameraBytes : 0;
+    auto const need = bytes * (1 + kUploadExpansion) + cameraGrowth + kUploadReserveBytes;
+    auto const free = freeBytes();
+    if (free < need)
+    {
+        auto const gb = [](std::uint64_t value) { return std::to_string(value / 1000000000ull) + "." + std::to_string(value / 100000000ull % 10); };
+        return {507, "not enough free storage for this upload: about " + gb(need) + " GB needed (the file, its frames, the camera buffers' growth, a reserve), " +
+                         gb(free) + " GB free"};
+    }
+    return {0, {}};
 }
 
 std::uint64_t Engine::freeBytes() const

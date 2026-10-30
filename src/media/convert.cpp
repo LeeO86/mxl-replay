@@ -299,6 +299,11 @@ UploadResult streamUpload(UploadSource const& source, VideoFormat const& house, 
     }
     if (startsWithJpeg(source))
     {
+        if (size > kMaxStillBytes)
+        {
+            out.error = std::string(kUploadTooLarge) + "a still image (JPEG) may have up to " + std::to_string(kMaxStillBytes / (1024 * 1024)) + " MB";
+            return out;
+        }
         std::vector<std::uint8_t> file;
         if (!source.path.empty() && !readFile(source.path, file))
         {
