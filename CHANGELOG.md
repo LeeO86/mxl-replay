@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.8.3 (unreleased)
+## 1.8.3 (2026-10-30)
 
 - Fix: a channel resynced (`output_resync`, `jumped_grains` 3) at almost every playlist transition, e.g. every clip change of an idle playlist. At a transition the output thread read the incoming clip's first frames from the disk itself (`Engine::render`, the frame read after `maybeStartTransition` and `finishClip` moved the channel to the next entry's IN). Those frames are usually not in the page cache: the clip is old, the recorder's writing churns the cache, and the disk's readahead starts again at a new place. So the first grains of every new item waited for the disk, and the channel fell more than two grains behind. Now a loader thread reads them ahead (`ReadAhead`, `FrameRing::prefetch`). It reads 1 s of frames ahead of each channel's position (more above 100 %; behind it in reverse) and, once OUT is 2 s away (plus the playlist's longest transition: a mix starts before OUT), the first second of the clip the channel plays after OUT: the next playlist entry (auto-advance or cued), the idle playlist's next or first entry, or the clip's own IN on *loop*. A cued shot has its first second read at the cue, so a play (also a red-light play) finds it in the page cache. The output thread no longer opens segment files for these reads either. Live and black channels read nothing ahead.
 - New metric `read_ahead_bytes_total{channel}` (0 from the start): the bytes the loader read for the channel.
@@ -15,6 +15,7 @@
 - Lab (A16 GPU, CUDA build, 1080p50 house, noisy test-pattern uploads with 1.36 MB JPEG frames, 30 s of a cued and played clip per run; "loaded": another process keeps every SM busy). 60p: idle GPU `render` mean 21.6 ms and 16 resyncs before, 13.6–15.6 ms after; loaded 26.7 ms and 104 resyncs before, 22.2 ms and 29 after. The resyncs left on an idle GPU (11–18) came in one burst of about 2 s of slow disk reads, with or without this change; the 1.8.3 read-ahead of stored frames (`ReadAhead`) removes them. Both together, 60p with the clip dropped from the page cache: idle GPU 11.1 ms and 0 resyncs, loaded 20.0 ms and 0 resyncs (the read-ahead alone: 20.0 ms idle, 0 resyncs, but no margin). 25p (repeated pictures only, before the GPU decoder change): idle 20.7 → 12.7 ms, 18 → 1 resyncs; loaded 30.7 → 18.1 ms, 148 → 5. 29.97p (the same): idle 20.6 → 13.9 ms, 13 → 2; loaded 29.2 → 21.4 ms, 137 → 25. CPU build, a 25p test-pattern upload (150 kB frames): 20.1 → 13.2 ms. At speed 1 an upload is not interpolated (its frames are at the house rate), so `motion` does not change this.
 - Not fixed: on a GPU that other processes keep fully busy, a detailed clip with a new picture on every grain can still take about a period per grain. The GPU stream priorities order only the replay's own work, not other processes'.
 - New test: a 25p upload played in a 50p house shows each source frame on two grains and decodes it once (`playout_repeated_pictures_total`).
+- The Compose and Kubernetes examples use the `1.8.3` image.
 
 ## 1.8.2 (2026-10-30)
 
