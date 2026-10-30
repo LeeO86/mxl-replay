@@ -166,6 +166,8 @@ struct LoadedConfig
 [[nodiscard]] std::map<std::string, std::string> readConfigFile(std::string const& path);
 // The state directory's config.json as replay writes it: a JSON object of strings, read back by readConfigFile.
 [[nodiscard]] std::string configFileJson(std::map<std::string, std::string> const& values);
+// Writes configFileJson(values) to `path` durably (temp file, fsync, rename, fsync of the directory).
+bool writeConfigFile(std::string const& path, std::map<std::string, std::string> const& values, std::string& error);
 // loadConfig with the state file at `statePath` (when it exists). A state file that cannot be read or
 // loaded while env and `file` load is logged (`state_config_invalid`), renamed to `<path>.bad`, and
 // left out: replay starts with env, the config file and the defaults.

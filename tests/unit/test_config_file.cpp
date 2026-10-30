@@ -115,7 +115,7 @@ TEST_CASE("a state config.json that cannot be loaded is moved aside")
     auto const env = baseEnv(dir);
     // The file 1.8.1 could not read back, an invalid value and an unknown key.
     for (auto const* text : {R"({"NMOS_TAGS": "{\"urn:x-example:function\":[\"replay\"]}", "CH1_PLAY_ON_TALLY": "false" )", R"({"REPLAY_JPEG_QUALITY": "999"})",
-             R"({"NOT_A_KEY": "1"})"})
+             R"({"NOT_A_KEY": "1"})", "", " \n\t\n", R"({"CH1_LABEL": "a",})"})
     {
         writeText(statePath, text);
         std::filesystem::remove(statePath + ".bad");
@@ -125,6 +125,22 @@ TEST_CASE("a state config.json that cannot be loaded is moved aside")
         CHECK_FALSE(std::filesystem::exists(statePath));
         CHECK(readText(statePath + ".bad") == text);
     }
+    // An older config.json.bad is kept; the new one has the time in its name.
+    writeText(statePath + ".bad", "older");
+    writeText(statePath, "{");
+    (void)loadStartupConfig(env, {}, statePath);
+    CHECK(readText(statePath + ".bad") == "older");
+    std::size_t stamped = 0;
+    for (auto const& entry : std::filesystem::directory_iterator(dir / "state"))
+    {
+        auto const name = entry.path().filename().string();
+        if (name.rfind("config.json.bad-", 0) == 0)
+        {
+            ++stamped;
+            CHECK(readText(entry.path()) == "{");
+        }
+    }
+    CHECK(stamped == 1);
     // A bad environment still exits 78 and leaves the state file where it is.
     writeText(statePath, R"({"CH1_LABEL": "kept"})");
     auto badEnv = env;
@@ -145,5 +161,18 @@ TEST_CASE("env overrides the state file; a key only in the state file stays")
     auto const loaded = loadStartupConfig(env, {}, statePath);
     CHECK(loaded.config.nmosTags.at("a").at(0) == "from-env");
     CHECK(loaded.config.nmosLabel == "from-state");
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("writeConfigFile writes durably and leaves no temp file")
+{
+    auto const dir = freshConfigDir("mxl-replay-config-write");
+    auto const path = (dir / "config.json").string();
+    std::string error;
+    REQUIRE(writeConfigFile(path, {{"CH1_LABEL", "a \"b\""}}, error));
+    CHECK(readConfigFile(path).at("CH1_LABEL") == "a \"b\"");
+    CHECK_FALSE(std::filesystem::exists(path + ".tmp"));
+    CHECK_FALSE(writeConfigFile((dir / "missing" / "config.json").string(), {}, error));
+    CHECK(error.find("cannot write") == 0);
     std::filesystem::remove_all(dir);
 }

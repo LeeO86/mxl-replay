@@ -8,10 +8,14 @@
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -457,6 +461,47 @@ std::string configFileJson(std::map<std::string, std::string> const& values)
     return out;
 }
 
+bool writeConfigFile(std::string const& path, std::map<std::string, std::string> const& values, std::string& error)
+{
+    // Written next to it, synced, and renamed over it, then the directory synced: a crash or a power
+    // cut leaves the old file or the new one, never an empty or half one.
+    auto const temp = path + ".tmp";
+    auto const text = configFileJson(values);
+    int const fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    bool ok = fd >= 0;
+    std::size_t done = 0;
+    while (ok && done < text.size())
+    {
+        auto const n = ::write(fd, text.data() + done, text.size() - done);
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        ok = n > 0;
+        done += ok ? static_cast<std::size_t>(n) : 0;
+    }
+    ok = ok && ::fsync(fd) == 0;
+    if (fd >= 0)
+    {
+        ok = ::close(fd) == 0 && ok;
+    }
+    ok = ok && ::rename(temp.c_str(), path.c_str()) == 0;
+    if (!ok)
+    {
+        error = "cannot write " + path + ": " + std::strerror(errno);
+        ::unlink(temp.c_str());
+        return false;
+    }
+    auto const dir = std::filesystem::path(path).parent_path().string();
+    int const dirFd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirFd >= 0)
+    {
+        ::fsync(dirFd);
+        ::close(dirFd);
+    }
+    return true;
+}
+
 LoadedConfig loadStartupConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file, std::string const& statePath)
 {
     std::map<std::string, std::string> state;
@@ -465,6 +510,14 @@ LoadedConfig loadStartupConfig(std::map<std::string, std::string> const& env, st
     {
         try
         {
+            // Replay never writes an empty file: an empty (or blank) one is a cut-off write.
+            std::ifstream in(statePath, std::ios::binary);
+            std::stringstream text;
+            text << in.rdbuf();
+            if (text.str().find_first_not_of(" \t\r\n") == std::string::npos)
+            {
+                throw ConfigError("the state file " + statePath + " is empty");
+            }
             state = readConfigFile(statePath);
             return loadConfig(env, file, state);
         }
@@ -475,7 +528,21 @@ LoadedConfig loadStartupConfig(std::map<std::string, std::string> const& env, st
         // Without the state file: if env and the config file load, the state file was the problem.
         // It is written by replay itself, so a broken one must not stop every start (exit 78 in a loop).
         auto loaded = loadConfig(env, file, {});
-        auto const aside = statePath + ".bad";
+        // An older config.json.bad is kept: the new one gets the time (UTC) in its name.
+        auto aside = statePath + ".bad";
+        if (std::filesystem::exists(aside))
+        {
+            char stamp[32];
+            auto const now = std::time(nullptr);
+            std::tm utc{};
+            gmtime_r(&now, &utc);
+            std::strftime(stamp, sizeof(stamp), "%Y%m%dT%H%M%SZ", &utc);
+            aside = statePath + ".bad-" + stamp;
+            for (int n = 2; std::filesystem::exists(aside); ++n)
+            {
+                aside = statePath + ".bad-" + stamp + "-" + std::to_string(n);
+            }
+        }
         std::error_code ec;
         std::filesystem::rename(statePath, aside, ec);
         logError("state_config_invalid", {{"path", statePath}, {"error", problem}, {"moved_to", ec ? std::string{} : aside},
