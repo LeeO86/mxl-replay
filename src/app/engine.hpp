@@ -255,6 +255,15 @@ private:
         bool scaled = false;
         CameraRuntime(std::string directory, std::uint64_t retentionNs, int segmentSeconds);
     };
+    // A stored picture the output decoded (1.8.3). An upload at a lower frame rate stores each source frame once
+    // per house frame (1.8.1): the same JPEG on the next grain is not decoded again. `key`: the GPU decoder's key
+    // for it; `v210`: the CPU decode (empty when the GPU decoded it).
+    struct DecodedPicture
+    {
+        std::vector<std::uint8_t> jpeg;
+        std::string key;
+        std::vector<std::uint8_t> v210;
+    };
     struct ChannelRuntime
     {
         Scheduler scheduler;
@@ -274,6 +283,8 @@ private:
         std::uint64_t audioNs = 0;
         Frame10 last;
         std::vector<std::uint8_t> lastV210;
+        // The stored picture the last grain decoded (this channel's playout thread only).
+        DecodedPicture decoded;
         std::string timecode; // of the last output grain (its ANC)
         std::uint64_t late = 0;
         // The flows of the next grains (SPECIFICATION.md §5.3) and the grains blended without one.
@@ -347,7 +358,7 @@ private:
     Frame10 frameAt(int camera, std::uint64_t taiNs, bool* found) const;
     // The stored frame nearest `taiNs` decoded straight into `v210` (house format). `found` says
     // whether a frame exists; false with found set means it is not in the house format.
-    bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found) const;
+    bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated) const;
     void finishClip(int channel);
     // What finishClip will do at OUT with the channel on `list` (lock held).
     [[nodiscard]] ClipEnd planClipEnd(ChannelRuntime const& runtime, Catalog::Playlist const& list) const;
