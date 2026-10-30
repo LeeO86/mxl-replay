@@ -61,6 +61,8 @@ MEDIAMTX_BIN=/path/to/mediamtx tests/integration/preview.sh ./build/mxl-replay
 
 Precedence is environment, then `REPLAY_CONFIG_FILE`, then the imported state file `REPLAY_STATE_DIR/config.json`, then the defaults. The config file is a JSON object of strings or `KEY=value` lines. Unknown file keys are an error (exit 78). Unknown environment variables are ignored. Invalid values exit 78 with the key name.
 
+Replay writes the state file itself (a settings save: *Play on red light*, the idle playlist, a config import) as a JSON object of strings. It holds every key that was set when it was written, including those from the environment and `REPLAY_CONFIG_FILE`. The environment still wins at the next start, but a key that is later removed from the environment keeps the value saved in the state file. A state file that cannot be read or loaded is renamed to `config.json.bad`, logged as `state_config_invalid`, and replay starts without it (environment, config file, defaults). An invalid environment or `REPLAY_CONFIG_FILE` still exits 78.
+
 There are no secret settings. Nothing in the configuration is a password, and configuration values are not written to the log. `GET /api/v1/config/export?include_secrets=true` returns the same document as the export without that query.
 
 Process state (the SQLite catalog, imported settings, and IS-05 routes) lives in `REPLAY_STATE_DIR` (default `/config`). Media bytes stay in `REPLAY_STORAGE_DIR`. A catalog left in the storage directory from an older build is copied into the state directory on the first start.

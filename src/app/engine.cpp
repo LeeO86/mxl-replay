@@ -1701,18 +1701,7 @@ bool Engine::saveSettings(std::string& error) const
         error = "cannot write " + path;
         return false;
     }
-    out << "{\n";
-    bool first = true;
-    for (auto const& [key, value] : settings_)
-    {
-        if (!first)
-        {
-            out << ",\n";
-        }
-        first = false;
-        out << "  \"" << jsonEscape(key) << "\": \"" << jsonEscape(value) << '"';
-    }
-    out << "\n}\n";
+    out << configFileJson(settings_);
     out.close();
     std::error_code ec;
     if (!out || (std::filesystem::rename(temp, path, ec), ec))

@@ -1,6 +1,8 @@
 #include "config/config.hpp"
 
 #include "nmos/ids.hpp"
+#include "util/json.hpp"
+#include "util/logging.hpp"
 #include "util/uuid.hpp"
 
 #include <ifaddrs.h>
@@ -10,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -248,103 +251,28 @@ std::uint64_t parseU64(std::string const& key, std::string const& text, std::uin
 std::map<std::string, std::vector<std::string>> parseNmosTags(std::string const& text)
 {
     std::map<std::string, std::vector<std::string>> tags;
-    if (text.empty() || text == "{}")
+    if (text.empty())
     {
         return tags;
     }
-    std::size_t i = 0;
-    auto skip = [&] {
-        while (i < text.size() && (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t'))
-        {
-            ++i;
-        }
-    };
-    auto parseString = [&]() -> std::string {
-        skip();
-        if (i >= text.size() || text[i] != '"')
-        {
-            throw ConfigError("NMOS_TAGS values must be JSON strings");
-        }
-        ++i;
-        std::string out;
-        while (i < text.size() && text[i] != '"')
-        {
-            if (text[i] == '\\' && i + 1 < text.size())
-            {
-                ++i;
-            }
-            out.push_back(text[i]);
-            ++i;
-        }
-        if (i >= text.size() || text[i] != '"')
-        {
-            throw ConfigError("NMOS_TAGS has an unterminated string");
-        }
-        ++i;
-        return out;
-    };
-    skip();
-    if (i >= text.size() || text[i] != '{')
+    Json doc;
+    if (!parseJson(text, doc) || doc.kind != Json::Kind::Object)
     {
         throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
     }
-    ++i;
-    while (true)
+    for (auto const& [key, member] : doc.members)
     {
-        skip();
-        if (i < text.size() && text[i] == '}')
-        {
-            break;
-        }
-        auto const key = parseString();
-        skip();
-        if (i >= text.size() || text[i] != ':')
-        {
-            throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
-        }
-        ++i;
-        skip();
-        if (i >= text.size() || text[i] != '[')
+        if (member.kind != Json::Kind::Array ||
+            !std::all_of(member.items.begin(), member.items.end(), [](Json const& item) { return item.kind == Json::Kind::String; }))
         {
             throw ConfigError("NMOS_TAGS values must be arrays of strings");
         }
-        ++i;
-        std::vector<std::string> values;
-        while (true)
+        auto& values = tags[key];
+        values.clear();
+        for (auto const& item : member.items)
         {
-            skip();
-            if (i < text.size() && text[i] == ']')
-            {
-                ++i;
-                break;
-            }
-            values.push_back(parseString());
-            skip();
-            if (i < text.size() && text[i] == ',')
-            {
-                ++i;
-                continue;
-            }
-            if (i < text.size() && text[i] == ']')
-            {
-                ++i;
-                break;
-            }
-            throw ConfigError("NMOS_TAGS values must be arrays of strings");
+            values.push_back(item.text);
         }
-        tags[key] = std::move(values);
-        skip();
-        if (i < text.size() && text[i] == ',')
-        {
-            ++i;
-            continue;
-        }
-        skip();
-        if (i < text.size() && text[i] == '}')
-        {
-            break;
-        }
-        throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
     }
     return tags;
 }
@@ -470,58 +398,23 @@ std::map<std::string, std::string> readConfigFile(std::string const& path)
     buffer << in.rdbuf();
     auto const text = buffer.str();
     std::map<std::string, std::string> values;
-    if (!text.empty() && text.find_first_not_of(" \t\r\n") != std::string::npos && text[text.find_first_not_of(" \t\r\n")] == '{')
+    auto const first = text.find_first_not_of(" \t\r\n");
+    if (first != std::string::npos && text[first] == '{')
     {
-        std::string body = text;
-        auto const start = body.find('{');
-        auto const end = body.rfind('}');
-        if (start == std::string::npos || end == std::string::npos || end <= start)
+        // A JSON object of strings, read by the JSON parser (1.8.2): escapes such as \" and \u00e9 are
+        // decoded, so a value may hold JSON itself (NMOS_TAGS).
+        Json doc;
+        if (!parseJson(text, doc) || doc.kind != Json::Kind::Object)
         {
-            throw ConfigError("config file is not a JSON object");
+            throw ConfigError("config file " + path + " is not a valid JSON object");
         }
-        body = body.substr(start + 1, end - start - 1);
-        std::size_t i = 0;
-        while (i < body.size())
+        for (auto const& [key, member] : doc.members)
         {
-            while (i < body.size() && (body[i] == ' ' || body[i] == '\n' || body[i] == '\r' || body[i] == '\t' || body[i] == ','))
+            if (member.kind != Json::Kind::String)
             {
-                ++i;
+                throw ConfigError("config file " + path + ": the value of " + key + " is not a string");
             }
-            if (i >= body.size())
-            {
-                break;
-            }
-            if (body[i] != '"')
-            {
-                throw ConfigError("config file has a non-string key");
-            }
-            auto const keyEnd = body.find('"', i + 1);
-            if (keyEnd == std::string::npos)
-            {
-                throw ConfigError("config file has an unterminated key");
-            }
-            auto key = body.substr(i + 1, keyEnd - i - 1);
-            i = body.find(':', keyEnd);
-            if (i == std::string::npos)
-            {
-                throw ConfigError("config file is missing a colon");
-            }
-            ++i;
-            while (i < body.size() && body[i] == ' ')
-            {
-                ++i;
-            }
-            if (i >= body.size() || body[i] != '"')
-            {
-                throw ConfigError("config values must be strings");
-            }
-            auto const valueEnd = body.find('"', i + 1);
-            if (valueEnd == std::string::npos)
-            {
-                throw ConfigError("config file has an unterminated value");
-            }
-            values[key] = body.substr(i + 1, valueEnd - i - 1);
-            i = valueEnd + 1;
+            values[key] = member.text;
         }
         return values;
     }
@@ -545,6 +438,51 @@ std::map<std::string, std::string> readConfigFile(std::string const& path)
         values[line.substr(0, eq)] = line.substr(eq + 1);
     }
     return values;
+}
+
+std::string configFileJson(std::map<std::string, std::string> const& values)
+{
+    std::string out = "{\n";
+    bool first = true;
+    for (auto const& [key, value] : values)
+    {
+        if (!first)
+        {
+            out += ",\n";
+        }
+        first = false;
+        out += "  \"" + jsonEscape(key) + "\": \"" + jsonEscape(value) + '"';
+    }
+    out += "\n}\n";
+    return out;
+}
+
+LoadedConfig loadStartupConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file, std::string const& statePath)
+{
+    std::map<std::string, std::string> state;
+    std::string problem;
+    if (std::filesystem::is_regular_file(statePath))
+    {
+        try
+        {
+            state = readConfigFile(statePath);
+            return loadConfig(env, file, state);
+        }
+        catch (ConfigError const& ex)
+        {
+            problem = ex.what();
+        }
+        // Without the state file: if env and the config file load, the state file was the problem.
+        // It is written by replay itself, so a broken one must not stop every start (exit 78 in a loop).
+        auto loaded = loadConfig(env, file, {});
+        auto const aside = statePath + ".bad";
+        std::error_code ec;
+        std::filesystem::rename(statePath, aside, ec);
+        logError("state_config_invalid", {{"path", statePath}, {"error", problem}, {"moved_to", ec ? std::string{} : aside},
+                                             {"rename_error", ec ? ec.message() : std::string{}}});
+        return loaded;
+    }
+    return loadConfig(env, file, state);
 }
 
 LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file,

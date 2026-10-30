@@ -164,6 +164,13 @@ struct LoadedConfig
 [[nodiscard]] LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file,
     std::map<std::string, std::string> const& state = {});
 [[nodiscard]] std::map<std::string, std::string> readConfigFile(std::string const& path);
+// The state directory's config.json as replay writes it: a JSON object of strings, read back by readConfigFile.
+[[nodiscard]] std::string configFileJson(std::map<std::string, std::string> const& values);
+// loadConfig with the state file at `statePath` (when it exists). A state file that cannot be read or
+// loaded while env and `file` load is logged (`state_config_invalid`), renamed to `<path>.bad`, and
+// left out: replay starts with env, the config file and the defaults.
+[[nodiscard]] LoadedConfig loadStartupConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file,
+    std::string const& statePath);
 [[nodiscard]] std::string stateDirectory(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file);
 [[nodiscard]] std::string exportKeyValue(Config const& config);
 [[nodiscard]] std::string hostnameString();

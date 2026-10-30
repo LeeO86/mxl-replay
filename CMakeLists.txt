@@ -82,6 +82,7 @@ if(REPLAY_BUILD_TESTS)
         tests/unit/test_transitions.cpp
         tests/unit/test_interlaced.cpp
         tests/unit/test_upload_rate.cpp
+        tests/unit/test_config_file.cpp
     )
     target_link_libraries(unit-tests PRIVATE replay-core)
     target_compile_options(unit-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)

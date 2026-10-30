@@ -6,4 +6,4 @@
 - nmos-cpp pin is `fe303849527394b03bdedc8f161f377fe458bb62`.
 - Unit tests do not need libmxl. `tests/integration/replay.sh` runs the CPU binary.
 - Do not write into a mirror domain (`x-mxl-fabrics-agent.mirror`).
-- Config precedence is environment > `REPLAY_CONFIG_FILE` > `REPLAY_STATE_DIR/config.json` > defaults. Invalid config exits 78. Storage, the state directory, or a port that cannot be bound exits 75. SIGTERM exits 143.
+- Config precedence is environment > `REPLAY_CONFIG_FILE` > `REPLAY_STATE_DIR/config.json` > defaults. Invalid config exits 78; an invalid `REPLAY_STATE_DIR/config.json` is moved to `config.json.bad` instead. Storage, the state directory, or a port that cannot be bound exits 75. SIGTERM exits 143.
