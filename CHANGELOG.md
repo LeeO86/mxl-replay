@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.8.4 (unreleased)
+
+- Fix: histograms (`playout_seconds`, `frame_gpu_seconds`, …) had no `le="+Inf"` bucket, so Prometheus' `histogram_quantile` returned NaN. Every histogram now ends with it (equal to `_count`).
+
 ## 1.8.3 (2026-10-30)
 
 - Fix: a channel resynced (`output_resync`, `jumped_grains` 3) at almost every playlist transition, e.g. every clip change of an idle playlist. At a transition the output thread read the incoming clip's first frames from the disk itself (`Engine::render`, the frame read after `maybeStartTransition` and `finishClip` moved the channel to the next entry's IN). Those frames are usually not in the page cache: the clip is old, the recorder's writing churns the cache, and the disk's readahead starts again at a new place. So the first grains of every new item waited for the disk, and the channel fell more than two grains behind. Now a loader thread reads them ahead (`ReadAhead`, `FrameRing::prefetch`). It reads 1 s of frames ahead of each channel's position (more above 100 %; behind it in reverse) and, once OUT is 2 s away (plus the playlist's longest transition: a mix starts before OUT), the first second of the clip the channel plays after OUT: the next playlist entry (auto-advance or cued), the idle playlist's next or first entry, or the clip's own IN on *loop*. A cued shot has its first second read at the cue, so a play (also a red-light play) finds it in the page cache. The output thread no longer opens segment files for these reads either. Live and black channels read nothing ahead.
