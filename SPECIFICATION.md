@@ -203,8 +203,9 @@ of sequences beyond playlists, compressed outputs, HDR.
   live input "E2E").
 - A grain that shows the same stored picture as the previous grain (a repeated source frame
   of an upload at a lower frame rate, a paused or cued channel) does not decode it again
-  (1.8.3), counted in `playout_repeated_pictures_total{channel}`. Each grain's render and
-  write time is the histogram `playout_seconds{channel,stage}` (`render`, `publish`).
+  (1.8.3), counted in `playout_repeated_pictures_total{channel}`. The GPU path decodes stored
+  JPEGs with the Huffman decoding on the GPU (1.8.3). Each grain's render and write time is
+  the histogram `playout_seconds{channel,stage}` (`render`, `publish`).
 
 ### 5.2 Live slow-motion control
 
