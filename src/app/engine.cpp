@@ -1444,9 +1444,15 @@ void Engine::readAhead(int channel)
         post(camera, from, runtime.readAheadFrom);
         runtime.readAheadFrom = from;
     }
-    // The first frames of the clip after OUT (the next entry, the idle playlist's, a loop's IN), once OUT is near.
-    if (runtime.clipId.empty() || !runtime.hasOut || !runtime.scheduler.playing || speed < kMinClipSpeed || position >= runtime.outNs ||
-        static_cast<double>(runtime.outNs - position) / speed > static_cast<double>(kReadAheadLeadNs))
+    // The first frames of the clip after OUT (the next entry, the idle playlist's, a loop's IN), once OUT is near:
+    // kReadAheadLeadNs before the playlist's longest transition starts.
+    if (runtime.clipId.empty() || !runtime.hasOut || !runtime.scheduler.playing || speed < kMinClipSpeed || position >= runtime.outNs)
+    {
+        return;
+    }
+    auto const transition = runtime.playlistId.empty() ? 0 : currentPlaylist(channel).id.empty() ? 0 : runtime.planMaxTransition;
+    auto const lead = static_cast<double>(kReadAheadLeadNs) + static_cast<double>(transition) * static_cast<double>(runtime.scheduler.framePeriodNs);
+    if (static_cast<double>(runtime.outNs - position) / speed > lead)
     {
         return;
     }

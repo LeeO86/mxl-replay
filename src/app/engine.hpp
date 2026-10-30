@@ -228,7 +228,7 @@ public:
 
     // How far ahead the stored frames a channel plays are read (SPECIFICATION.md §5.3): kReadAheadNs of frames
     // ahead of its position (times the speed above 1), and the first kReadAheadNs of the clip it plays after OUT
-    // once OUT is kReadAheadLeadNs away.
+    // once OUT is kReadAheadLeadNs (plus the playlist's longest transition) away.
     static constexpr std::uint64_t kReadAheadNs = 1'000'000'000;
     static constexpr std::uint64_t kReadAheadLeadNs = 2'000'000'000;
     // Called on the loader thread after each read-ahead with the request and the bytes read (tests).
