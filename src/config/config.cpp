@@ -1,15 +1,22 @@
 #include "config/config.hpp"
 
 #include "nmos/ids.hpp"
+#include "util/json.hpp"
+#include "util/logging.hpp"
 #include "util/uuid.hpp"
 
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -248,103 +255,28 @@ std::uint64_t parseU64(std::string const& key, std::string const& text, std::uin
 std::map<std::string, std::vector<std::string>> parseNmosTags(std::string const& text)
 {
     std::map<std::string, std::vector<std::string>> tags;
-    if (text.empty() || text == "{}")
+    if (text.empty())
     {
         return tags;
     }
-    std::size_t i = 0;
-    auto skip = [&] {
-        while (i < text.size() && (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t'))
-        {
-            ++i;
-        }
-    };
-    auto parseString = [&]() -> std::string {
-        skip();
-        if (i >= text.size() || text[i] != '"')
-        {
-            throw ConfigError("NMOS_TAGS values must be JSON strings");
-        }
-        ++i;
-        std::string out;
-        while (i < text.size() && text[i] != '"')
-        {
-            if (text[i] == '\\' && i + 1 < text.size())
-            {
-                ++i;
-            }
-            out.push_back(text[i]);
-            ++i;
-        }
-        if (i >= text.size() || text[i] != '"')
-        {
-            throw ConfigError("NMOS_TAGS has an unterminated string");
-        }
-        ++i;
-        return out;
-    };
-    skip();
-    if (i >= text.size() || text[i] != '{')
+    Json doc;
+    if (!parseJson(text, doc) || doc.kind != Json::Kind::Object)
     {
         throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
     }
-    ++i;
-    while (true)
+    for (auto const& [key, member] : doc.members)
     {
-        skip();
-        if (i < text.size() && text[i] == '}')
-        {
-            break;
-        }
-        auto const key = parseString();
-        skip();
-        if (i >= text.size() || text[i] != ':')
-        {
-            throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
-        }
-        ++i;
-        skip();
-        if (i >= text.size() || text[i] != '[')
+        if (member.kind != Json::Kind::Array ||
+            !std::all_of(member.items.begin(), member.items.end(), [](Json const& item) { return item.kind == Json::Kind::String; }))
         {
             throw ConfigError("NMOS_TAGS values must be arrays of strings");
         }
-        ++i;
-        std::vector<std::string> values;
-        while (true)
+        auto& values = tags[key];
+        values.clear();
+        for (auto const& item : member.items)
         {
-            skip();
-            if (i < text.size() && text[i] == ']')
-            {
-                ++i;
-                break;
-            }
-            values.push_back(parseString());
-            skip();
-            if (i < text.size() && text[i] == ',')
-            {
-                ++i;
-                continue;
-            }
-            if (i < text.size() && text[i] == ']')
-            {
-                ++i;
-                break;
-            }
-            throw ConfigError("NMOS_TAGS values must be arrays of strings");
+            values.push_back(item.text);
         }
-        tags[key] = std::move(values);
-        skip();
-        if (i < text.size() && text[i] == ',')
-        {
-            ++i;
-            continue;
-        }
-        skip();
-        if (i < text.size() && text[i] == '}')
-        {
-            break;
-        }
-        throw ConfigError("NMOS_TAGS must be a JSON object of string arrays");
     }
     return tags;
 }
@@ -470,58 +402,23 @@ std::map<std::string, std::string> readConfigFile(std::string const& path)
     buffer << in.rdbuf();
     auto const text = buffer.str();
     std::map<std::string, std::string> values;
-    if (!text.empty() && text.find_first_not_of(" \t\r\n") != std::string::npos && text[text.find_first_not_of(" \t\r\n")] == '{')
+    auto const first = text.find_first_not_of(" \t\r\n");
+    if (first != std::string::npos && text[first] == '{')
     {
-        std::string body = text;
-        auto const start = body.find('{');
-        auto const end = body.rfind('}');
-        if (start == std::string::npos || end == std::string::npos || end <= start)
+        // A JSON object of strings, read by the JSON parser (1.8.2): escapes such as \" and \u00e9 are
+        // decoded, so a value may hold JSON itself (NMOS_TAGS).
+        Json doc;
+        if (!parseJson(text, doc) || doc.kind != Json::Kind::Object)
         {
-            throw ConfigError("config file is not a JSON object");
+            throw ConfigError("config file " + path + " is not a valid JSON object");
         }
-        body = body.substr(start + 1, end - start - 1);
-        std::size_t i = 0;
-        while (i < body.size())
+        for (auto const& [key, member] : doc.members)
         {
-            while (i < body.size() && (body[i] == ' ' || body[i] == '\n' || body[i] == '\r' || body[i] == '\t' || body[i] == ','))
+            if (member.kind != Json::Kind::String)
             {
-                ++i;
+                throw ConfigError("config file " + path + ": the value of " + key + " is not a string");
             }
-            if (i >= body.size())
-            {
-                break;
-            }
-            if (body[i] != '"')
-            {
-                throw ConfigError("config file has a non-string key");
-            }
-            auto const keyEnd = body.find('"', i + 1);
-            if (keyEnd == std::string::npos)
-            {
-                throw ConfigError("config file has an unterminated key");
-            }
-            auto key = body.substr(i + 1, keyEnd - i - 1);
-            i = body.find(':', keyEnd);
-            if (i == std::string::npos)
-            {
-                throw ConfigError("config file is missing a colon");
-            }
-            ++i;
-            while (i < body.size() && body[i] == ' ')
-            {
-                ++i;
-            }
-            if (i >= body.size() || body[i] != '"')
-            {
-                throw ConfigError("config values must be strings");
-            }
-            auto const valueEnd = body.find('"', i + 1);
-            if (valueEnd == std::string::npos)
-            {
-                throw ConfigError("config file has an unterminated value");
-            }
-            values[key] = body.substr(i + 1, valueEnd - i - 1);
-            i = valueEnd + 1;
+            values[key] = member.text;
         }
         return values;
     }
@@ -547,6 +444,128 @@ std::map<std::string, std::string> readConfigFile(std::string const& path)
     return values;
 }
 
+std::string configFileJson(std::map<std::string, std::string> const& values)
+{
+    std::string out = "{\n";
+    bool first = true;
+    for (auto const& [key, value] : values)
+    {
+        if (!first)
+        {
+            out += ",\n";
+        }
+        first = false;
+        out += "  \"" + jsonEscape(key) + "\": \"" + jsonEscape(value) + '"';
+    }
+    out += "\n}\n";
+    return out;
+}
+
+bool writeConfigFile(std::string const& path, std::map<std::string, std::string> const& values, std::string& error)
+{
+    // Written next to it, synced, and renamed over it, then the directory synced: a crash or a power
+    // cut leaves the old file or the new one, never an empty or half one.
+    auto const temp = path + ".tmp";
+    auto const text = configFileJson(values);
+    int const fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    bool ok = fd >= 0;
+    std::size_t done = 0;
+    while (ok && done < text.size())
+    {
+        auto const n = ::write(fd, text.data() + done, text.size() - done);
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        ok = n > 0;
+        done += ok ? static_cast<std::size_t>(n) : 0;
+    }
+    ok = ok && ::fsync(fd) == 0;
+    if (fd >= 0)
+    {
+        ok = ::close(fd) == 0 && ok;
+    }
+    ok = ok && ::rename(temp.c_str(), path.c_str()) == 0;
+    if (!ok)
+    {
+        error = "cannot write " + path + ": " + std::strerror(errno);
+        ::unlink(temp.c_str());
+        return false;
+    }
+    auto const dir = std::filesystem::path(path).parent_path().string();
+    int const dirFd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirFd >= 0)
+    {
+        ::fsync(dirFd);
+        ::close(dirFd);
+    }
+    return true;
+}
+
+LoadedConfig loadStartupConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file, std::string const& statePath)
+{
+    std::map<std::string, std::string> state;
+    std::string problem;
+    if (std::filesystem::is_regular_file(statePath))
+    {
+        try
+        {
+            // Replay never writes an empty file: an empty (or blank) one is a cut-off write.
+            std::ifstream in(statePath, std::ios::binary);
+            std::stringstream text;
+            text << in.rdbuf();
+            if (text.str().find_first_not_of(" \t\r\n") == std::string::npos)
+            {
+                throw ConfigError("the state file " + statePath + " is empty");
+            }
+            state = readConfigFile(statePath);
+            auto loaded = loadConfig(env, file, state);
+            if (!loaded.droppedStateKeys.empty())
+            {
+                // A 1.8.1 state file holds every key that was set, the environment's too: those are the
+                // platform's, so they leave the file (a key later removed from env falls back to its default).
+                std::string keys;
+                for (auto const& key : loaded.droppedStateKeys)
+                {
+                    keys += (keys.empty() ? "" : ",") + key;
+                }
+                std::string error;
+                bool const written = writeConfigFile(statePath, loaded.state, error);
+                logInfo("state_config_platform_keys_dropped", {{"path", statePath}, {"keys", keys}, {"rewritten", written ? "true" : "false"}, {"error", error}});
+            }
+            return loaded;
+        }
+        catch (ConfigError const& ex)
+        {
+            problem = ex.what();
+        }
+        // Without the state file: if env and the config file load, the state file was the problem.
+        // It is written by replay itself, so a broken one must not stop every start (exit 78 in a loop).
+        auto loaded = loadConfig(env, file, {});
+        // An older config.json.bad is kept: the new one gets the time (UTC) in its name.
+        auto aside = statePath + ".bad";
+        if (std::filesystem::exists(aside))
+        {
+            char stamp[32];
+            auto const now = std::time(nullptr);
+            std::tm utc{};
+            gmtime_r(&now, &utc);
+            std::strftime(stamp, sizeof(stamp), "%Y%m%dT%H%M%SZ", &utc);
+            aside = statePath + ".bad-" + stamp;
+            for (int n = 2; std::filesystem::exists(aside); ++n)
+            {
+                aside = statePath + ".bad-" + stamp + "-" + std::to_string(n);
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(statePath, aside, ec);
+        logError("state_config_invalid", {{"path", statePath}, {"error", problem}, {"moved_to", ec ? std::string{} : aside},
+                                             {"rename_error", ec ? ec.message() : std::string{}}});
+        return loaded;
+    }
+    return loadConfig(env, file, state);
+}
+
 LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file,
     std::map<std::string, std::string> const& state)
 {
@@ -568,6 +587,9 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
     {
         values[key] = value;
     }
+    auto const platformKey = [&](std::string const& key) {
+        return file.count(key) != 0 || (env.count(key) != 0 && (std::find(known.begin(), known.end(), key) != known.end() || knownIndexed(key)));
+    };
     for (auto const& [key, value] : env)
     {
         if (std::find(known.begin(), known.end(), key) != known.end() || knownIndexed(key))
@@ -576,6 +598,18 @@ LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<
         }
     }
     LoadedConfig loaded;
+    // The state file holds what the UI set (1.8.2); a key the platform sets (env, config file) is its.
+    for (auto const& [key, value] : state)
+    {
+        if (platformKey(key))
+        {
+            loaded.droppedStateKeys.push_back(key);
+        }
+        else
+        {
+            loaded.state[key] = value;
+        }
+    }
     Config& cfg = loaded.config;
     cfg.hostId = take(values, "HOST_ID", hostnameString());
     try

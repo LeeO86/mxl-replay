@@ -1,0 +1,203 @@
+// The state directory's config.json (1.8.2): written and read back with the JSON parser, and a state
+// file that cannot be read is moved aside instead of stopping every start.
+#include "app/engine.hpp"
+#include "config/config.hpp"
+
+#include <doctest/doctest.h>
+
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+using namespace replay;
+
+namespace
+{
+std::filesystem::path freshConfigDir(char const* name)
+{
+    auto const dir = std::filesystem::temp_directory_path() / name;
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+void writeText(std::filesystem::path const& path, std::string const& text)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << text;
+}
+
+std::string readText(std::filesystem::path const& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    return buffer.str();
+}
+
+std::map<std::string, std::string> baseEnv(std::filesystem::path const& dir)
+{
+    return {{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+        {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()}, {"REPLAY_STORAGE_MIN_MBPS", "0"},
+        {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}};
+}
+
+std::string const kTags = R"({"urn:x-example:function":["replay"],"urn:x-example:area":["studio \"1\""]})";
+} // namespace
+
+TEST_CASE("config.json round trip keeps quotes, backslashes, unicode and JSON in a string")
+{
+    auto const dir = freshConfigDir("mxl-replay-config-roundtrip");
+    std::map<std::string, std::string> const values{
+        {"NMOS_TAGS", kTags},
+        {"CH1_LABEL", "say \"hi\""},
+        {"CAM1_LABEL", R"(C:\cams\one \" two)"},
+        {"CH2_LABEL", "Zürich – 東京 🎥"},
+        {"NMOS_LABEL", "tab\there\nnew line, comma: colon {brace} [bracket]"},
+        {"TSL_MAP", ""},
+    };
+    auto const path = dir / "config.json";
+    writeText(path, configFileJson(values));
+    CHECK(readConfigFile(path.string()) == values);
+
+    // Escapes another writer may use: \u, a surrogate pair, \/ .
+    writeText(path, R"({"CH1_LABEL": "\u00e9\ud83c\udfa5\/x", "CH2_LABEL":"a\\b"})");
+    auto const other = readConfigFile(path.string());
+    CHECK(other.at("CH1_LABEL") == "é🎥/x");
+    CHECK(other.at("CH2_LABEL") == "a\\b");
+
+    // Not a JSON object of strings.
+    for (auto const* bad : {R"({"CH1_LABEL": "unterminated)", R"({"CH1_LABEL": 5})", R"({"CH1_LABEL": "a"} trailing)", R"({CH1_LABEL: "a"})"})
+    {
+        writeText(path, bad);
+        CHECK_THROWS_AS((void)readConfigFile(path.string()), ConfigError);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("NMOS_TAGS is read by the JSON parser, escapes included")
+{
+    auto const loaded = loadConfig({{"NMOS_TAGS", R"({"urn:x-example:area":["studio \"1\"","caf\u00e9"]})"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {});
+    CHECK(loaded.config.nmosTags.at("urn:x-example:area") == std::vector<std::string>{"studio \"1\"", "café"});
+    CHECK(loadConfig({{"NMOS_TAGS", "{}"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}).config.nmosTags.empty());
+    CHECK_THROWS_AS((void)loadConfig({{"NMOS_TAGS", R"({"a":"b"})"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
+    CHECK_THROWS_AS((void)loadConfig({{"NMOS_TAGS", R"({"a":[1]})"}, {"NMOS_HOST_ADDRESS", "10.0.0.1"}}, {}), ConfigError);
+}
+
+TEST_CASE("a settings save with NMOS_TAGS in env starts again")
+{
+    // The failure of 1.8.1: the state file held NMOS_TAGS as JSON in a string, and the next start exited 78.
+    auto const dir = freshConfigDir("mxl-replay-config-save");
+    auto env = baseEnv(dir);
+    env["NMOS_TAGS"] = kTags;
+    auto const statePath = (dir / "state" / "config.json").string();
+    {
+        auto const loaded = loadStartupConfig(env, {}, statePath);
+        Engine engine(loaded.config, loaded.flat, loaded.state);
+        engine.openBuffer();
+        std::string error;
+        REQUIRE(engine.setPlayOnTally(1, false, error));
+    }
+    // Only what the UI set is saved (1.8.2), not the environment's NMOS_TAGS.
+    CHECK(readConfigFile(statePath) == std::map<std::string, std::string>{{"CH1_PLAY_ON_TALLY", "false"}});
+    auto const again = loadStartupConfig(env, {}, statePath);
+    CHECK(again.config.nmosTags.at("urn:x-example:area").at(0) == "studio \"1\"");
+    CHECK_FALSE(again.config.channelList[0].playOnTally);
+    CHECK(std::filesystem::exists(statePath));
+    CHECK_FALSE(std::filesystem::exists(statePath + ".bad"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a state config.json that cannot be loaded is moved aside")
+{
+    auto const dir = freshConfigDir("mxl-replay-config-bad");
+    std::filesystem::create_directories(dir / "state");
+    auto const statePath = (dir / "state" / "config.json").string();
+    auto const env = baseEnv(dir);
+    // The file 1.8.1 could not read back, an invalid value and an unknown key.
+    for (auto const* text : {R"({"NMOS_TAGS": "{\"urn:x-example:function\":[\"replay\"]}", "CH1_PLAY_ON_TALLY": "false" )", R"({"REPLAY_JPEG_QUALITY": "999"})",
+             R"({"NOT_A_KEY": "1"})", "", " \n\t\n", R"({"CH1_LABEL": "a",})"})
+    {
+        writeText(statePath, text);
+        std::filesystem::remove(statePath + ".bad");
+        auto const loaded = loadStartupConfig(env, {}, statePath);
+        CHECK(loaded.config.inputs == 1);
+        CHECK(loaded.config.jpegQuality == 92);
+        CHECK_FALSE(std::filesystem::exists(statePath));
+        CHECK(readText(statePath + ".bad") == text);
+    }
+    // An older config.json.bad is kept; the new one has the time in its name.
+    writeText(statePath + ".bad", "older");
+    writeText(statePath, "{");
+    (void)loadStartupConfig(env, {}, statePath);
+    CHECK(readText(statePath + ".bad") == "older");
+    std::size_t stamped = 0;
+    for (auto const& entry : std::filesystem::directory_iterator(dir / "state"))
+    {
+        auto const name = entry.path().filename().string();
+        if (name.rfind("config.json.bad-", 0) == 0)
+        {
+            ++stamped;
+            CHECK(readText(entry.path()) == "{");
+        }
+    }
+    CHECK(stamped == 1);
+    // A bad environment still exits 78 and leaves the state file where it is.
+    writeText(statePath, R"({"CH1_LABEL": "kept"})");
+    auto badEnv = env;
+    badEnv["REPLAY_INPUTS"] = "99";
+    CHECK_THROWS_AS((void)loadStartupConfig(badEnv, {}, statePath), ConfigError);
+    CHECK(std::filesystem::exists(statePath));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("the state file keeps only the UI's keys: platform keys leave it, env wins, a removed env key falls back")
+{
+    auto const dir = freshConfigDir("mxl-replay-config-precedence");
+    std::filesystem::create_directories(dir / "state");
+    auto const statePath = (dir / "state" / "config.json").string();
+    // As 1.8.1 saved it: the UI's keys and a snapshot of the environment's.
+    writeText(statePath, configFileJson({{"NMOS_TAGS", R"({"a":["from-state"]})"}, {"REPLAY_JPEG_QUALITY", "80"}, {"CH1_LABEL", "from-ui"},
+                             {"CH1_PLAY_ON_TALLY", "false"}}));
+    auto env = baseEnv(dir);
+    env["NMOS_TAGS"] = R"({"a":["from-env"]})";
+    env["REPLAY_JPEG_QUALITY"] = "80";
+    auto const loaded = loadStartupConfig(env, {{"NMOS_LABEL", "from-file"}}, statePath);
+    CHECK(loaded.config.nmosTags.at("a").at(0) == "from-env");
+    CHECK(loaded.config.jpegQuality == 80);
+    CHECK(loaded.config.nmosLabel == "from-file");
+    CHECK(loaded.config.channelList[0].label == "from-ui");
+    CHECK(loaded.droppedStateKeys == std::vector<std::string>{"NMOS_TAGS", "REPLAY_JPEG_QUALITY"});
+    std::map<std::string, std::string> const ui{{"CH1_LABEL", "from-ui"}, {"CH1_PLAY_ON_TALLY", "false"}};
+    CHECK(loaded.state == ui);
+    // Rewritten at once without the platform's keys.
+    CHECK(readConfigFile(statePath) == ui);
+    // The platform drops REPLAY_JPEG_QUALITY: the default again, not the old snapshot.
+    env.erase("REPLAY_JPEG_QUALITY");
+    auto const later = loadStartupConfig(env, {}, statePath);
+    CHECK(later.config.jpegQuality == 92);
+    CHECK(later.droppedStateKeys.empty());
+    // A save keeps the UI's keys and adds none of the platform's; the export still has them all.
+    {
+        Engine engine(later.config, later.flat, later.state);
+        engine.openBuffer();
+        std::string error;
+        REQUIRE(engine.setPlayOnTally(1, true, error));
+        CHECK(engine.exportConfigJson().find("NMOS_TAGS") != std::string::npos);
+    }
+    CHECK(readConfigFile(statePath) == std::map<std::string, std::string>{{"CH1_LABEL", "from-ui"}, {"CH1_PLAY_ON_TALLY", "true"}});
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("writeConfigFile writes durably and leaves no temp file")
+{
+    auto const dir = freshConfigDir("mxl-replay-config-write");
+    auto const path = (dir / "config.json").string();
+    std::string error;
+    REQUIRE(writeConfigFile(path, {{"CH1_LABEL", "a \"b\""}}, error));
+    CHECK(readConfigFile(path).at("CH1_LABEL") == "a \"b\"");
+    CHECK_FALSE(std::filesystem::exists(path + ".tmp"));
+    CHECK_FALSE(writeConfigFile((dir / "missing" / "config.json").string(), {}, error));
+    CHECK(error.find("cannot write") == 0);
+    std::filesystem::remove_all(dir);
+}

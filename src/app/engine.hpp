@@ -77,7 +77,9 @@ class Engine
 {
 public:
     // Checks the storage and opens the catalog. The buffer is opened by openBuffer().
-    explicit Engine(Config config, std::map<std::string, std::string> settings = {});
+    // `settings`: every key that is set (the export, the import's base); `state`: the keys the UI owns,
+    // which saveSettings writes to the state directory's config.json (1.8.2: not the platform's keys).
+    explicit Engine(Config config, std::map<std::string, std::string> settings = {}, std::map<std::string, std::string> state = {});
     ~Engine();
 
     // Indexes the retained segments (minutes for hours of buffer) and protects the
@@ -371,7 +373,9 @@ private:
     [[nodiscard]] std::string routesPath() const;
 
     Config config_;
+    // The keys the UI set (saved), and every key that is set (exported).
     std::map<std::string, std::string> settings_;
+    std::map<std::string, std::string> effective_;
     NmosIds ids_;
     Metrics metrics_;
     Catalog catalog_;

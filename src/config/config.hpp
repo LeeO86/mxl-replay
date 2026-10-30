@@ -159,13 +159,28 @@ struct Config
 struct LoadedConfig
 {
     Config config;
+    // Every key that is set: environment, config file and state file (the effective settings).
     std::map<std::string, std::string> flat;
+    // The state file's keys that the UI owns: those that the environment or the config file do not set.
+    // Only these are saved again (1.8.2).
+    std::map<std::string, std::string> state;
+    // State file keys left out because the environment or the config file sets them.
+    std::vector<std::string> droppedStateKeys;
 };
 
 [[nodiscard]] std::vector<std::string> configKeys();
 [[nodiscard]] LoadedConfig loadConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file,
     std::map<std::string, std::string> const& state = {});
 [[nodiscard]] std::map<std::string, std::string> readConfigFile(std::string const& path);
+// The state directory's config.json as replay writes it: a JSON object of strings, read back by readConfigFile.
+[[nodiscard]] std::string configFileJson(std::map<std::string, std::string> const& values);
+// Writes configFileJson(values) to `path` durably (temp file, fsync, rename, fsync of the directory).
+bool writeConfigFile(std::string const& path, std::map<std::string, std::string> const& values, std::string& error);
+// loadConfig with the state file at `statePath` (when it exists). A state file that cannot be read or
+// loaded while env and `file` load is logged (`state_config_invalid`), renamed to `<path>.bad`, and
+// left out: replay starts with env, the config file and the defaults.
+[[nodiscard]] LoadedConfig loadStartupConfig(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file,
+    std::string const& statePath);
 [[nodiscard]] std::string stateDirectory(std::map<std::string, std::string> const& env, std::map<std::string, std::string> const& file);
 [[nodiscard]] std::string exportKeyValue(Config const& config);
 [[nodiscard]] std::string hostnameString();
