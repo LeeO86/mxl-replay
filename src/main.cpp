@@ -98,14 +98,8 @@ int main(int argc, char** argv)
         {
             file = replay::readConfigFile(configPath);
         }
-        std::map<std::string, std::string> state;
         auto const stateDir = replay::stateDirectory(env, file);
-        auto const statePath = stateDir + "/config.json";
-        if (std::filesystem::is_regular_file(statePath))
-        {
-            state = replay::readConfigFile(statePath);
-        }
-        auto loaded = replay::loadConfig(env, file, state);
+        auto loaded = replay::loadStartupConfig(env, file, stateDir + "/config.json");
         replay::setLogLevel(replay::parseLogLevel(loaded.config.logLevel));
         replay::setLogFormatJson(loaded.config.logFormat != "text");
         auto const flat = loaded.flat;
@@ -126,7 +120,7 @@ int main(int argc, char** argv)
             }
             mediamtx.start({"mediamtx", path});
         }
-        replay::Engine engine(std::move(loaded.config), flat);
+        replay::Engine engine(std::move(loaded.config), flat, loaded.state);
         // The mosaic and its encoder outlive the reader and playout threads that draw into it.
         std::unique_ptr<replay::PreviewMosaic> mosaic;
         std::unique_ptr<replay::PreviewPublisher> publisher;
