@@ -709,7 +709,7 @@ Frame10 Engine::frameAt(int camera, std::uint64_t taiNs, bool* found) const
     return frame;
 }
 
-bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found) const
+bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated) const
 {
     *found = false;
     auto const* ring = ringOf(camera);
@@ -717,14 +717,24 @@ bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& 
     {
         return false;
     }
-    auto const stored = ring->findNearest(taiNs);
+    auto stored = ring->findNearest(taiNs);
     if (!stored)
     {
         return false;
     }
     *found = true;
+    *repeated = !last.v210.empty() && stored->jpeg == last.jpeg;
+    if (*repeated)
+    {
+        v210 = last.v210; // the previous grain's picture (1.8.3)
+        return true;
+    }
     v210.resize(v210Size(config_.format.width, config_.format.height));
-    return decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, v210.data());
+    bool const ok = decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, v210.data());
+    last.jpeg = ok ? std::move(stored->jpeg) : std::vector<std::uint8_t>{};
+    last.key.clear();
+    last.v210 = ok ? v210 : std::vector<std::uint8_t>{};
+    return ok;
 }
 
 RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
@@ -869,7 +879,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         bool const wantB = pick.kind != SourcePick::Kind::Exact && pick.kind != SourcePick::Kind::Repeat;
         auto& ahead = *runtime.ahead;
         lock.unlock();
-        auto const storedA = ring->findNearest(taiA);
+        auto storedA = ring->findNearest(taiA);
         auto const storedB = wantB ? ring->findNearest(taiB) : std::nullopt;
         bool const second = storedB && storedA && storedB->taiNs != storedA->taiNs;
         GpuPicture gpuPicture;
@@ -878,10 +888,23 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         bool onGpu = false;
         if (storedA && !storedA->jpeg.empty())
         {
-            auto const keyA = std::to_string(camera) + ":" + std::to_string(storedA->taiNs);
+            // The previous grain's picture keeps its key, so the decoder does not decode it again (1.8.3).
+            auto& last = runtime.decoded;
+            bool const repeated = !last.key.empty() && storedA->jpeg == last.jpeg;
+            auto const keyA = repeated ? last.key : std::to_string(camera) + ":" + std::to_string(storedA->taiNs);
             auto const keyB = second ? std::to_string(camera) + ":" + std::to_string(storedB->taiNs) : std::string{};
             onGpu = gpuRenderFromJpeg(storedA->jpeg.data(), storedA->jpeg.size(), keyA, second ? storedB->jpeg.data() : nullptr, second ? storedB->jpeg.size() : 0,
                 keyB, static_cast<float>(pick.phase), flow.get(), config_.format.width, config_.format.height, gpuPicture);
+            if (onGpu && repeated)
+            {
+                metrics_.inc("playout_repeated_pictures_total", {{"channel", std::to_string(channel)}});
+            }
+            else if (onGpu)
+            {
+                last.jpeg = std::move(storedA->jpeg);
+                last.key = keyA;
+                last.v210.clear();
+            }
         }
         lock.lock();
         if (onGpu)
@@ -914,9 +937,10 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         bool const black = runtime.black;
         lock.unlock();
         bool decoded = false;
+        bool repeated = false;
         if (!needB && !black)
         {
-            decoded = v210At(camera, taiA, rendered.v210, &foundA);
+            decoded = v210At(camera, taiA, rendered.v210, &foundA, runtime.decoded, &repeated);
             directV210 = decoded;
         }
         // A black channel shows no frame; a frame not in the house format takes the 16-bit path.
@@ -929,6 +953,10 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             }
         }
         lock.lock();
+        if (repeated)
+        {
+            metrics_.inc("playout_repeated_pictures_total", {{"channel", std::to_string(channel)}});
+        }
     }
     // Black is one cached grain: filling, packing and thumbnailing a black frame for every
     // grain made idle channels cost about as much as playing ones.

@@ -206,6 +206,8 @@ int main(int argc, char** argv)
                 auto const num = engine.config().format.rateNum;
                 auto const den = engine.config().format.rateDen;
                 replay::Labels const labels{{"channel", std::to_string(channel)}};
+                replay::Labels const renderLabels{{"channel", std::to_string(channel)}, {"stage", "render"}};
+                replay::Labels const publishLabels{{"channel", std::to_string(channel)}, {"stage", "publish"}};
                 engine.metrics().inc("output_resyncs_total", labels, 0);
                 replay::PlayoutGrid grid;
                 while (!gStop.load())
@@ -223,8 +225,14 @@ int main(int argc, char** argv)
                                                              {"jumped_grains", std::to_string(grid.lastJump)}});
                     }
                     auto const tai = replay::indexToTimestamp(num, den, index);
+                    // How long a grain takes to render and to write (1.8.3): over a period on average, the output falls
+                    // behind and resyncs.
+                    auto const began = std::chrono::steady_clock::now();
                     auto rendered = engine.render(channel, tai);
+                    auto const renderedAt = std::chrono::steady_clock::now();
                     bridge.publish(channel, rendered, tai);
+                    engine.metrics().observe("playout_seconds", renderLabels, std::chrono::duration<double>(renderedAt - began).count());
+                    engine.metrics().observe("playout_seconds", publishLabels, std::chrono::duration<double>(std::chrono::steady_clock::now() - renderedAt).count());
                     auto const wait = static_cast<std::int64_t>(replay::indexToTimestamp(num, den, grid.next)) - static_cast<std::int64_t>(replay::taiNowNs());
                     if (wait > 0)
                     {

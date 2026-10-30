@@ -1,9 +1,13 @@
 #include <doctest/doctest.h>
 
+#include "app/engine.hpp"
+#include "config/config.hpp"
 #include "media/convert.hpp"
 #include "media/format.hpp"
+#include "media/v210.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <numeric>
 #include <random>
 #include <string>
@@ -224,4 +228,38 @@ TEST_CASE("an upload whose video cannot be decoded or scaled fails with a reason
     CHECK(converted.frames.empty());
     CHECK(converted.order.empty());
     CHECK(converted.error == "unsupported video: no decoder for an unknown codec");
+}
+
+TEST_CASE("a 25p upload plays at 50p with each source frame decoded once, not on every house frame (1.8.3)")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-upload-repeat";
+    std::filesystem::remove_all(dir);
+    auto const loaded = loadConfig({{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.01"},
+                                       {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()},
+                                       {"REPLAY_STORAGE_MIN_MBPS", "0"}, {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    {
+        Engine engine(loaded.config, loaded.flat);
+        engine.openBuffer();
+        auto const file = y4m("25:1", 20); // 40 house frames, two of each source frame
+        std::string error;
+        auto const id = engine.upload(file.data(), file.size(), "repeat", error);
+        REQUIRE(error.empty());
+        engine.playClip(1, id);
+        bool pictures = true;
+        for (std::uint64_t grain = 0; grain < 30; ++grain)
+        {
+            auto const rendered = engine.render(1, grain * 20000000ull);
+            REQUIRE(rendered.v210.size() == v210Size(64, 32));
+            Frame10 picture;
+            picture.allocate(64, 32);
+            unpackV210(rendered.v210.data(), static_cast<int>(v210RowBytes(64)), picture);
+            // The first grain shows source frame 0, then each source frame shows on two grains (luma 16 + 4·i, 10-bit).
+            pictures = pictures && picture.y[0] == (16 + 4 * ((grain + 1) / 2)) << 2;
+        }
+        CHECK(pictures);
+        // Grains 2, 4 … 28 show the previous grain's picture: not decoded again.
+        CHECK(engine.metrics().render().find("mxl_replay_playout_repeated_pictures_total{channel=\"1\"} 14\n") != std::string::npos);
+    }
+    std::filesystem::remove_all(dir);
 }

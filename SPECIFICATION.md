@@ -201,6 +201,10 @@ of sequences beyond playlists, compressed outputs, HDR.
   which goes before the flows'. When nothing is
   playing, a channel shows its idle source (configurable: last frame, black, or a
   live input "E2E").
+- A grain that shows the same stored picture as the previous grain (a repeated source frame
+  of an upload at a lower frame rate, a paused or cued channel) does not decode it again
+  (1.8.3), counted in `playout_repeated_pictures_total{channel}`. Each grain's render and
+  write time is the histogram `playout_seconds{channel,stage}` (`render`, `publish`).
 
 ### 5.2 Live slow-motion control
 
@@ -684,7 +688,7 @@ cannot be recorded, once per flow: `interlaced`, 1.7.1; `interlaced_bff`, `inter
 process start at most; also `last_frame_age_s` per camera in the status); per channel
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,
 `frame_gpu_seconds` (histogram by stage: decode, flow, interpolate, pack; only `flow` is
-measured, 1.4.1),
+measured, 1.4.1), `playout_seconds{channel,stage}` and `playout_repeated_pictures_total` (§5.1, 1.8.3),
 `flow_cache_hits_total`; storage `write_bytes_per_second` (what the recorder writes,
 0 when nothing records), `storage_measured_bytes_per_second` (the write test at
 start), `read_bytes_per_second`, `free_bytes`, `protected_bytes`; GPU SM/memory/OFA
