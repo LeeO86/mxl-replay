@@ -1,12 +1,13 @@
 # Changelog
 
-## 1.8.5 (unreleased)
+## 1.8.5 (2026-10-31)
 
 - A channel's next stored pictures are decoded ahead on a worker, so the output thread no longer waits for a JPEG decode while a clip plays. On a GPU that other processes keep busy each decode takes longer, and 1.8.4 still made a channel late (`render` p99 about 30 ms at 1080p50, resyncs, each a 60 ms audio hole). Now a worker per channel, with its own GPU stream and nvJPEG state, decodes the frames the next 2 grains show (from the position and speed: frame A, and B of a grain between two frames; at speeds 1, 2, slow motion and reverse) into 4 slots, and the output thread copies the decoded picture. It waits at most 5 ms for a frame the worker is still decoding, else decodes it itself, as it does after a jump, a cue, a speed or angle change, a loop back to IN, in a mix and close to live. A repeat of the picture before (a 25p upload in a 50p house, a still camera) is not decoded on the worker either. Without a GPU the worker decodes single frames into v210.
 - New metrics: `decode_ahead_frames_total{channel,result}` (each stored picture the output thread needed: `hit` decoded ahead, `late` still decoding after 5 ms, `miss` not decoded ahead) and the histogram `decode_ahead_wait_seconds{channel}` (the output thread's wait for the worker).
 - GPU memory: about 46 MiB more per channel that plays stored pictures (4 slots of a 1080 picture and the worker's nvJPEG state; lab 194 → 240 MiB with one channel).
 - Lab (A16 GPU 3, CUDA build without libmxl, 1080p50, one channel playing a looped 32 s upload of a noisy 60p file, about 1.5 MB per JPEG frame; a CUDA busy-kernel loop keeping every SM busy and 7 busy loops on the replay's 10 cores). Light loop, 10 min each: `render` p50 21.3 → 15.4 ms, p99 39.6 → 19.9 ms, grains over 20 ms 16057 → 56, resyncs 0 → 0. Heavy loop, 5 min runs (4 of 1.8.4, 7 of 1.8.5; other work on the host varied between runs): `render` p99 39.1–39.7 ms in every 1.8.4 run, 11.9–39.1 ms with 1.8.5; grains over 20 ms 3132–9204 → 9–2450; resyncs 2, 7, 1 and 752 → 0 in 5 runs, 4 in 2 (2.3 per 10 min against 6.7 without the 752-resync run). Hits 99.4–99.9 %. Idle GPU: p50 10.0 → 3.5 ms, p99 12.0 → 6.1 ms. Speed 2: over 20 ms 1262 → 28; reverse: 270 → 8; 50 % interpolate 2167 → 711. Recorded material (synthetic camera, 3 of 4 grains repeated): p99 19.8 → 7.9 ms. Waiting up to 0, 5 or 12 ms for a frame still being decoded made no clear difference (late frames were 0–0.3 % of grains); 5 ms stays.
 - New tests: the frames ahead at speeds 1, 2, −1, 0.5, 0.25 and −0.5, with `repeat` and `blend`, without frame B, paused and in a ramp; the worker (plan order, hit, miss, late after a short wait and hit after a long one, a failed decode not retried, a held slot not reused, least recently used reuse); an engine playing at speed 1 and after a jump.
+- The Compose and Kubernetes examples use the `1.8.5` image.
 
 ## 1.8.4 (2026-10-30)
 
