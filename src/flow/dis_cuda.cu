@@ -1138,10 +1138,54 @@ std::vector<std::uint8_t> downloadV210(DevPlanes const& planes)
     return std::vector<std::uint8_t>(pinned, pinned + bytes);
 }
 
+} // namespace
+
+struct GpuPictures
+{
+    std::vector<DevPlanes> planes;
+
+    GpuPictures() = default;
+    GpuPictures(GpuPictures const&) = delete;
+    GpuPictures& operator=(GpuPictures const&) = delete;
+
+    ~GpuPictures()
+    {
+        for (auto& picture : planes)
+        {
+            releasePlanes(picture);
+        }
+    }
+};
+
+namespace
+{
+// A copy of `from` (another thread's picture, done) into `to` on this thread's stream; returns when it is done.
+bool copyPlanes(DevPlanes const& from, DevPlanes& to)
+{
+    auto& state = nv();
+    if (!ensureSlot(to, from.width, from.height))
+    {
+        return false;
+    }
+    auto const copy = [&](std::uint8_t* dst, int dstPitch, std::uint8_t const* src, int srcPitch, int bytes) {
+        return cudaMemcpy2DAsync(dst, static_cast<std::size_t>(dstPitch), src, static_cast<std::size_t>(srcPitch), static_cast<std::size_t>(bytes),
+                   static_cast<std::size_t>(from.height), cudaMemcpyDeviceToDevice, state.stream) == cudaSuccess;
+    };
+    bool const queued = copy(to.y, to.pitchY, from.y, from.pitchY, from.width) && copy(to.cb, to.pitchC, from.cb, from.pitchC, from.width / 2) &&
+                        copy(to.cr, to.pitchC, from.cr, from.pitchC, from.width / 2);
+    if (!queued || cudaStreamSynchronize(state.stream) != cudaSuccess)
+    {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 // Puts frame A, and B when `needB`, into slots 0 and 1, decoding only a frame the thread does not hold from
-// its last call. Returns A's slot (B is in the other); -1 when a bitstream is rejected or not width × height.
+// its last call and `ahead` does not have. Returns A's slot (B is in the other); -1 when a bitstream is
+// rejected or not width × height.
 int loadPair(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB, std::size_t sizeB, std::string const& keyB,
-    bool needB, int width, int height)
+    bool needB, int width, int height, GpuAhead* ahead = nullptr)
 {
     auto& state = nv();
     auto holding = [&](std::string const& key) {
@@ -1154,13 +1198,24 @@ int loadPair(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& ke
         }
         return -1;
     };
-    // Decode into slot `index` unless it already holds `key`.
-    auto load = [&](int index, std::uint8_t const* jpeg, std::size_t size, std::string const& key) {
+    // Decode into slot `index` unless it already holds `key` or `ahead` has it (frame 0: A, 1: B).
+    auto load = [&](int index, std::uint8_t const* jpeg, std::size_t size, std::string const& key, int frame) {
         if (!key.empty() && state.slotKey[index] == key)
         {
             return true;
         }
         state.slotKey[index].clear();
+        if (int const picture = ahead != nullptr ? ahead->take(frame) : -1; picture >= 0)
+        {
+            auto const& from = ahead->pictures->planes[static_cast<std::size_t>(picture)];
+            bool const copied = from.width == width && from.height == height && copyPlanes(from, state.slots[index]);
+            ahead->give(picture);
+            if (copied)
+            {
+                state.slotKey[index] = key;
+                return true;
+            }
+        }
         if (!decodeToSlot(jpeg, size, state.slots[index]) || state.slots[index].width != width || state.slots[index].height != height)
         {
             return false;
@@ -1174,7 +1229,7 @@ int loadPair(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& ke
         a = needB && holding(keyB) == 0 ? 1 : 0;
     }
     bool const decodeA = keyA.empty() || state.slotKey[a] != keyA;
-    if (!load(a, jpegA, sizeA, keyA))
+    if (!load(a, jpegA, sizeA, keyA, 0))
     {
         return -1;
     }
@@ -1185,7 +1240,7 @@ int loadPair(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& ke
     {
         return -1;
     }
-    if (needB && !load(1 - a, jpegB, sizeB, keyB))
+    if (needB && !load(1 - a, jpegB, sizeB, keyB, 1))
     {
         return -1;
     }
@@ -1270,8 +1325,30 @@ std::shared_ptr<GpuFlow const> gpuComputeFlow(std::uint8_t const* jpegA, std::si
     return done ? flow : nullptr;
 }
 
+std::shared_ptr<GpuPictures> gpuPicturesCreate(int count)
+{
+    auto pictures = std::make_shared<GpuPictures>();
+    pictures->planes.resize(static_cast<std::size_t>(std::max(0, count)));
+    return pictures;
+}
+
+bool gpuDecodePicture(GpuPictures& pictures, int index, std::uint8_t const* jpeg, std::size_t size, int width, int height)
+{
+    if (index < 0 || index >= static_cast<int>(pictures.planes.size()) || jpeg == nullptr || size == 0 || !prepareNv())
+    {
+        return false;
+    }
+    auto& picture = pictures.planes[static_cast<std::size_t>(index)];
+    auto& state = nv();
+    if (!decodeToSlot(jpeg, size, picture) || cudaStreamSynchronize(state.stream) != cudaSuccess || cudaGetLastError() != cudaSuccess)
+    {
+        return false;
+    }
+    return picture.width == width && picture.height == height;
+}
+
 bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB, std::size_t sizeB, std::string const& keyB,
-    float phase, GpuFlow const* flow, int width, int height, GpuPicture& out)
+    float phase, GpuFlow const* flow, int width, int height, GpuPicture& out, GpuAhead* ahead)
 {
     if (jpegA == nullptr || sizeA == 0 || width < 2 || height < 1)
     {
@@ -1283,7 +1360,7 @@ bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string
         return false;
     }
     bool const needB = jpegB != nullptr && sizeB > 0 && phase > 0.001f && phase < 0.999f;
-    int const a = loadPair(jpegA, sizeA, keyA, jpegB, sizeB, keyB, needB, width, height);
+    int const a = loadPair(jpegA, sizeA, keyA, jpegB, sizeB, keyB, needB, width, height, ahead);
     if (a < 0)
     {
         return false;
