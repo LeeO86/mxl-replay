@@ -4,9 +4,11 @@
 
 #include "app/engine.hpp"
 #include "config/config.hpp"
+#include "flow/cuda_flow.hpp"
 #include "playout/decodeahead.hpp"
 #include "playout/scheduler.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -170,8 +172,9 @@ TEST_CASE("the decode worker decodes the plan in order; the playout takes a deco
     fail = false;
 }
 
-TEST_CASE("the decode worker keeps a held slot and the planned frames, and reuses the least recently used one")
+TEST_CASE("the decode worker keeps a held slot, the planned and the kept frames, and reuses the least recently used one")
 {
+    static_assert(DecodeAhead::kSlots == DecodeAhead::kMaxPlan + DecodeAhead::kMaxKeep);
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, int>> decoded;
     DecodeAhead worker([&](AheadFrame const& frame, int slot, std::uint64_t& storedNs) {
@@ -194,28 +197,63 @@ TEST_CASE("the decode worker keeps a held slot and the planned frames, and reuse
         }
         return false;
     };
-    std::vector<AheadFrame> frames{{1, 1}, {1, 2}, {1, 3}, {1, 4}};
-    worker.plan(frames.data(), 4);
-    REQUIRE(waitDecoded(4));
+    auto const slotOf = [&](std::uint64_t tai) {
+        std::lock_guard lock{mutex};
+        for (auto const& [frame, slot] : decoded)
+        {
+            if (frame == tai)
+            {
+                return slot;
+            }
+        }
+        return -1;
+    };
+    auto const frames = [](std::uint64_t first, int count) {
+        std::vector<AheadFrame> out;
+        for (int i = 0; i < count; ++i)
+        {
+            out.push_back({1, first + static_cast<std::uint64_t>(i)});
+        }
+        return out;
+    };
+    static_assert(DecodeAhead::kMaxPlan == 8 && DecodeAhead::kSlots == 10);
+    auto plan = frames(1, DecodeAhead::kMaxPlan); // 1–8
+    worker.plan(plan.data(), static_cast<int>(plan.size()));
+    REQUIRE(waitDecoded(8));
+    // Frame 1 is held, frame 2 kept for the current grain; 8 new frames: 2 free slots, then the least recently
+    // used of 3–8, never the held or the kept one.
     auto const held = worker.take({1, 1}, std::chrono::milliseconds(0));
     REQUIRE(held.result == DecodeAhead::Result::Hit);
-    // Four new frames while frame 1 is held: three slots are free to reuse, the fourth frame waits for the give.
-    frames = {{1, 5}, {1, 6}, {1, 7}, {1, 8}};
-    worker.plan(frames.data(), 4);
-    REQUIRE(waitDecoded(7));
+    AheadFrame const kept{1, 2};
+    plan = frames(11, DecodeAhead::kMaxPlan); // 11–18
+    worker.plan(plan.data(), static_cast<int>(plan.size()), &kept, 1);
+    REQUIRE(waitDecoded(16));
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     {
         std::lock_guard lock{mutex};
-        REQUIRE(decoded.size() == 7);
-        for (std::size_t i = 4; i < 7; ++i)
+        REQUIRE(decoded.size() == 16);
+        for (std::size_t i = 8; i < 16; ++i)
         {
+            CAPTURE(i);
             CHECK(decoded[i].second != held.slot);
         }
     }
+    CHECK(slotOf(13) == slotOf(3));
+    auto const second = worker.take({1, 2}, std::chrono::milliseconds(0));
+    CHECK(second.result == DecodeAhead::Result::Hit);
+    CHECK(worker.take({1, 8}, std::chrono::milliseconds(0)).result == DecodeAhead::Result::Miss);
+    // A slot whose picture was taken goes before one not taken yet (frames decoded early for later grains): frame
+    // 1, taken first, before 12–18, which were decoded later but never taken.
     worker.give(held.slot);
-    REQUIRE(waitDecoded(8));
+    worker.give(second.slot);
+    auto const eleven = worker.take({1, 11}, std::chrono::milliseconds(0));
+    REQUIRE(eleven.result == DecodeAhead::Result::Hit);
+    worker.give(eleven.slot);
+    AheadFrame const later{1, 21};
+    worker.plan(&later, 1);
+    REQUIRE(waitDecoded(17));
     std::lock_guard lock{mutex};
-    CHECK(decoded[7] == std::pair<std::uint64_t, int>{8, held.slot});
+    CHECK(decoded[16].second == held.slot);
 }
 
 namespace
@@ -307,6 +345,218 @@ TEST_CASE("a playing channel shows the pictures decoded ahead; a jump decodes it
     CHECK(decodeAhead(*engine, "miss") + decodeAhead(*engine, "late") == misses + 1);
     CHECK(decodeAhead(*engine, "hit") == hits + 9);
     CHECK(engine->metrics().render().find("mxl_replay_decode_ahead_wait_seconds_bucket{le=\"+Inf\",channel=\"1\"}") != std::string::npos);
+    engine.reset();
+    std::filesystem::remove_all(dir);
+}
+
+namespace
+{
+// A source at frame `frame` of camera `camera` (source period kPeriod) at `speed`, repeat.
+AheadSource sourceAt(int camera, double frame, double speed, MotionMode motion = MotionMode::Repeat)
+{
+    AheadSource source;
+    source.scheduler = schedulerAt(frame, speed);
+    source.scheduler.camera = camera;
+    source.current = pickSource(source.scheduler.positionNs, 0, kPeriod, 1.0, 0.1, motion);
+    source.camera = camera;
+    source.periodNs = static_cast<std::uint64_t>(kPeriod);
+    source.motion = motion;
+    return source;
+}
+
+AheadFrame frameOf(int camera, std::uint64_t frame)
+{
+    return {camera, frame * static_cast<std::uint64_t>(kPeriod)};
+}
+
+std::vector<AheadFrame> framesOf(DecodePlan const& plan)
+{
+    return {plan.frames.begin(), plan.frames.begin() + plan.count};
+}
+
+std::vector<AheadFrame> keptOf(DecodePlan const& plan)
+{
+    return {plan.keep.begin(), plan.keep.begin() + plan.keepCount};
+}
+
+using AheadFrames = std::vector<AheadFrame>;
+} // namespace
+
+TEST_CASE("the decode plan: one source, the next clip's first frames before OUT, and both entries of a mix")
+{
+    // One source at speed 1: the next 2 frames; the current one is kept.
+    auto const one = sourceAt(1, 10, 1);
+    auto plan = planAhead(&one, 1, nullptr, 0, 2);
+    CHECK(framesOf(plan) == AheadFrames{frameOf(1, 11), frameOf(1, 12)});
+    CHECK(keptOf(plan) == AheadFrames{frameOf(1, 10)});
+    // Between two frames (interpolate on the GPU): A and B are kept.
+    auto const slow = sourceAt(1, 10.5, 0.5, MotionMode::Interpolate);
+    plan = planAhead(&slow, 1, nullptr, 0, 2);
+    CHECK(framesOf(plan) == AheadFrames{frameOf(1, 12)});
+    CHECK(keptOf(plan) == AheadFrames{frameOf(1, 10), frameOf(1, 11)});
+    // Without B (the CPU path) a grain between two frames keeps nothing.
+    auto cpu = slow;
+    cpu.withB = false;
+    CHECK(planAhead(&cpu, 1, nullptr, 0, 2).keepCount == 0);
+
+    // Before OUT (frame 11): the next clip's IN and the frame after it follow the first grain; frame 12 is after
+    // OUT and is not shown.
+    auto cut = sourceAt(1, 10, 1);
+    cut.untilNs = 11 * static_cast<std::uint64_t>(kPeriod);
+    AheadFrame const next[] = {frameOf(0, 500), frameOf(0, 501)};
+    plan = planAhead(&cut, 1, next, 2, 2);
+    CHECK(framesOf(plan) == AheadFrames{frameOf(1, 11), frameOf(0, 500), frameOf(0, 501)});
+    // A loop back to IN on the same camera.
+    AheadFrame const loop[] = {frameOf(1, 2), frameOf(1, 3)};
+    plan = planAhead(&cut, 1, loop, 2, 2);
+    CHECK(framesOf(plan) == AheadFrames{frameOf(1, 11), frameOf(1, 2), frameOf(1, 3)});
+
+    // A mix: the incoming entry (camera 0 from 500) and the outgoing one (camera 1, holding at its OUT 21), grain
+    // by grain; both current frames kept.
+    AheadSource mix[] = {sourceAt(0, 500, 1), sourceAt(1, 20, 1)};
+    mix[1].untilNs = 21 * static_cast<std::uint64_t>(kPeriod);
+    plan = planAhead(mix, 2, nullptr, 0, 2);
+    CHECK(framesOf(plan) == AheadFrames{frameOf(0, 501), frameOf(1, 21), frameOf(0, 502)});
+    CHECK(keptOf(plan) == AheadFrames{frameOf(0, 500), frameOf(1, 20)});
+    // The incoming entry further ahead than the outgoing one (a mix needs two new pictures a grain).
+    mix[0].grains = 6;
+    plan = planAhead(mix, 2, nullptr, 0, 2);
+    CHECK(framesOf(plan) == AheadFrames{frameOf(0, 501), frameOf(1, 21), frameOf(0, 502), frameOf(0, 503), frameOf(0, 504), frameOf(0, 505), frameOf(0, 506)});
+    // Two sources at 200 % and the next clip's 6 frames: at most kMaxPlan frames, the soonest first.
+    AheadSource busy[] = {sourceAt(0, 500, 2), sourceAt(1, 20, 2)};
+    AheadFrame const more[] = {frameOf(2, 900), frameOf(2, 901), frameOf(2, 902), frameOf(2, 903), frameOf(2, 904), frameOf(2, 905)};
+    plan = planAhead(busy, 2, more, 6, 2);
+    CHECK(plan.count == DecodeAhead::kMaxPlan);
+    CHECK(framesOf(plan) == AheadFrames{frameOf(0, 502), frameOf(1, 22), frameOf(2, 900), frameOf(2, 901), frameOf(2, 902), frameOf(2, 903), frameOf(2, 904),
+                                frameOf(2, 905)});
+}
+
+namespace
+{
+// One camera, 64×32p50, frames 0–79 recorded, each a luma step of 10 brighter.
+std::unique_ptr<Engine> recordedEngine(std::filesystem::path const& dir)
+{
+    std::filesystem::remove_all(dir);
+    auto const loaded = loadConfig({{"REPLAY_FORMAT", "64x32p50"}, {"REPLAY_INPUTS", "1"}, {"REPLAY_CHANNELS", "1"}, {"REPLAY_BUFFER_HOURS", "0.1"},
+                                       {"REPLAY_STORAGE_DIR", (dir / "media").string()}, {"REPLAY_STATE_DIR", (dir / "state").string()},
+                                       {"REPLAY_STORAGE_MIN_MBPS", "0"}, {"REPLAY_PROTECT_MAX_PCT", "90"}, {"CH1_MOTION", "repeat"},
+                                       {"NMOS_HOST_ADDRESS", "10.4.4.4"}, {"HOST_ID", "ci"}},
+        {});
+    auto engine = std::make_unique<Engine>(loaded.config, loaded.flat);
+    engine->openBuffer();
+    for (int i = 0; i < 80; ++i)
+    {
+        engine->ingestAudio(1, at(i), std::vector<float>(960 * 2, 0.5F), 2);
+        Frame10 frame;
+        frame.allocate(64, 32);
+        frame.fill(static_cast<std::uint16_t>(100 + 10 * i), 512, 512);
+        engine->ingestVideo(1, 1, at(i), std::move(frame));
+    }
+    return engine;
+}
+
+std::string clipOf(Engine& engine, int in, int out)
+{
+    engine.setPosition(1, at(in));
+    engine.markIn(1);
+    engine.setPosition(1, at(out));
+    engine.markOut(1);
+    std::string error;
+    auto id = engine.createClip(1, "", false, false, error);
+    INFO(error);
+    REQUIRE(error.empty());
+    return id;
+}
+} // namespace
+
+TEST_CASE("the first frames after OUT are decoded ahead: the next entry, a loop to IN, the idle playlist, a mix; a cued shot's frame at the cue")
+{
+    auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-decodeahead-ends";
+    auto engine = recordedEngine(dir);
+    auto const a = clipOf(*engine, 10, 20);
+    auto const b = clipOf(*engine, 40, 50);
+    std::uint64_t out = at(500);
+    // Renders `grains` grains 10 ms apart; the luma of each.
+    auto const render = [&](int grains) {
+        std::vector<int> luma;
+        for (int i = 0; i < grains; ++i)
+        {
+            luma.push_back(lumaOf(engine->render(1, out)));
+            out += static_cast<std::uint64_t>(kPeriod);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return luma;
+    };
+    auto const notAhead = [&] { return decodeAhead(*engine, "miss") + decodeAhead(*engine, "late"); };
+    // The worker sets up its GPU state at its first decode: time for it before the grains are counted.
+    auto const settle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(300)); };
+    // One frame of the luma ramp (100 + 10·frame, ±4 after the JPEG round trip).
+    auto const shows = [](int luma, int frame) { return std::abs(luma - (100 + 10 * frame)) <= 4; };
+
+    SUBCASE("the next entry at OUT, cut")
+    {
+        auto const list = engine->createPlaylist("cut", {PlaylistEntry{a, 1, EndAction::Next, true}, PlaylistEntry{b, 1, EndAction::Freeze, true}});
+        engine->playPlaylist(1, list);
+        settle();
+        auto const luma = render(20);
+        // a plays from 11 (the cut's audio crossfade starts b a few grains before a's OUT), then b from its IN; b
+        // freezes at its OUT (no decode).
+        auto const join = std::find_if(luma.begin(), luma.end(), [&](int y) { return shows(y, 40); });
+        REQUIRE(join != luma.end());
+        REQUIRE(join != luma.begin());
+        CHECK(*(join - 1) < 100 + 10 * 21);
+        CHECK(notAhead() == 0);
+        CHECK(decodeAhead(*engine, "hit") >= 17);
+    }
+    SUBCASE("a loop back to IN")
+    {
+        auto const list = engine->createPlaylist("loop", {PlaylistEntry{a, 1, EndAction::Loop, true}});
+        engine->playPlaylist(1, list);
+        settle();
+        auto const luma = render(25);
+        CHECK(std::count_if(luma.begin(), luma.end(), [&](int y) { return shows(y, 10); }) >= 1);
+        CHECK(notAhead() == 0);
+    }
+    SUBCASE("the idle playlist's next entry and its first again")
+    {
+        auto const idle = engine->createPlaylist("idle", {PlaylistEntry{a}, PlaylistEntry{b}});
+        std::string error;
+        REQUIRE(engine->setIdlePlaylist(1, idle, error));
+        engine->stop(1);
+        (void)render(1); // the idle playlist starts at a's IN
+        settle();
+        auto const before = notAhead();
+        (void)render(30); // a → b → a
+        CHECK(notAhead() == before);
+    }
+    SUBCASE("a cued shot")
+    {
+        CHECK(engine->shotClick(1, b) == ShotState::Cued);
+        settle();
+        auto const luma = render(3);
+        CHECK(shows(luma.front(), 40));
+        CHECK(notAhead() == 0);
+        CHECK(decodeAhead(*engine, "hit") == 1);
+        // The play's first grain was decoded while the channel was cued.
+        engine->play(1);
+        (void)render(3);
+        CHECK(notAhead() == 0);
+    }
+    SUBCASE("a mix (GPU only: the CPU mix decodes its frames itself)")
+    {
+        if (cudaFlowAvailable())
+        {
+            PlaylistEntry second{b, 1, EndAction::Freeze, true};
+            second.transition = Transition::Mix;
+            second.transitionFrames = 4;
+            auto const list = engine->createPlaylist("mix", {PlaylistEntry{a, 1, EndAction::Next, true}, second});
+            engine->playPlaylist(1, list);
+            settle();
+            (void)render(20);
+            CHECK(notAhead() == 0);
+            CHECK(decodeAhead(*engine, "hit") >= 20);
+        }
+    }
     engine.reset();
     std::filesystem::remove_all(dir);
 }

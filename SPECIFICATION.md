@@ -213,12 +213,19 @@ of sequences beyond playlists, compressed outputs, HDR.
   and speed the output thread knows the frames the next grains show (frame A, and B of a grain
   between two frames; a paused or cued channel: the first frame of a play) and posts those the
   current grain does not show to a worker per channel. The worker decodes them, in that order
-  (not a repeat of the picture it read before them), into 4 slots (on the GPU on its own CUDA stream at the playout's priority, with its own nvJPEG
+  (not a repeat of the picture it read before them), into 10 slots (on the GPU on its own CUDA stream at the playout's priority, with its own nvJPEG
   state; without a GPU into v210 grains, single frames only). The output thread copies a decoded
-  slot into its own picture instead of decoding. It never waits on the worker for more than 5 ms:
-  a frame the worker is still decoding then, one it was not given (a jump, a cue, a speed or
-  angle change, a mix, a frame not recorded yet, as close to live), or one whose stored frame
-  changed is decoded on the output thread as before. Counted per frame the output thread needs
+  slot into its own picture instead of decoding. Since 1.8.6 the plan also has, from the
+  playlist's longest transition plus 12 grains before OUT, the first 6 frames of the clip after
+  OUT at its speed (the next entry, auto-advance or cued; the idle playlist's next or first
+  entry; a loop's IN); during a mix the frames of the incoming entry's next 6 grains and the
+  outgoing entry's next 2 (GPU); and a cue posts the cued frame and the first frame of its play
+  at once. A plan has at most 8 frames, the soonest needed first, and the current grain keeps at
+  most 2 it is about to take, so 10 slots never make the worker wait for one; a slot whose
+  picture was taken is reused before one decoded for a later grain. It never waits on
+  the worker for more than 5 ms: a frame the worker is still decoding then, one it was not given
+  (a jump, a speed or angle change, a frame not recorded yet, as close to live), or one whose
+  stored frame changed is decoded on the output thread as before. Counted per frame the output thread needs
   in `decode_ahead_frames_total{channel,result}` (`hit`, `late`, `miss`); the time it waited
   for the worker is the histogram `decode_ahead_wait_seconds{channel}`.
 

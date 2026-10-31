@@ -3,6 +3,7 @@
 
 #include "app/engine.hpp"
 #include "config/config.hpp"
+#include "flow/cuda_flow.hpp"
 #include "library/catalog.hpp"
 #include "media/audio.hpp"
 #include "media/convert.hpp"
@@ -298,7 +299,7 @@ TEST_CASE("a catalog from before transitions and aux tracks gets their columns w
     std::filesystem::remove(path);
 }
 
-TEST_CASE("a mix blends the outgoing and incoming frames at the mix weights, bit-exact, with an equal-power audio crossfade")
+TEST_CASE("a mix blends the outgoing and incoming frames at the mix weights, bit-exact (the CPU's or the GPU's blend), with an equal-power audio crossfade")
 {
     auto const dir = std::filesystem::temp_directory_path() / "mxl-replay-mix";
     auto engine = twoToneEngine(dir);
@@ -332,9 +333,14 @@ TEST_CASE("a mix blends the outgoing and incoming frames at the mix weights, bit
     // 11); grains of the mix k = 0…3, each weight (k+1)/5 in 1/1024 steps.
     auto const start = std::find_if(luma.begin(), luma.end(), [&](int y) { return y != ya; }) - luma.begin();
     REQUIRE(start + 4 < static_cast<long>(luma.size()));
+    // The CPU blends the 10-bit samples in 1/1024 steps. The GPU blends the decoded 8-bit planes (as the blend path,
+    // in float, truncated to 8 bits) and packs them to 10 bits (× 4): its own reference, not the CPU's.
+    bool const gpu = cudaFlowAvailable();
     for (int k = 0; k < 4; ++k)
     {
-        auto const expected = blendSample(static_cast<std::uint16_t>(ya), static_cast<std::uint16_t>(yb), blendWeight1024(mixWeight(k, 4)));
+        CAPTURE(k);
+        auto const expected = gpu ? 4 * static_cast<int>(static_cast<float>(ya / 4) + static_cast<float>(mixWeight(k, 4)) * static_cast<float>(yb / 4 - ya / 4))
+                                  : static_cast<int>(blendSample(static_cast<std::uint16_t>(ya), static_cast<std::uint16_t>(yb), blendWeight1024(mixWeight(k, 4))));
         CHECK(luma[static_cast<std::size_t>(start + k)] == expected);
     }
     CHECK(luma[static_cast<std::size_t>(start + 4)] == yb);

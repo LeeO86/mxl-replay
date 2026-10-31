@@ -350,6 +350,15 @@ private:
         std::uint64_t readAheadFrom = 0;
         std::uint64_t readAheadTo = 0;
         std::string readAheadNext;
+        // The first frame the channel shows after OUT (the next entry's IN, the idle playlist's, a loop's IN), set
+        // with readAheadNext: decoded ahead before OUT (1.8.6).
+        struct
+        {
+            bool valid = false;
+            int camera = 0;
+            std::uint64_t inNs = 0;
+            double speed = 1; // the speed it plays at
+        } nextStart;
     };
     // What finishClip does at OUT (planClipEnd; lock held).
     struct ClipEnd
