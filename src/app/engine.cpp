@@ -129,6 +129,10 @@ constexpr int kFlowAheadGrains = 8;
 // Decoded ahead (SPECIFICATION.md §5.1): the stored pictures of the next 2 grains, and how long the playout
 // waits for one the worker is still decoding before it decodes the picture itself.
 constexpr int kDecodeAheadGrains = 2;
+// Around a transition (1.8.6): the first frames of the clip after OUT, and in a mix the incoming entry's frames that
+// far ahead. A mix needs two new pictures a grain; frames decoded in the grains before it, when the worker has time
+// for more than one, keep it ahead.
+constexpr int kDecodeAheadNext = 6;
 constexpr std::chrono::milliseconds kDecodeAheadWait{5};
 
 std::string jsonString(std::string const& text)
@@ -942,9 +946,18 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             GpuPicture gpuPicture;
             if (storedOut && storedIn && !storedOut->jpeg.empty() && !storedIn->jpeg.empty())
             {
-                if (gpu && gpuRenderFromJpeg(storedOut->jpeg.data(), storedOut->jpeg.size(), std::to_string(outCamera) + ":" + std::to_string(storedOut->taiNs),
-                               storedIn->jpeg.data(), storedIn->jpeg.size(), std::to_string(camera) + ":" + std::to_string(storedIn->taiNs),
-                               static_cast<float>(weight), nullptr, config_.format.width, config_.format.height, gpuPicture))
+                // Both entries' frames from the decode worker when it has them (1.8.6).
+                AheadTaker taker(*runtime.decodeAhead);
+                taker.pictures = runtime.pictures->gpu.get();
+                taker.frames = {AheadFrame{outCamera, taiOut}, AheadFrame{camera, taiIn}};
+                taker.stored = {storedOut->taiNs, storedIn->taiNs};
+                bool const onGpu = gpu &&
+                                   gpuRenderFromJpeg(storedOut->jpeg.data(), storedOut->jpeg.size(), std::to_string(outCamera) + ":" + std::to_string(storedOut->taiNs),
+                                       storedIn->jpeg.data(), storedIn->jpeg.size(), std::to_string(camera) + ":" + std::to_string(storedIn->taiNs),
+                                       static_cast<float>(weight), nullptr, config_.format.width, config_.format.height, gpuPicture,
+                                       taker.pictures != nullptr ? &taker : nullptr);
+                countDecodeAhead(channel, taker);
+                if (onGpu)
                 {
                     rendered.v210 = std::move(gpuPicture.v210);
                     renderedOnGpu = true;
@@ -1393,18 +1406,55 @@ AheadFlow Engine::computeFlow(FlowAhead::Pair const& pair, int channel)
 
 void Engine::planDecodes(int channel, SourcePick const& current, MotionMode motion)
 {
-    // None while black or mixing (the mix decodes its own frames), and none not recorded yet (close to live: those
-    // are decoded on the output thread). A locked channel moves at channel 1's speed.
+    // None while black, and none not recorded yet (close to live: those are decoded on the output thread). A
+    // locked channel moves at channel 1's speed. Lock held, no reads, no allocation.
     auto const& runtime = channels_[static_cast<std::size_t>(channel - 1)];
     auto const& cfg = config_.channelList[static_cast<std::size_t>(channel - 1)];
-    int const camera = runtime.scheduler.camera;
-    auto const* ring = ringOf(camera);
-    std::array<AheadFrame, DecodeAhead::kMaxPlan> frames{};
+    // The GPU decodes both frames of a grain between two, and both entries of a mix; the CPU path decodes only
+    // single frames ahead (its mix and blend decode 16-bit frames).
+    bool const gpu = runtime.pictures->gpu != nullptr;
+    auto const source = [&](Scheduler const& scheduler, SourcePick const& pick, MotionMode mode) {
+        AheadSource ahead;
+        ahead.scheduler = scheduler;
+        ahead.current = pick;
+        ahead.camera = scheduler.camera;
+        ahead.periodNs = sourcePeriod(scheduler.camera);
+        ahead.hfrFactor = hfrFactor(scheduler.camera);
+        ahead.hfrSnap = config_.hfrSnap;
+        ahead.motion = mode;
+        ahead.withB = gpu;
+        return ahead;
+    };
+    std::array<AheadSource, 2> sources{};
     int count = 0;
-    if (ring != nullptr && !runtime.black && !runtime.mix.active)
+    std::array<AheadFrame, kDecodeAheadNext> next{};
+    int nextCount = 0;
+    if (runtime.black)
+    {
+    }
+    else if (runtime.mix.active && runtime.mix.done < runtime.mix.videoFrames)
+    {
+        // A mix (1.8.6): the incoming and the outgoing entry's nearest frames (render's mix), the outgoing one
+        // holding at its OUT.
+        if (gpu)
+        {
+            auto const nearest = [&](Scheduler const& scheduler) {
+                return pickSource(std::max<std::int64_t>(0, scheduler.positionNs), 0, scheduler.framePeriodNs, hfrFactor(scheduler.camera), config_.hfrSnap,
+                    MotionMode::Repeat);
+            };
+            auto incoming = source(runtime.scheduler, nearest(runtime.scheduler), MotionMode::Repeat);
+            incoming.grains = kDecodeAheadNext;
+            sources[static_cast<std::size_t>(count++)] = incoming;
+            auto outgoing = source(runtime.mix.scheduler, nearest(runtime.mix.scheduler), MotionMode::Repeat);
+            outgoing.untilNs = runtime.mix.outNs;
+            sources[static_cast<std::size_t>(count++)] = outgoing;
+        }
+    }
+    else
     {
         Scheduler moving = cfg.lockToFirst && channel > 1 ? channels_[0].scheduler : runtime.scheduler;
         moving.positionNs = runtime.scheduler.positionNs;
+        moving.camera = runtime.scheduler.camera;
         if (runtime.liveMode)
         {
             moving.playing = true;
@@ -1412,21 +1462,53 @@ void Engine::planDecodes(int channel, SourcePick const& current, MotionMode moti
             moving.targetSpeed = 1;
             moving.rampLeft = 0;
         }
-        // The GPU decodes both frames of a grain between two; the CPU path decodes only single frames ahead.
-        bool const gpu = runtime.pictures->gpu != nullptr;
-        auto const ahead = framesAhead(moving, current, hfrFactor(camera), config_.hfrSnap, motion, gpu, kDecodeAheadGrains);
-        auto const periodSrc = sourcePeriod(camera);
-        auto const newest = ring->newestNs();
-        for (int i = 0; i < ahead.count; ++i)
+        auto main = source(moving, current, motion);
+        // Before OUT (1.8.6): the next clip's first kDecodeAheadNext frames, from twice that many grains before the
+        // longest transition starts (a mix shows the incoming IN on its first grain). The frames after OUT are not
+        // shown.
+        double const speed = runtime.scheduler.speed;
+        auto const position = runtime.scheduler.positionNs;
+        auto const transition = runtime.playlistId.empty() ? 0 : runtime.planMaxTransition;
+        auto const window = static_cast<double>(transition + 2 * kDecodeAheadNext) * speed * static_cast<double>(runtime.scheduler.framePeriodNs);
+        if (runtime.nextStart.valid && !runtime.clipId.empty() && runtime.hasOut && runtime.scheduler.playing && speed >= kMinClipSpeed &&
+            position < static_cast<std::int64_t>(runtime.outNs) && static_cast<double>(static_cast<std::int64_t>(runtime.outNs) - position) <= window)
         {
-            auto const tai = static_cast<std::uint64_t>(ahead.frames[static_cast<std::size_t>(i)]) * periodSrc;
-            if (ahead.frames[static_cast<std::size_t>(i)] >= 0 && tai <= newest)
+            main.untilNs = runtime.outNs;
+            // The next clip from its IN at its speed, as cueClip and the steps after it put it.
+            Scheduler start;
+            start.framePeriodNs = runtime.scheduler.framePeriodNs;
+            start.camera = runtime.nextStart.camera;
+            start.positionNs = static_cast<std::int64_t>(runtime.nextStart.inNs);
+            start.setTargetSpeed(runtime.nextStart.speed, 0);
+            auto const periodNext = sourcePeriod(start.camera);
+            for (int grain = 0; grain < 2 * kDecodeAheadNext && nextCount < kDecodeAheadNext; ++grain)
             {
-                frames[static_cast<std::size_t>(count++)] = {camera, tai};
+                auto const pick = pickSource(std::max<std::int64_t>(0, start.positionNs), 0, start.framePeriodNs, hfrFactor(start.camera), config_.hfrSnap,
+                    MotionMode::Repeat);
+                AheadFrame const frame{start.camera, static_cast<std::uint64_t>(std::max<std::int64_t>(0, pick.frameA)) * periodNext};
+                if (nextCount == 0 || !(next[static_cast<std::size_t>(nextCount - 1)] == frame))
+                {
+                    next[static_cast<std::size_t>(nextCount++)] = frame;
+                }
+                start.playing = true;
+                start.step();
             }
         }
+        sources[static_cast<std::size_t>(count++)] = main;
     }
-    runtime.decodeAhead->plan(frames.data(), count);
+    auto plan = planAhead(sources.data(), count, next.data(), nextCount, kDecodeAheadGrains);
+    // Only recorded frames.
+    int kept = 0;
+    for (int i = 0; i < plan.count; ++i)
+    {
+        auto const& frame = plan.frames[static_cast<std::size_t>(i)];
+        auto const* ring = ringOf(frame.camera);
+        if (ring != nullptr && frame.taiNs <= ring->newestNs())
+        {
+            plan.frames[static_cast<std::size_t>(kept++)] = frame;
+        }
+    }
+    runtime.decodeAhead->plan(plan.frames.data(), kept, plan.keep.data(), plan.keepCount);
 }
 
 bool Engine::decodeAheadFrame(AheadPictures& pictures, AheadFrame const& frame, int slot, std::uint64_t& storedNs) const
@@ -1622,6 +1704,7 @@ void Engine::readAhead(int channel)
     {
         runtime.readAheadCamera = -1;
         runtime.readAheadNext.clear();
+        runtime.nextStart.valid = false;
         return;
     }
     auto const post = [&](int camera, std::uint64_t from, std::uint64_t to) { readAhead_->request({channel, camera, from, to}); };
@@ -1670,21 +1753,33 @@ void Engine::readAhead(int channel)
         return;
     }
     runtime.readAheadNext = key;
-    auto const plan = planClipEnd(runtime, currentPlaylist(channel));
+    runtime.nextStart.valid = false;
+    auto const& list = currentPlaylist(channel);
+    auto const plan = planClipEnd(runtime, list);
+    // The clip after OUT: its first second read, its first frames decoded ahead at its speed (planDecodes).
+    auto const next = [&](int nextCamera, std::uint64_t inNs, double nextSpeed) {
+        post(nextCamera, inNs, inNs + kReadAheadNs);
+        runtime.nextStart.valid = true;
+        runtime.nextStart.camera = nextCamera;
+        runtime.nextStart.inNs = inNs;
+        runtime.nextStart.speed = nextSpeed;
+    };
     if (plan.idleNext || (plan.action == EndAction::Next && plan.next >= 0))
     {
-        post(plan.nextClip.camera, plan.nextClip.inNs, plan.nextClip.inNs + kReadAheadNs);
+        next(plan.nextClip.camera, plan.nextClip.inNs,
+            plan.next >= 0 && plan.next < static_cast<int>(list.entries.size()) ? list.entries[static_cast<std::size_t>(plan.next)].speed : 1.0);
     }
     else if (plan.action == EndAction::Loop)
     {
-        post(camera, runtime.inNs, runtime.inNs + kReadAheadNs);
+        next(camera, runtime.inNs, runtime.scheduler.targetSpeed);
     }
     else if (plan.action != EndAction::ReturnToLive && !idleId.empty())
     {
         ClipRef first;
-        if (firstPlayable(catalog_, findPlaylist(catalog_, idleId), first) >= 0)
+        auto const idle = findPlaylist(catalog_, idleId);
+        if (int const index = firstPlayable(catalog_, idle, first); index >= 0)
         {
-            post(first.camera, first.inNs, first.inNs + kReadAheadNs);
+            next(first.camera, first.inNs, idle.entries[static_cast<std::size_t>(index)].speed);
         }
     }
 }
@@ -2264,6 +2359,24 @@ void Engine::cueClip(int channel, ClipRef const& clip, PlaylistEntry const* entr
     runtime.scheduler.setTargetSpeed(entry != nullptr ? entry->speed : clip.speed, 0);
     runtime.scheduler.playing = false;
     runtime.shot.end = entry != nullptr ? entry->end : clip.end;
+    // The cued frame, and the first one a play steps to (a cue that plays at once shows that one), are decoded on
+    // the worker from now, not on the next grain's output thread (1.8.6); the next grain's plan keeps them.
+    std::array<AheadFrame, 2> cued{};
+    int count = 0;
+    auto const periodSrc = sourcePeriod(clip.camera);
+    auto const* ring = ringOf(clip.camera);
+    for (auto const positionNs : {static_cast<std::int64_t>(clip.inNs),
+             static_cast<std::int64_t>(clip.inNs) + static_cast<std::int64_t>(std::llround(runtime.scheduler.targetSpeed * static_cast<double>(runtime.scheduler.framePeriodNs)))})
+    {
+        auto const pick = pickSource(std::max<std::int64_t>(0, positionNs), 0, runtime.scheduler.framePeriodNs, hfrFactor(clip.camera), config_.hfrSnap,
+            MotionMode::Repeat);
+        AheadFrame const frame{clip.camera, static_cast<std::uint64_t>(std::max<std::int64_t>(0, pick.frameA)) * periodSrc};
+        if (ring != nullptr && frame.taiNs <= ring->newestNs() && (count == 0 || !(cued[0] == frame)))
+        {
+            cued[static_cast<std::size_t>(count++)] = frame;
+        }
+    }
+    runtime.decodeAhead->plan(cued.data(), count);
     bool ok = false;
     config_.channelList[static_cast<std::size_t>(channel - 1)].motion = parseMotion(clip.motion, &ok);
     config_.channelList[static_cast<std::size_t>(channel - 1)].audio = parseAudioMode(clip.audio, &ok);

@@ -94,11 +94,11 @@ struct PairAhead
 // The source frames the next `grains` output grains show that the current grain (`current`) does not, in the
 // order they are needed: frame A, and frame B of a grain between two frames when `withB` (blend, interpolate).
 // `scheduler` is the channel's after the current grain's step. A paused one shows the current frames on the
-// next grain, then steps as if it played (as pairsAhead), so a play finds its first picture decoded. At most 4
+// next grain, then steps as if it played (as pairsAhead), so a play finds its first picture decoded. At most 8
 // (SPECIFICATION.md §5.1, decoded ahead).
 struct FramesAhead
 {
-    std::array<std::int64_t, 4> frames{};
+    std::array<std::int64_t, 8> frames{};
     int count = 0;
 };
 [[nodiscard]] FramesAhead framesAhead(Scheduler scheduler, SourcePick const& current, double hfrFactor, double hfrSnap, MotionMode motion, bool withB,
