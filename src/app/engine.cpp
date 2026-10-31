@@ -126,6 +126,11 @@ constexpr int kPreviewQuality = 80;
 // How many grains ahead a channel's flows are computed (SPECIFICATION.md §5.3).
 constexpr int kFlowAheadGrains = 8;
 
+// Decoded ahead (SPECIFICATION.md §5.1): the stored pictures of the next 2 grains, and how long the playout
+// waits for one the worker is still decoding before it decodes the picture itself.
+constexpr int kDecodeAheadGrains = 2;
+constexpr std::chrono::milliseconds kDecodeAheadWait{5};
+
 std::string jsonString(std::string const& text)
 {
     return "\"" + jsonEscape(text) + "\"";
@@ -166,6 +171,44 @@ double lastFrameAge(std::uint64_t newestNs, std::uint64_t startedNs, std::uint64
     return nowNs > last ? static_cast<double>(nowNs - last) / 1e9 : 0.0;
 }
 } // namespace
+
+// A grain's lookups of the pictures its channel's worker decoded ahead (frame 0: A, 1: B): the slot of a hit
+// whose stored frame is the one the grain shows, else -1 (decode it here). For gpuRenderFromJpeg and v210At.
+class AheadTaker final : public GpuAhead
+{
+public:
+    explicit AheadTaker(DecodeAhead& ahead) : ahead_(ahead)
+    {
+    }
+    std::array<AheadFrame, 2> frames{};
+    std::array<std::uint64_t, 2> stored{};
+    std::array<DecodeAhead::Take, 2> taken{};
+    std::array<bool, 2> asked{};
+    // The v210 slots (no GPU).
+    std::array<std::vector<std::uint8_t>, DecodeAhead::kSlots> const* v210 = nullptr;
+
+    int take(int frame) override
+    {
+        auto& result = taken[static_cast<std::size_t>(frame)];
+        result = ahead_.take(frames[static_cast<std::size_t>(frame)], kDecodeAheadWait);
+        asked[static_cast<std::size_t>(frame)] = true;
+        if (result.result == DecodeAhead::Result::Hit && result.storedNs != stored[static_cast<std::size_t>(frame)])
+        {
+            // Another stored frame than the grain's (the ring changed in between): decoded here.
+            ahead_.give(result.slot);
+            result.result = DecodeAhead::Result::Miss;
+            result.slot = -1;
+        }
+        return result.slot;
+    }
+    void give(int index) override
+    {
+        ahead_.give(index);
+    }
+
+private:
+    DecodeAhead& ahead_;
+};
 
 Engine::CameraRuntime::CameraRuntime(std::string directory, std::uint64_t retentionNs, int segmentSeconds)
     : ring(std::move(directory), retentionNs, segmentSeconds)
@@ -264,6 +307,21 @@ Engine::Engine(Config config, std::map<std::string, std::string> settings, std::
         int const index = static_cast<int>(channels_.size()) + 1;
         runtime.ahead = std::make_unique<FlowAhead>([this, index](FlowAhead::Pair const& pair) { return computeFlow(pair, index); },
             [] { gpuPrepareThread(GpuPriority::Flow); });
+        // Its next pictures are decoded ahead on a worker whose GPU stream has the playout's priority (set up at
+        // its first decode: a channel that never plays a stored picture has no GPU state for it).
+        runtime.pictures = std::make_shared<AheadPictures>();
+        if (cudaFlowAvailable())
+        {
+            runtime.pictures->gpu = gpuPicturesCreate(DecodeAhead::kSlots);
+        }
+        runtime.decodeAhead = std::make_unique<DecodeAhead>(
+            [this, pictures = runtime.pictures](AheadFrame const& frame, int slot, std::uint64_t& storedNs) {
+                return decodeAheadFrame(*pictures, frame, slot, storedNs);
+            });
+        for (char const* result : {"hit", "late", "miss"})
+        {
+            metrics_.inc("decode_ahead_frames_total", {{"channel", std::to_string(index)}, {"result", result}}, 0);
+        }
         metrics_.inc("interpolation_fallbacks_total", {{"channel", std::to_string(index)}}, 0);
         metrics_.inc("tally_plays_total", {{"channel", std::to_string(index)}}, 0);
         metrics_.inc("transitions_total", {{"channel", std::to_string(index)}, {"kind", "cut"}}, 0);
@@ -727,7 +785,8 @@ Frame10 Engine::frameAt(int camera, std::uint64_t taiNs, bool* found) const
     return frame;
 }
 
-bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated) const
+bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated,
+    AheadTaker* ahead) const
 {
     *found = false;
     auto const* ring = ringOf(camera);
@@ -748,7 +807,26 @@ bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& 
         return true;
     }
     v210.resize(v210Size(config_.format.width, config_.format.height));
-    bool const ok = decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, v210.data());
+    bool ok = false;
+    if (ahead != nullptr && ahead->v210 != nullptr)
+    {
+        ahead->frames[0] = {camera, taiNs};
+        ahead->stored[0] = stored->taiNs;
+        if (int const slot = ahead->take(0); slot >= 0)
+        {
+            auto const& picture = (*ahead->v210)[static_cast<std::size_t>(slot)];
+            ok = picture.size() == v210.size();
+            if (ok)
+            {
+                std::memcpy(v210.data(), picture.data(), v210.size());
+            }
+            ahead->give(slot);
+        }
+    }
+    if (!ok)
+    {
+        ok = decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, v210.data());
+    }
     last.jpeg = ok ? std::move(stored->jpeg) : std::vector<std::uint8_t>{};
     last.key.clear();
     last.v210 = ok ? v210 : std::vector<std::uint8_t>{};
@@ -816,6 +894,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
     std::uint64_t const taiA = static_cast<std::uint64_t>(pick.frameA) * periodSrc;
     std::uint64_t const taiB = static_cast<std::uint64_t>(pick.frameB) * periodSrc;
     planFlows(channel);
+    planDecodes(channel, pick, motion);
     bool const wantFlow = motion == MotionMode::Interpolate && pick.kind == SourcePick::Kind::Interpolate;
     // A grain that interpolates: with its flow (a hit), or blended because the flow is not ready yet (a
     // fallback, logged at most every 10 s). Lock held.
@@ -912,8 +991,15 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             bool const repeated = !last.key.empty() && storedA->jpeg == last.jpeg;
             auto const keyA = repeated ? last.key : std::to_string(camera) + ":" + std::to_string(storedA->taiNs);
             auto const keyB = second ? std::to_string(camera) + ":" + std::to_string(storedB->taiNs) : std::string{};
+            // A frame the GPU does not hold from the last grain comes from the decode worker when it has it.
+            AheadTaker taker(*runtime.decodeAhead);
+            taker.pictures = runtime.pictures->gpu.get();
+            taker.frames = {AheadFrame{camera, taiA}, AheadFrame{camera, taiB}};
+            taker.stored = {storedA->taiNs, second ? storedB->taiNs : 0};
             onGpu = gpuRenderFromJpeg(storedA->jpeg.data(), storedA->jpeg.size(), keyA, second ? storedB->jpeg.data() : nullptr, second ? storedB->jpeg.size() : 0,
-                keyB, static_cast<float>(pick.phase), flow.get(), config_.format.width, config_.format.height, gpuPicture);
+                keyB, static_cast<float>(pick.phase), flow.get(), config_.format.width, config_.format.height, gpuPicture,
+                taker.pictures != nullptr ? &taker : nullptr);
+            countDecodeAhead(channel, taker);
             if (onGpu && repeated)
             {
                 metrics_.inc("playout_repeated_pictures_total", {{"channel", std::to_string(channel)}});
@@ -959,7 +1045,10 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         bool repeated = false;
         if (!needB && !black)
         {
-            decoded = v210At(camera, taiA, rendered.v210, &foundA, runtime.decoded, &repeated);
+            AheadTaker taker(*runtime.decodeAhead);
+            taker.v210 = runtime.pictures->gpu == nullptr ? &runtime.pictures->v210 : nullptr;
+            decoded = v210At(camera, taiA, rendered.v210, &foundA, runtime.decoded, &repeated, &taker);
+            countDecodeAhead(channel, taker);
             directV210 = decoded;
         }
         // A black channel shows no frame; a frame not in the house format takes the 16-bit path.
@@ -1300,6 +1389,95 @@ AheadFlow Engine::computeFlow(FlowAhead::Pair const& pair, int channel)
         flow.cpu = std::make_shared<FlowPair const>(computeFlowPair(grayFromLuma(toFloat(a)), grayFromLuma(toFloat(b)), op));
     }
     return flow;
+}
+
+void Engine::planDecodes(int channel, SourcePick const& current, MotionMode motion)
+{
+    // None while black or mixing (the mix decodes its own frames), and none not recorded yet (close to live: those
+    // are decoded on the output thread). A locked channel moves at channel 1's speed.
+    auto const& runtime = channels_[static_cast<std::size_t>(channel - 1)];
+    auto const& cfg = config_.channelList[static_cast<std::size_t>(channel - 1)];
+    int const camera = runtime.scheduler.camera;
+    auto const* ring = ringOf(camera);
+    std::array<AheadFrame, DecodeAhead::kMaxPlan> frames{};
+    int count = 0;
+    if (ring != nullptr && !runtime.black && !runtime.mix.active)
+    {
+        Scheduler moving = cfg.lockToFirst && channel > 1 ? channels_[0].scheduler : runtime.scheduler;
+        moving.positionNs = runtime.scheduler.positionNs;
+        if (runtime.liveMode)
+        {
+            moving.playing = true;
+            moving.speed = 1;
+            moving.targetSpeed = 1;
+            moving.rampLeft = 0;
+        }
+        // The GPU decodes both frames of a grain between two; the CPU path decodes only single frames ahead.
+        bool const gpu = runtime.pictures->gpu != nullptr;
+        auto const ahead = framesAhead(moving, current, hfrFactor(camera), config_.hfrSnap, motion, gpu, kDecodeAheadGrains);
+        auto const periodSrc = sourcePeriod(camera);
+        auto const newest = ring->newestNs();
+        for (int i = 0; i < ahead.count; ++i)
+        {
+            auto const tai = static_cast<std::uint64_t>(ahead.frames[static_cast<std::size_t>(i)]) * periodSrc;
+            if (ahead.frames[static_cast<std::size_t>(i)] >= 0 && tai <= newest)
+            {
+                frames[static_cast<std::size_t>(count++)] = {camera, tai};
+            }
+        }
+    }
+    runtime.decodeAhead->plan(frames.data(), count);
+}
+
+bool Engine::decodeAheadFrame(AheadPictures& pictures, AheadFrame const& frame, int slot, std::uint64_t& storedNs) const
+{
+    // On the channel's decode worker, without the engine lock: the rings have their own.
+    auto const* ring = ringOf(frame.camera);
+    if (ring == nullptr)
+    {
+        return false;
+    }
+    auto const stored = ring->findNearest(frame.taiNs);
+    if (!stored || stored->jpeg.empty())
+    {
+        return false;
+    }
+    storedNs = stored->taiNs;
+    // The same picture as the frame before it (a repeated source frame of an upload, a still camera): the
+    // playout shows it without decoding (1.8.3), so it is not decoded here either.
+    if (stored->jpeg == pictures.lastJpeg)
+    {
+        return false;
+    }
+    pictures.lastJpeg.assign(stored->jpeg.begin(), stored->jpeg.end());
+    int const width = config_.format.width;
+    int const height = config_.format.height;
+    if (pictures.gpu)
+    {
+        gpuPrepareThread(GpuPriority::Playout);
+        return gpuDecodePicture(*pictures.gpu, slot, stored->jpeg.data(), stored->jpeg.size(), width, height);
+    }
+    auto& v210 = pictures.v210[static_cast<std::size_t>(slot)];
+    v210.resize(v210Size(width, height));
+    return decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), width, height, 0, v210.data());
+}
+
+void Engine::countDecodeAhead(int channel, AheadTaker const& taker)
+{
+    for (std::size_t i = 0; i < taker.asked.size(); ++i)
+    {
+        if (!taker.asked[i])
+        {
+            continue;
+        }
+        auto const& taken = taker.taken[i];
+        auto const result = taken.result == DecodeAhead::Result::Hit ? "hit" : taken.result == DecodeAhead::Result::Late ? "late" : "miss";
+        metrics_.inc("decode_ahead_frames_total", {{"channel", std::to_string(channel)}, {"result", result}});
+        if (taken.planned)
+        {
+            metrics_.observe("decode_ahead_wait_seconds", {{"channel", std::to_string(channel)}}, std::chrono::duration<double>(taken.waited).count());
+        }
+    }
 }
 
 Engine::ClipEnd Engine::planClipEnd(ChannelRuntime const& runtime, Catalog::Playlist const& list) const

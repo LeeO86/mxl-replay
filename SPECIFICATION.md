@@ -209,6 +209,18 @@ of sequences beyond playlists, compressed outputs, HDR.
   (1.8.3), counted in `playout_repeated_pictures_total{channel}`. The GPU path decodes stored
   JPEGs with the Huffman decoding on the GPU (1.8.3). Each grain's render and write time is
   the histogram `playout_seconds{channel,stage}` (`render`, `publish`).
+- The stored pictures of a channel's next 2 grains are decoded ahead (1.8.5). From the position
+  and speed the output thread knows the frames the next grains show (frame A, and B of a grain
+  between two frames; a paused or cued channel: the first frame of a play) and posts those the
+  current grain does not show to a worker per channel. The worker decodes them, in that order
+  (not a repeat of the picture it read before them), into 4 slots (on the GPU on its own CUDA stream at the playout's priority, with its own nvJPEG
+  state; without a GPU into v210 grains, single frames only). The output thread copies a decoded
+  slot into its own picture instead of decoding. It never waits on the worker for more than 5 ms:
+  a frame the worker is still decoding then, one it was not given (a jump, a cue, a speed or
+  angle change, a mix, a frame not recorded yet, as close to live), or one whose stored frame
+  changed is decoded on the output thread as before. Counted per frame the output thread needs
+  in `decode_ahead_frames_total{channel,result}` (`hit`, `late`, `miss`); the time it waited
+  for the worker is the histogram `decode_ahead_wait_seconds{channel}`.
 
 ### 5.2 Live slow-motion control
 
@@ -694,6 +706,7 @@ process start at most; also `last_frame_age_s` per camera in the status); per ch
 `channel_state`, `speed`, `motion_mode` (info), `late_grains_total`,
 `frame_gpu_seconds` (histogram by stage: decode, flow, interpolate, pack; only `flow` is
 measured, 1.4.1), `playout_seconds{channel,stage}` and `playout_repeated_pictures_total` (§5.1, 1.8.3),
+`decode_ahead_frames_total{channel,result}` and `decode_ahead_wait_seconds{channel}` (§5.1, 1.8.5),
 `flow_cache_hits_total`; storage `write_bytes_per_second` (what the recorder writes,
 0 when nothing records), `storage_measured_bytes_per_second` (the write test at
 start), `read_bytes_per_second`, `free_bytes`, `protected_bytes`; GPU SM/memory/OFA

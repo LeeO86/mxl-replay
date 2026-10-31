@@ -172,6 +172,42 @@ std::vector<PairAhead> pairsAhead(Scheduler scheduler, double hfrFactor, double 
     return pairs;
 }
 
+FramesAhead framesAhead(Scheduler scheduler, SourcePick const& current, double hfrFactor, double hfrSnap, MotionMode motion, bool withB, int grains)
+{
+    FramesAhead ahead;
+    auto const between = [](SourcePick const& pick) { return pick.kind == SourcePick::Kind::Blend || pick.kind == SourcePick::Kind::Interpolate; };
+    // Without B the current grain holds a single picture only when it is not between two frames.
+    bool const held = withB || !between(current);
+    auto const add = [&](std::int64_t frame) {
+        bool const shown = held && (frame == current.frameA || (between(current) && frame == current.frameB));
+        bool const known = std::find(ahead.frames.begin(), ahead.frames.begin() + ahead.count, frame) != ahead.frames.begin() + ahead.count;
+        if (!shown && !known && ahead.count < static_cast<int>(ahead.frames.size()))
+        {
+            ahead.frames[static_cast<std::size_t>(ahead.count++)] = frame;
+        }
+    };
+    bool const paused = !scheduler.playing;
+    scheduler.playing = true;
+    for (int grain = 1; grain <= grains; ++grain)
+    {
+        if (!paused || grain > 1)
+        {
+            scheduler.step();
+        }
+        auto const pick = pickSource(std::max<std::int64_t>(0, scheduler.positionNs), 0, scheduler.framePeriodNs, hfrFactor, hfrSnap, motion);
+        if (between(pick) && !withB)
+        {
+            continue;
+        }
+        add(pick.frameA);
+        if (between(pick))
+        {
+            add(pick.frameB);
+        }
+    }
+    return ahead;
+}
+
 std::string flowKey(int camera, std::uint64_t taiA, std::uint64_t taiB)
 {
     return std::to_string(camera) + ":" + std::to_string(taiA) + ":" + std::to_string(taiB);

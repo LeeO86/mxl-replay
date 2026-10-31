@@ -9,6 +9,7 @@
 #include "nmos/ids.hpp"
 #include "ops/metrics.hpp"
 #include "ops/preview.hpp"
+#include "playout/decodeahead.hpp"
 #include "playout/flowahead.hpp"
 #include "playout/readahead.hpp"
 #include "playout/scheduler.hpp"
@@ -18,6 +19,7 @@
 #include "record/ring.hpp"
 #include "tally/tsl.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -29,6 +31,8 @@
 
 namespace replay
 {
+struct GpuPictures;
+class AheadTaker;
 struct RenderedFrame
 {
     std::vector<std::uint8_t> v210;
@@ -264,6 +268,14 @@ private:
         std::string key;
         std::vector<std::uint8_t> v210;
     };
+    // The slots of a channel's DecodeAhead: on the device with a GPU, else v210 grains.
+    struct AheadPictures
+    {
+        std::shared_ptr<GpuPictures> gpu;
+        std::array<std::vector<std::uint8_t>, DecodeAhead::kSlots> v210;
+        // The JPEG the worker read last (the worker only): a repeat of it is not decoded.
+        std::vector<std::uint8_t> lastJpeg;
+    };
     struct ChannelRuntime
     {
         Scheduler scheduler;
@@ -287,6 +299,9 @@ private:
         DecodedPicture decoded;
         std::string timecode; // of the last output grain (its ANC)
         std::uint64_t late = 0;
+        // The stored pictures of the next grains, decoded ahead on a worker (SPECIFICATION.md §5.1, 1.8.5).
+        std::unique_ptr<DecodeAhead> decodeAhead;
+        std::shared_ptr<AheadPictures> pictures;
         // The flows of the next grains (SPECIFICATION.md §5.3) and the grains blended without one.
         std::unique_ptr<FlowAhead> ahead;
         LogLimit fallbackLog;
@@ -358,7 +373,9 @@ private:
     Frame10 frameAt(int camera, std::uint64_t taiNs, bool* found) const;
     // The stored frame nearest `taiNs` decoded straight into `v210` (house format). `found` says
     // whether a frame exists; false with found set means it is not in the house format.
-    bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated) const;
+    // A picture the channel's worker decoded ahead is copied from there (`ahead`, may be null).
+    bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated,
+        AheadTaker* ahead = nullptr) const;
     void finishClip(int channel);
     // What finishClip will do at OUT with the channel on `list` (lock held).
     [[nodiscard]] ClipEnd planClipEnd(ChannelRuntime const& runtime, Catalog::Playlist const& list) const;
@@ -384,6 +401,13 @@ private:
     bool startIdle(int channel);
     // Posts the pairs the channel's next grains interpolate to its flow worker. Lock held.
     void planFlows(int channel);
+    // Posts the stored frames the channel's next grains show, and the current grain (`current`) does not, to its
+    // decode worker. Lock held.
+    void planDecodes(int channel, SourcePick const& current, MotionMode motion);
+    // Decodes a planned frame into slot `slot` of `pictures` on the channel's decode worker (no engine lock).
+    bool decodeAheadFrame(AheadPictures& pictures, AheadFrame const& frame, int slot, std::uint64_t& storedNs) const;
+    // Counts a grain's lookups of pictures decoded ahead.
+    void countDecodeAhead(int channel, AheadTaker const& taker);
     // A pair's flow for the channel's worker: on the GPU when there is one (its GPU time is observed), else on the CPU.
     AheadFlow computeFlow(FlowAhead::Pair const& pair, int channel);
     // Back to live on the channel (lock held). Uploads have no live picture: live follows camera 1.

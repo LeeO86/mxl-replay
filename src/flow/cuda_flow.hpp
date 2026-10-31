@@ -51,14 +51,35 @@ struct GpuFlow;
 [[nodiscard]] std::shared_ptr<GpuFlow const> gpuComputeFlow(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB,
     std::size_t sizeB, std::string const& keyB, OperatingPoint const& op, int width, int height, double& gpuSeconds);
 
+// Device pictures a channel's next grains show, decoded ahead on a worker (DecodeAhead, SPECIFICATION.md §5.1;
+// opaque).
+struct GpuPictures;
+[[nodiscard]] std::shared_ptr<GpuPictures> gpuPicturesCreate(int count);
+// Decodes a JPEG into picture `index` on the calling thread's stream and returns when it is done (the worker).
+// False when there is no device, nvJPEG rejects the bitstream, or it is not width × height.
+bool gpuDecodePicture(GpuPictures& pictures, int index, std::uint8_t const* jpeg, std::size_t size, int width, int height);
+
+// What gpuRenderFromJpeg asks for a frame (0: A, 1: B) it does not hold from its last call: the index of its
+// picture decoded ahead, held until give(); -1 decodes it on the calling thread.
+class GpuAhead
+{
+public:
+    GpuPictures* pictures = nullptr;
+    virtual int take(int frame) = 0;
+    virtual void give(int index) = 0;
+
+protected:
+    ~GpuAhead() = default;
+};
+
 // Decode JPEG bitstreams on the device, blend there (interpolate with `flow` when it is given),
 // pack v210 there, and download only the packed grain (UI previews are made from it on request).
 // Returns false when there is no device or nvJPEG rejects the bitstream; the
 // caller then uses the CPU path.
 // keyA and keyB name the source frames (camera and time): a frame still decoded on the
-// device from the previous call is not decoded again.
+// device from the previous call is not decoded again, and one `ahead` has is copied from there.
 bool gpuRenderFromJpeg(std::uint8_t const* jpegA, std::size_t sizeA, std::string const& keyA, std::uint8_t const* jpegB, std::size_t sizeB, std::string const& keyB,
-    float phase, GpuFlow const* flow, int width, int height, GpuPicture& out);
+    float phase, GpuFlow const* flow, int width, int height, GpuPicture& out, GpuAhead* ahead = nullptr);
 
 // One upload of a packed v210 grain, nvJPEG 4:2:2 encode, one download of the bitstream.
 // Every GPU function here works on the calling thread's own stream and nvJPEG state,

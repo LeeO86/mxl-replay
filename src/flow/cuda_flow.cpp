@@ -39,8 +39,22 @@ std::shared_ptr<GpuFlow const> gpuComputeFlow(std::uint8_t const*, std::size_t, 
     return nullptr;
 }
 
+struct GpuPictures
+{
+};
+
+std::shared_ptr<GpuPictures> gpuPicturesCreate(int)
+{
+    return nullptr;
+}
+
+bool gpuDecodePicture(GpuPictures&, int, std::uint8_t const*, std::size_t, int, int)
+{
+    return false;
+}
+
 bool gpuRenderFromJpeg(std::uint8_t const*, std::size_t, std::string const&, std::uint8_t const*, std::size_t, std::string const&, float, GpuFlow const*, int, int,
-    GpuPicture&)
+    GpuPicture&, GpuAhead*)
 {
     return false;
 }
