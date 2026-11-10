@@ -837,7 +837,7 @@ bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& 
     return ok;
 }
 
-RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
+RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady const& audioReady)
 {
     std::unique_lock lock{mutex_};
     RenderedFrame rendered;
@@ -887,6 +887,131 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
             ring->waitFor(position, std::chrono::nanoseconds(period / 2));
             lock.lock();
         }
+    }
+    // The grain's audio comes first (1.8.7): it needs only the position, not the picture, so it goes
+    // out before the picture is rendered (10–20 ms on a busy GPU) and is no longer late by that much.
+    int const samples = audioSamplesForFrame(timestampToIndex(config_.format.rateNum, config_.format.rateDen, outputTaiNs), config_.format.rateNum,
+        config_.format.rateDen, 48000);
+    int const audioCamera = cfg.atmosCamera > 0 ? cfg.atmosCamera : camera;
+    double const speed = std::fabs(runtime.scheduler.speed);
+    // A channel that stands still (paused, cued, at a clip's end, black, or at speed 0) is silent: its position
+    // does not move, and its frame's samples repeated every grain are a buzz. Slow motion in `mute` is silent too.
+    bool const still = !runtime.liveMode && (!runtime.scheduler.playing || runtime.black || speed <= 0.01);
+    // A playlist entry whose own audio is off is silent too (its aux track plays, 1.6.0).
+    bool const silent = still || (!runtime.liveMode && speed < 0.999 && cfg.audio == AudioMode::Mute) || (!runtime.liveMode && !runtime.ownAudio);
+    std::vector<float> pcm(static_cast<std::size_t>(samples) * 2, 0.f);
+    if (auto const* ring = ringOf(audioCamera))
+    {
+        // Audio is stored with the frames on house times (phase 1 of an HFR camera).
+        auto const house = static_cast<std::uint64_t>(std::max<std::int64_t>(1, period));
+        auto at = (position + house / 2) / house * house;
+        // A channel that just stopped fades out over the audio after the grain it played last (no splice, no click),
+        // not over its frame again.
+        if (still && runtime.fadeFramesLeft < 2 && runtime.audioNs != 0)
+        {
+            at = runtime.audioNs + house;
+        }
+        runtime.audioNs = at;
+        lock.unlock();
+        auto audio = ring->findNearestAudio(at);
+        lock.lock();
+        if (!audio.empty())
+        {
+            audio.resize(pcm.size(), 0.f);
+            pcm = std::move(audio);
+        }
+    }
+    if (!silent && !runtime.liveMode && speed < 0.999)
+    {
+        if (cfg.audio == AudioMode::Stretch)
+        {
+            pcm = timeStretch(pcm, 2, speed).samples;
+            pcm.resize(static_cast<std::size_t>(samples) * 2, 0.f);
+        }
+        else if (cfg.audio == AudioMode::Follow)
+        {
+            pcm = resampleLinear(pcm, 2, speed);
+            pcm.resize(static_cast<std::size_t>(samples) * 2, 0.f);
+        }
+    }
+    // Two-grain fades: out into silence, in when the channel plays (or goes live) again.
+    if (silent)
+    {
+        if (runtime.fadeFramesLeft < 2)
+        {
+            applyMuteFade(pcm, runtime.fadeFramesLeft, 2);
+            ++runtime.fadeFramesLeft;
+        }
+        else
+        {
+            std::fill(pcm.begin(), pcm.end(), 0.f);
+        }
+    }
+    else if (runtime.fadeFramesLeft > 0)
+    {
+        applyFadeIn(pcm, 2 - runtime.fadeFramesLeft, 2);
+        --runtime.fadeFramesLeft;
+    }
+    // The audio crossfade of a transition (equal power): the outgoing entry's audio at its own position, faded out
+    // under the incoming's. A channel that stops ends it with a one-grain fade.
+    bool outgoingAudible = false;
+    if (runtime.mix.active && runtime.mix.audioSamples < runtime.mix.audioTotal)
+    {
+        auto& mix = runtime.mix;
+        double const outSpeed = std::fabs(mix.scheduler.speed);
+        bool const outMuted = !mix.ownAudio || (outSpeed < 0.999 && mix.audio == AudioMode::Mute);
+        std::vector<float> outPcm(pcm.size(), 0.f);
+        int const outAudioCamera = cfg.atmosCamera > 0 ? cfg.atmosCamera : mix.scheduler.camera;
+        if (auto const* ring = ringOf(outAudioCamera); ring != nullptr && !outMuted)
+        {
+            auto const house = static_cast<std::uint64_t>(std::max<std::int64_t>(1, period));
+            auto const outPosition = static_cast<std::uint64_t>(std::max<std::int64_t>(0, mix.scheduler.positionNs));
+            auto at = (outPosition + house / 2) / house * house;
+            // Held at its OUT: the audio after it, not the same frame again.
+            if (mix.audioNs != 0 && at <= mix.audioNs)
+            {
+                at = mix.audioNs + house;
+            }
+            mix.audioNs = at;
+            lock.unlock();
+            auto audio = ring->findNearestAudio(at);
+            lock.lock();
+            if (!audio.empty())
+            {
+                audio.resize(outPcm.size(), 0.f);
+                outPcm = std::move(audio);
+            }
+            if (outSpeed < 0.999 && mix.audio == AudioMode::Stretch)
+            {
+                outPcm = timeStretch(outPcm, 2, outSpeed).samples;
+                outPcm.resize(pcm.size(), 0.f);
+            }
+            else if (outSpeed < 0.999 && mix.audio == AudioMode::Follow)
+            {
+                outPcm = resampleLinear(outPcm, 2, outSpeed);
+                outPcm.resize(pcm.size(), 0.f);
+            }
+        }
+        if (still)
+        {
+            applyMuteFade(outPcm, 0, 1);
+        }
+        std::size_t const frames = pcm.size() / 2;
+        for (std::size_t i = 0; i < frames; ++i)
+        {
+            auto const gains = still ? CrossfadeGains{1.f, 1.f} : crossfadeGains(mix.audioSamples + static_cast<std::int64_t>(i), mix.audioTotal);
+            pcm[2 * i] = pcm[2 * i] * gains.in + outPcm[2 * i] * gains.out;
+            pcm[2 * i + 1] = pcm[2 * i + 1] * gains.in + outPcm[2 * i + 1] * gains.out;
+        }
+        mix.audioSamples = still ? mix.audioTotal : mix.audioSamples + static_cast<std::int64_t>(frames);
+        outgoingAudible = !outMuted;
+    }
+    mixAux(channel, lock, pcm, still, !silent || outgoingAudible, outputTaiNs);
+    if (audioReady)
+    {
+        lock.unlock();
+        audioReady(pcm);
+        lock.lock();
     }
     MotionMode motion = cfg.motion;
     if (motion == MotionMode::Interpolate && !gpuInterpolate())
@@ -1189,123 +1314,6 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs)
         rendered.ancSecond = encodeAncGrain(packet);
     }
 
-    int const samples = audioSamplesForFrame(timestampToIndex(config_.format.rateNum, config_.format.rateDen, outputTaiNs), config_.format.rateNum,
-        config_.format.rateDen, 48000);
-    int const audioCamera = cfg.atmosCamera > 0 ? cfg.atmosCamera : camera;
-    double const speed = std::fabs(runtime.scheduler.speed);
-    // A channel that stands still (paused, cued, at a clip's end, black, or at speed 0) is silent: its position
-    // does not move, and its frame's samples repeated every grain are a buzz. Slow motion in `mute` is silent too.
-    bool const still = !runtime.liveMode && (!runtime.scheduler.playing || runtime.black || speed <= 0.01);
-    // A playlist entry whose own audio is off is silent too (its aux track plays, 1.6.0).
-    bool const silent = still || (!runtime.liveMode && speed < 0.999 && cfg.audio == AudioMode::Mute) || (!runtime.liveMode && !runtime.ownAudio);
-    std::vector<float> pcm(static_cast<std::size_t>(samples) * 2, 0.f);
-    if (auto const* ring = ringOf(audioCamera))
-    {
-        // Audio is stored with the frames on house times (phase 1 of an HFR camera).
-        auto const house = static_cast<std::uint64_t>(std::max<std::int64_t>(1, period));
-        auto at = (position + house / 2) / house * house;
-        // A channel that just stopped fades out over the audio after the grain it played last (no splice, no click),
-        // not over its frame again.
-        if (still && runtime.fadeFramesLeft < 2 && runtime.audioNs != 0)
-        {
-            at = runtime.audioNs + house;
-        }
-        runtime.audioNs = at;
-        lock.unlock();
-        auto audio = ring->findNearestAudio(at);
-        lock.lock();
-        if (!audio.empty())
-        {
-            audio.resize(pcm.size(), 0.f);
-            pcm = std::move(audio);
-        }
-    }
-    if (!silent && !runtime.liveMode && speed < 0.999)
-    {
-        if (cfg.audio == AudioMode::Stretch)
-        {
-            pcm = timeStretch(pcm, 2, speed).samples;
-            pcm.resize(static_cast<std::size_t>(samples) * 2, 0.f);
-        }
-        else if (cfg.audio == AudioMode::Follow)
-        {
-            pcm = resampleLinear(pcm, 2, speed);
-            pcm.resize(static_cast<std::size_t>(samples) * 2, 0.f);
-        }
-    }
-    // Two-grain fades: out into silence, in when the channel plays (or goes live) again.
-    if (silent)
-    {
-        if (runtime.fadeFramesLeft < 2)
-        {
-            applyMuteFade(pcm, runtime.fadeFramesLeft, 2);
-            ++runtime.fadeFramesLeft;
-        }
-        else
-        {
-            std::fill(pcm.begin(), pcm.end(), 0.f);
-        }
-    }
-    else if (runtime.fadeFramesLeft > 0)
-    {
-        applyFadeIn(pcm, 2 - runtime.fadeFramesLeft, 2);
-        --runtime.fadeFramesLeft;
-    }
-    // The audio crossfade of a transition (equal power): the outgoing entry's audio at its own position, faded out
-    // under the incoming's. A channel that stops ends it with a one-grain fade.
-    bool outgoingAudible = false;
-    if (runtime.mix.active && runtime.mix.audioSamples < runtime.mix.audioTotal)
-    {
-        auto& mix = runtime.mix;
-        double const outSpeed = std::fabs(mix.scheduler.speed);
-        bool const outMuted = !mix.ownAudio || (outSpeed < 0.999 && mix.audio == AudioMode::Mute);
-        std::vector<float> outPcm(pcm.size(), 0.f);
-        int const outAudioCamera = cfg.atmosCamera > 0 ? cfg.atmosCamera : mix.scheduler.camera;
-        if (auto const* ring = ringOf(outAudioCamera); ring != nullptr && !outMuted)
-        {
-            auto const house = static_cast<std::uint64_t>(std::max<std::int64_t>(1, period));
-            auto const outPosition = static_cast<std::uint64_t>(std::max<std::int64_t>(0, mix.scheduler.positionNs));
-            auto at = (outPosition + house / 2) / house * house;
-            // Held at its OUT: the audio after it, not the same frame again.
-            if (mix.audioNs != 0 && at <= mix.audioNs)
-            {
-                at = mix.audioNs + house;
-            }
-            mix.audioNs = at;
-            lock.unlock();
-            auto audio = ring->findNearestAudio(at);
-            lock.lock();
-            if (!audio.empty())
-            {
-                audio.resize(outPcm.size(), 0.f);
-                outPcm = std::move(audio);
-            }
-            if (outSpeed < 0.999 && mix.audio == AudioMode::Stretch)
-            {
-                outPcm = timeStretch(outPcm, 2, outSpeed).samples;
-                outPcm.resize(pcm.size(), 0.f);
-            }
-            else if (outSpeed < 0.999 && mix.audio == AudioMode::Follow)
-            {
-                outPcm = resampleLinear(outPcm, 2, outSpeed);
-                outPcm.resize(pcm.size(), 0.f);
-            }
-        }
-        if (still)
-        {
-            applyMuteFade(outPcm, 0, 1);
-        }
-        std::size_t const frames = pcm.size() / 2;
-        for (std::size_t i = 0; i < frames; ++i)
-        {
-            auto const gains = still ? CrossfadeGains{1.f, 1.f} : crossfadeGains(mix.audioSamples + static_cast<std::int64_t>(i), mix.audioTotal);
-            pcm[2 * i] = pcm[2 * i] * gains.in + outPcm[2 * i] * gains.out;
-            pcm[2 * i + 1] = pcm[2 * i + 1] * gains.in + outPcm[2 * i + 1] * gains.out;
-        }
-        mix.audioSamples = still ? mix.audioTotal : mix.audioSamples + static_cast<std::int64_t>(frames);
-        outgoingAudible = !outMuted;
-    }
-    mixAux(channel, lock, pcm, still, !silent || outgoingAudible, outputTaiNs);
     if (runtime.mix.active && runtime.scheduler.playing)
     {
         ++runtime.mix.done;

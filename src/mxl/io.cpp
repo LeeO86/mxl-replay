@@ -305,13 +305,31 @@ void MxlBridge::publish(int channel, RenderedFrame const& frame, std::uint64_t t
             }
         }
     }
-    if (writer.audio != nullptr && !frame.audio.empty())
+#endif
+}
+
+void MxlBridge::publishAudio(int channel, std::vector<float> const& audio, std::uint64_t taiNs)
+{
+#if !defined(REPLAY_WITH_MXL)
+    (void)channel;
+    (void)audio;
+    (void)taiNs;
+#else
+    if (!active_ || channel < 1 || channel > static_cast<int>(impl_->writers.size()))
+    {
+        return;
+    }
+    auto const& cfg = engine_.config();
+    mxlRational const rate{cfg.format.rateNum, cfg.format.rateDen};
+    auto const index = mxlTimestampToIndex(&rate, taiNs);
+    auto& writer = impl_->writers[static_cast<std::size_t>(channel - 1)];
+    if (writer.audio != nullptr && !audio.empty())
     {
         // The frame's samples [first, end) at 48 kHz, addressed by their end index; each
         // channel has its own ring (`stride` apart), possibly wrapped into two fragments.
         auto const first = audioSamplesUntil(index, cfg.format.rateNum, cfg.format.rateDen, 48000);
         auto const end = audioSamplesUntil(index + 1, cfg.format.rateNum, cfg.format.rateDen, 48000);
-        auto const count = std::min(static_cast<std::size_t>(end - first), frame.audio.size() / 2);
+        auto const count = std::min(static_cast<std::size_t>(end - first), audio.size() / 2);
         mxlMutableWrappedMultiBufferSlice slices{};
         if (count > 0 && mxlFlowWriterOpenSamples(writer.audio, first + count, count, &slices) == MXL_STATUS_OK)
         {
@@ -323,7 +341,7 @@ void MxlBridge::publish(int channel, RenderedFrame const& frame, std::uint64_t t
                     auto* out = reinterpret_cast<float*>(static_cast<std::uint8_t*>(fragment.pointer) + channel * slices.stride);
                     for (std::size_t i = 0; i < fragment.size / sizeof(float) && sample < count; ++i, ++sample)
                     {
-                        out[i] = frame.audio[sample * 2 + channel];
+                        out[i] = audio[sample * 2 + channel];
                     }
                 }
             }

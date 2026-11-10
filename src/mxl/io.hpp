@@ -140,8 +140,10 @@ public:
     ~MxlBridge();
     void start();
     void stop();
-    // Writes one channel's grain; channels may call it from their own threads.
+    // Writes one channel's grain (video and ANC); channels may call it from their own threads.
     void publish(int channel, RenderedFrame const& frame, std::uint64_t taiNs);
+    // Writes one channel's audio of grain `taiNs` (interleaved stereo), before its picture (1.8.7).
+    void publishAudio(int channel, std::vector<float> const& audio, std::uint64_t taiNs);
     [[nodiscard]] bool active() const { return active_; }
 
 private:
