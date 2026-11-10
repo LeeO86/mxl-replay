@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.8.7 (2026-11-10)
 
 - A grain's audio is written to MXL before its picture is rendered. Until now each channel rendered the picture first (GPU decode, interpolation, mix; on a busy shared GPU 10 ms typical, up to 20 ms at 50p), then wrote video, ANC and only then the grain's audio. The audio needs only the position, speed and transition state, so `Engine::render` now makes it first and hands it to the MXL writer at once (`MxlBridge::publishAudio`), then renders the picture as before. Downstream (an audio mixer reading the flow, a fabrics sender) gets each grain's audio about one render time earlier. A live channel still waits briefly for its newest recorded frame before both. The audio is still one write of the grain's samples (960 at 50p). `playout_seconds{stage="render"}` now includes the audio write; `publish` is the picture and ANC.
 - New test: the audio given to the callback is the grain's audio, once per grain.
+- Lab (A16 GPU 3, 1080p50, a looped clip, an audio mixer 1.6.0 reading the audio from MXL, 5 min each): the arrival lag p99/p99.9 stays at the floor of the 20 ms commits, 16.1/16.1 ms, idle and with a CUDA busy loop on the GPU; 1.8.6 had 16.4/18.4 ms idle and 20.0/22.0 ms under load. A live channel gains little: it waits up to half a frame for its newest recorded frame first, as before.
+- The Compose and Kubernetes examples use the `1.8.7` image.
 
 ## 1.8.6 (2026-10-31)
 
