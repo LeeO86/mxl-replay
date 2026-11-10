@@ -103,7 +103,10 @@ public:
     void countDropped(int camera, std::uint64_t grains);
     void ingestAudio(int camera, std::uint64_t taiNs, std::vector<float> audio, int channels);
 
-    [[nodiscard]] RenderedFrame render(int channel, std::uint64_t outputTaiNs);
+    // `audioReady` gets the grain's audio (interleaved stereo) before the picture is rendered (1.8.7),
+    // without the engine lock; the returned frame holds it too.
+    using AudioReady = std::function<void(std::vector<float> const&)>;
+    [[nodiscard]] RenderedFrame render(int channel, std::uint64_t outputTaiNs, AudioReady const& audioReady = {});
     // Plans every channel's flows again (render does it each grain): after a command, so the flows its
     // next grains need start now (SPECIFICATION.md §5.3).
     void planFlows();

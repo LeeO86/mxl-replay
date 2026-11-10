@@ -209,6 +209,10 @@ of sequences beyond playlists, compressed outputs, HDR.
   (1.8.3), counted in `playout_repeated_pictures_total{channel}`. The GPU path decodes stored
   JPEGs with the Huffman decoding on the GPU (1.8.3). Each grain's render and write time is
   the histogram `playout_seconds{channel,stage}` (`render`, `publish`).
+- A grain's audio is made and written to MXL before its picture is rendered (1.8.7). It needs
+  only the channel's position, speed and transition state, not the picture, so a slow render
+  no longer makes the audio late. A live channel makes it after its short wait for the newest
+  recorded frame, as before.
 - The stored pictures of a channel's next 2 grains are decoded ahead (1.8.5). From the position
   and speed the output thread knows the frames the next grains show (frame A, and B of a grain
   between two frames; a paused or cued channel: the first frame of a play) and posts those the

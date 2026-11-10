@@ -839,6 +839,13 @@ TEST_CASE("engine plays camera audio and an upload made after recording")
     REQUIRE(live.audio.size() == 960 * 2);
     CHECK(live.audio.front() == doctest::Approx(0.27F));
     CHECK(live.audio.back() == doctest::Approx(0.27F));
+    // The audio also goes to the callback, once per grain, before render returns the picture (1.8.7).
+    std::vector<std::vector<float>> early;
+    auto const next = engine.render(1, base + 5 * period, [&early](std::vector<float> const& audio) { early.push_back(audio); });
+    REQUIRE(early.size() == 1);
+    CHECK(early.front() == next.audio);
+    CHECK(early.front().front() == doctest::Approx(0.28F));
+    CHECK(next.v210.size() == v210Size(64, 32));
 
     // Camera 1 has recorded, so its ring only takes newer frames: the upload must go elsewhere.
     Frame10 still;

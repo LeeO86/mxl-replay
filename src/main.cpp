@@ -230,7 +230,10 @@ int main(int argc, char** argv)
                     // How long a grain takes to render and to write (1.8.3): over a period on average, the output falls
                     // behind and resyncs.
                     auto const began = std::chrono::steady_clock::now();
-                    auto rendered = engine.render(channel, tai);
+                    // The audio goes out as soon as render has it, before the picture (1.8.7).
+                    auto rendered = engine.render(channel, tai, [&bridge, channel, tai](std::vector<float> const& audio) {
+                        bridge.publishAudio(channel, audio, tai);
+                    });
                     auto const renderedAt = std::chrono::steady_clock::now();
                     bridge.publish(channel, rendered, tai);
                     engine.metrics().observe("playout_seconds", renderLabels, std::chrono::duration<double>(renderedAt - began).count());

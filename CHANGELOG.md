@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A grain's audio is written to MXL before its picture is rendered. Until now each channel rendered the picture first (GPU decode, interpolation, mix; on a busy shared GPU 10 ms typical, up to 20 ms at 50p), then wrote video, ANC and only then the grain's audio. The audio needs only the position, speed and transition state, so `Engine::render` now makes it first and hands it to the MXL writer at once (`MxlBridge::publishAudio`), then renders the picture as before. Downstream (an audio mixer reading the flow, a fabrics sender) gets each grain's audio about one render time earlier. A live channel still waits briefly for its newest recorded frame before both. The audio is still one write of the grain's samples (960 at 50p). `playout_seconds{stage="render"}` now includes the audio write; `publish` is the picture and ANC.
+- New test: the audio given to the callback is the grain's audio, once per grain.
+
 ## 1.8.6 (2026-10-31)
 
 - The pictures around a transition are decoded ahead too. 1.8.5 decoded the next grains' stored pictures on the channel's worker, but not the clip after OUT, a mix or a cue: those were decoded on the output thread (on the platform 81 of 88937 frames, and the 8 resyncs of channel 1 in 30 min, at the idle playlist's transitions). Now, before OUT, the worker decodes the first 6 frames of the clip after it at that clip's speed: the next playlist entry (auto-advance or cued), the idle playlist's next or first entry, or a loop back to IN. They are planned from 12 grains before the playlist's longest transition starts. During a mix it decodes both entries' frames, the incoming one 6 grains ahead: a mix needs two new pictures a grain, and the frames decoded in the grains before it keep the worker ahead. A cue posts the cued frame and the first frame of its play at once (a red light that plays a cued shot finds both decoded). The 5 ms wait and the decode on the output thread when a frame is not ready stay.
