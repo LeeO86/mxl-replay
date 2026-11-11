@@ -2,6 +2,8 @@
 
 Live slow-motion replay and clip player for [MXL](https://github.com/dmf-mxl/mxl). It records several inputs on the TAI timeline, plays them back from 0% to 200% with frame repeat, frame blend, or optical-flow interpolation, and exposes every input and playout channel as an NMOS receiver or sender pair.
 
+Part of [mxl-stack](https://github.com/LeeO86/mxl-stack), a collection of open-source MXL media functions with Docker Compose and Kubernetes examples.
+
 The interpolation is a derivative of [Futatabi](https://nageru.sesse.net/doc/futatabi.html) (part of Nageru, GPL-3.0-or-later) by Steinar H. Gunderson. The algorithm is Dense Inverse Search (Kroeger, Timofte, Dai, and Van Gool, ECCV 2016) plus the occlusion-aware blend Futatabi uses. See `NOTICE`.
 
 This program is free software under **GPL-3.0-or-later**. See `LICENSE`.
