@@ -5,7 +5,7 @@ Repository: `LeeO86/mxl-replay` (name can still change)
 License: **GPL-3.0-or-later** (this repo reuses the algorithm of Futatabi, part of Nageru, GPL-3.0-or-later)
 Aligns with: `LeeO86/mxl-decklink`, `LeeO86/mxl-st2110-gateway`, `LeeO86/mxl-fabrics-agent`,
 `LeeO86/mxl-multiviewer`, `LeeO86/mxl-webrtc-monitor`, `LeeO86/mxl-test-player`,
-`LeeO86/mxl-srt-gateway`, `LeeO86/mxl-color-corrector`, platform repo `mmz-srf/mxl-poc-platform`
+`LeeO86/mxl-srt-gateway`, `LeeO86/mxl-color-corrector`, the (private) platform repository
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in RFC 2119.
 
