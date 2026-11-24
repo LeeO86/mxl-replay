@@ -73,3 +73,46 @@ Same host, GPU and cameras as above; storage the OS disk. Image built from this 
 Recorded counts above 50 per second are cameras catching up on grains still in the input ring. The CPU rises because every camera is now actually recorded (200 encodes per second instead of about 75) and the nvJPEG decoder runs its Huffman stage on the CPU on this GPU.
 
 Result: four 1080p50 cameras record without drops while four channels interpolate, and the limit is now the GPU itself: dense optical flow (`dis-cuda` `balanced`) for one new frame pair per output pair at 0.5× keeps the GA107 at 97–98 % with four channels. Eight channels on this GPU take recording below full rate. A larger GPU (A4000, L4) is expected to scale with its SM count; that run is still open, as are 2160p50, OFA and the Futatabi comparison.
+
+## Lab run 2026-11-24: the CPU blend in v210
+
+Where a CPU slow motion lost its time, and the blend that works in v210 instead. The host was a 16 vCPU AMD EPYC (Genoa) VM without a GPU, with Debian sid and GCC. The pictures are `crowd_run` from SVT's 1080p50 test set (Xiph's derf collection), converted to v210.
+
+### Where the time went
+
+`mxl-replay-blend-bench` ran on 40 pictures. It times one blended grain of a 0.5× slow motion (frames k and k+1 at 50 %), stage by stage, in ms on one thread, with JPEG q92.
+
+| Stage | ms |
+| --- | --- |
+| **Before (1.8.7)**, all on the output thread | |
+| decode A into a 16-bit frame | 9.54 |
+| decode B into a 16-bit frame | 9.59 |
+| blend the 16-bit frames (`blendInto`) | 1.68 |
+| pack to v210 (`packV210`) | 2.34 |
+| copy to the channel's last grain | 0.32 |
+| **output thread** | **23.47** |
+| **After** | |
+| the worker decodes B to v210 | 9.70 |
+| B out of the worker's slot (copy) | 0.31 |
+| blend A and B into the grain (`blendV210`) | 0.49 |
+| copy to the channel's last grain | 0.28 |
+| **output thread** | **1.08** |
+| **CPU in all** | **10.78** |
+
+- The old path needed more than a 50p grain (20 ms) on the output thread for every blended grain. The two decodes were 82 % of that, and it decoded each frame twice, as B of one grain and again as the exact frame of the next.
+- Unpacking into 16-bit frames and packing back cost another 4 ms, and the blend itself 1.7 ms. v210 needs neither step.
+- Now the decode worker decodes each frame once, straight into v210. The output thread copies it out of the slot and blends. `blendV210` takes 0.5 ms with AVX2 and 2.0 ms in the baseline x86-64 build, which can't multiply 32-bit lanes, hence `target_clones`. A blended grain now costs less than half the CPU in all, and the output thread about 1 ms.
+- What remains is libjpeg-turbo's decode, 9.7 ms. Decoding straight to v210 costs the same as decoding to 16 bits, and the faster line packing (`line8ToV210` without its per-pixel branch) made no difference.
+
+### The replay
+
+The whole process ran without MXL. Every camera recorded real 1080p50 pictures and channel n played camera n (channels 5–8 played cameras 1–4 again). Each case ran 25 s, before and after the change in one job.
+
+| Case | Before: output grains/s, resyncs, render ms, CPU | After |
+| --- | --- | --- |
+| 4 cameras, 4 channels, 0.5× blend | 38.9, 371, 25.5 ms, 5.60 cores | 50.0, 0, 3.4 ms, 4.02 cores |
+| 4 cameras, 8 channels, 0.5× blend | 50.0, 3, 17.6 ms, 9.37 | 50.0, 0, 4.4 ms, 6.60 |
+| 12 cameras, 8 channels, 1× repeat | 49.9, 6, 5.4 ms, 10.56 | 49.8, 8, 5.9 ms, 10.35 |
+
+- Slow motion on the CPU now keeps up with 8 channels on 4 cameras and takes about a quarter less CPU. Before, 4 channels fell behind, and the 8-channel run that kept up had 17.6 ms renders, close to the limit.
+- Playout at 1× is unchanged. It takes the same path, and the few resyncs at 12 cameras and 8 channels occur before and after.

@@ -300,6 +300,11 @@ private:
         std::vector<std::uint8_t> lastV210;
         // The stored picture the last grain decoded (this channel's playout thread only).
         DecodedPicture decoded;
+        // A CPU blend's frame B (this channel's playout thread only). The next grain's frame A is often this
+        // B: it changes places with `decoded` instead of being decoded or copied again.
+        DecodedPicture decodedB;
+        // A CPU mix's incoming picture.
+        std::vector<std::uint8_t> blendB;
         std::string timecode; // of the last output grain (its ANC)
         std::uint64_t late = 0;
         // The stored pictures of the next grains, decoded ahead on a worker (SPECIFICATION.md §5.1, 1.8.5).
@@ -385,9 +390,15 @@ private:
     Frame10 frameAt(int camera, std::uint64_t taiNs, bool* found) const;
     // The stored frame nearest `taiNs` decoded straight into `v210` (house format). `found` says
     // whether a frame exists; false with found set means it is not in the house format.
-    // A picture the channel's worker decoded ahead is copied from there (`ahead`, may be null).
+    // A picture the channel's worker decoded ahead is copied from there (`ahead`, may be null; `which`: its
+    // frame A or B). `last` is the picture this lookup gave the grain before; `other` (may be null) another
+    // the channel holds decoded (a blend's other frame), used when the stored picture is that one.
     bool v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated,
-        AheadTaker* ahead = nullptr) const;
+        AheadTaker* ahead = nullptr, int which = 0, DecodedPicture* other = nullptr) const;
+    // The same lookup, the picture left in `last` (no copy out): `last.v210` holds it when true. A hit on
+    // `other` swaps the two, so the picture is not copied either.
+    bool decodedV210(int camera, std::uint64_t taiNs, bool* found, DecodedPicture& last, bool* repeated, AheadTaker* ahead, int which,
+        DecodedPicture* other) const;
     void finishClip(int channel);
     // What finishClip will do at OUT with the channel on `list` (lock held).
     [[nodiscard]] ClipEnd planClipEnd(ChannelRuntime const& runtime, Catalog::Playlist const& list) const;

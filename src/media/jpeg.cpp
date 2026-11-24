@@ -102,14 +102,25 @@ void v210LineTo8(std::uint8_t const* line, int width, std::uint8_t* y, std::uint
     }
 }
 
-// 8-bit planes to one v210 line, as to10 then packV210 (zero padding).
+// 8-bit planes to one v210 line, as to10 then packV210 (zero padding). Whole groups of 6 pixels straight
+// from the planes, no branch; the last, partial group and the padding after the groups apart. (Zeroing the
+// whole line and a branch per pixel made this half of decodeJpegToV210.)
 void line8ToV210(std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int width, int rowBytes, std::uint8_t* line)
 {
-    std::memset(line, 0, static_cast<std::size_t>(rowBytes));
     int const cw = width / 2;
+    int const full = width / 6;
     int const groups = (width + 5) / 6;
     auto const s = [](std::uint8_t v) { return static_cast<std::uint32_t>(v) << 2; };
-    for (int group = 0; group < groups; ++group)
+    for (int group = 0; group < full; ++group)
+    {
+        auto const* yg = y + group * 6;
+        auto const* cbg = cb + group * 3;
+        auto const* crg = cr + group * 3;
+        std::uint32_t const w[4] = {s(cbg[0]) | (s(yg[0]) << 10) | (s(crg[0]) << 20), s(yg[1]) | (s(cbg[1]) << 10) | (s(yg[2]) << 20),
+            s(crg[1]) | (s(yg[3]) << 10) | (s(cbg[2]) << 20), s(yg[4]) | (s(crg[2]) << 10) | (s(yg[5]) << 20)};
+        std::memcpy(line + static_cast<std::size_t>(group) * 16u, w, sizeof(w));
+    }
+    for (int group = full; group < groups; ++group)
     {
         int const x = group * 6;
         std::uint32_t yv[6] = {};
@@ -127,6 +138,11 @@ void line8ToV210(std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t con
         std::uint32_t const w[4] = {cbv[0] | (yv[0] << 10) | (crv[0] << 20), yv[1] | (cbv[1] << 10) | (yv[2] << 20), crv[1] | (yv[3] << 10) | (cbv[2] << 20),
             yv[4] | (crv[2] << 10) | (yv[5] << 20)};
         std::memcpy(line + static_cast<std::size_t>(group) * 16u, w, sizeof(w));
+    }
+    auto const used = static_cast<std::size_t>(groups) * 16u;
+    if (static_cast<std::size_t>(rowBytes) > used)
+    {
+        std::memset(line + used, 0, static_cast<std::size_t>(rowBytes) - used);
     }
 }
 
