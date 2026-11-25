@@ -132,4 +132,30 @@ void packV210(Frame10 const& src, std::uint8_t* dst, int dstRowBytes)
         }
     }
 }
+
+// Compiled for AVX2 and SSE4.1 too, picked at run time: the baseline x86-64 build has no 32-bit
+// multiply in vector registers (pmulld is SSE4.1), so it ran one word at a time.
+#if defined(__x86_64__) && defined(__GNUC__)
+__attribute__((target_clones("avx2", "sse4.1", "default")))
+#endif
+void blendV210(std::uint8_t const* a, std::uint8_t const* b, std::uint8_t* out, std::size_t bytes, std::uint32_t weight1024)
+{
+    std::uint32_t const wb = std::min<std::uint32_t>(weight1024, 1024u);
+    std::uint32_t const wa = 1024u - wb;
+    std::size_t const words = bytes / 4u;
+    // Word by word through memcpy (no alignment assumed); the loop has no branch, so the compiler keeps it
+    // in vector registers (8 words, 24 samples, per AVX2 step).
+    for (std::size_t i = 0; i < words; ++i)
+    {
+        std::uint32_t x;
+        std::uint32_t y;
+        std::memcpy(&x, a + i * 4u, 4);
+        std::memcpy(&y, b + i * 4u, 4);
+        std::uint32_t const s0 = ((x & 0x3ffu) * wa + (y & 0x3ffu) * wb) >> 10;
+        std::uint32_t const s1 = (((x >> 10) & 0x3ffu) * wa + ((y >> 10) & 0x3ffu) * wb) >> 10;
+        std::uint32_t const s2 = (((x >> 20) & 0x3ffu) * wa + ((y >> 20) & 0x3ffu) * wb) >> 10;
+        std::uint32_t const r = s0 | (s1 << 10) | (s2 << 20);
+        std::memcpy(out + i * 4u, &r, 4);
+    }
+}
 } // namespace replay

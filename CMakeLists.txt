@@ -88,11 +88,16 @@ if(REPLAY_BUILD_TESTS)
         tests/unit/test_upload_stream.cpp
         tests/unit/test_readahead.cpp
         tests/unit/test_decodeahead.cpp
+        tests/unit/test_blend.cpp
     )
     target_link_libraries(unit-tests PRIVATE replay-core)
     target_compile_options(unit-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
     add_test(NAME unit-tests COMMAND unit-tests)
 endif()
+
+# Where a CPU slow-motion blend grain spends its time, before and after the v210 blend (docs/benchmarks).
+add_executable(mxl-replay-blend-bench tests/bench/blend_bench.cpp)
+target_link_libraries(mxl-replay-blend-bench PRIVATE replay-core)
 
 find_package(mxl CONFIG QUIET)
 set(REPLAY_UI_SOURCE "")

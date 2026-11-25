@@ -789,10 +789,11 @@ Frame10 Engine::frameAt(int camera, std::uint64_t taiNs, bool* found) const
     return frame;
 }
 
-bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated,
-    AheadTaker* ahead) const
+bool Engine::decodedV210(int camera, std::uint64_t taiNs, bool* found, DecodedPicture& last, bool* repeated, AheadTaker* ahead, int which,
+    DecodedPicture* other) const
 {
     *found = false;
+    *repeated = false;
     auto const* ring = ringOf(camera);
     if (ring == nullptr)
     {
@@ -804,37 +805,63 @@ bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& 
         return false;
     }
     *found = true;
-    *repeated = !last.v210.empty() && stored->jpeg == last.jpeg;
-    if (*repeated)
+    auto const bytes = v210Size(config_.format.width, config_.format.height);
+    if (last.v210.size() == bytes && stored->jpeg == last.jpeg)
     {
-        v210 = last.v210; // the previous grain's picture (1.8.3)
+        *repeated = true; // the previous grain's picture (1.8.3)
         return true;
     }
-    v210.resize(v210Size(config_.format.width, config_.format.height));
+    if (other != nullptr && other->v210.size() == bytes && stored->jpeg == other->jpeg)
+    {
+        // The channel's other decoded picture (a blend's B is the next grain's A): the two change places.
+        std::swap(last, *other);
+        return true;
+    }
+    last.key.clear();
+    last.v210.resize(bytes);
     bool ok = false;
     if (ahead != nullptr && ahead->v210 != nullptr)
     {
-        ahead->frames[0] = {camera, taiNs};
-        ahead->stored[0] = stored->taiNs;
-        if (int const slot = ahead->take(0); slot >= 0)
+        auto const index = static_cast<std::size_t>(which);
+        ahead->frames[index] = {camera, taiNs};
+        ahead->stored[index] = stored->taiNs;
+        if (int const slot = ahead->take(which); slot >= 0)
         {
             auto const& picture = (*ahead->v210)[static_cast<std::size_t>(slot)];
-            ok = picture.size() == v210.size();
+            ok = picture.size() == bytes;
             if (ok)
             {
-                std::memcpy(v210.data(), picture.data(), v210.size());
+                std::memcpy(last.v210.data(), picture.data(), bytes);
             }
             ahead->give(slot);
         }
     }
     if (!ok)
     {
-        ok = decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, v210.data());
+        ok = decodeJpegToV210(stored->jpeg.data(), stored->jpeg.size(), config_.format.width, config_.format.height, 0, last.v210.data());
     }
-    last.jpeg = ok ? std::move(stored->jpeg) : std::vector<std::uint8_t>{};
-    last.key.clear();
-    last.v210 = ok ? v210 : std::vector<std::uint8_t>{};
+    if (ok)
+    {
+        last.jpeg = std::move(stored->jpeg);
+    }
+    else
+    {
+        last.jpeg.clear();
+        last.v210.clear();
+    }
     return ok;
+}
+
+bool Engine::v210At(int camera, std::uint64_t taiNs, std::vector<std::uint8_t>& v210, bool* found, DecodedPicture& last, bool* repeated,
+    AheadTaker* ahead, int which, DecodedPicture* other) const
+{
+    if (!decodedV210(camera, taiNs, found, last, repeated, ahead, which, other))
+    {
+        return false;
+    }
+    v210.resize(last.v210.size());
+    std::memcpy(v210.data(), last.v210.data(), v210.size());
+    return true;
 }
 
 RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady const& audioReady)
@@ -1049,6 +1076,8 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady 
     // A video mix (SPECIFICATION.md §7, 1.6.0): the outgoing entry's and the incoming entry's nearest frames,
     // blended at the mix weight on the GPU (the blend path without a flow) or on the CPU.
     bool mixed = false;
+    // A CPU mix blended in v210 straight into rendered.v210.
+    bool mixedV210 = false;
     Frame10 mixPicture;
     if (runtime.mix.active && runtime.mix.done < runtime.mix.videoFrames && !runtime.black)
     {
@@ -1074,6 +1103,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady 
                 // Both entries' frames from the decode worker when it has them (1.8.6).
                 AheadTaker taker(*runtime.decodeAhead);
                 taker.pictures = runtime.pictures->gpu.get();
+                taker.v210 = runtime.pictures->gpu == nullptr ? &runtime.pictures->v210 : nullptr;
                 taker.frames = {AheadFrame{outCamera, taiOut}, AheadFrame{camera, taiIn}};
                 taker.stored = {storedOut->taiNs, storedIn->taiNs};
                 bool const onGpu = gpu &&
@@ -1089,8 +1119,46 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady 
                     devicePicture = true;
                     mixed = true;
                 }
-                else
+                else if (!gpu)
                 {
+                    // CPU: both entries' pictures in v210 (from the decode worker when it has them) and blended
+                    // there; no 16-bit frames, no packing.
+                    auto const bytes = v210Size(config_.format.width, config_.format.height);
+                    auto picture = [&](int which, StoredFrame const& stored, std::vector<std::uint8_t>& out) {
+                        out.resize(bytes);
+                        if (taker.v210 != nullptr)
+                        {
+                            if (int const slot = taker.take(which); slot >= 0)
+                            {
+                                auto const& ahead = (*taker.v210)[static_cast<std::size_t>(slot)];
+                                bool const ok = ahead.size() == bytes;
+                                if (ok)
+                                {
+                                    std::memcpy(out.data(), ahead.data(), bytes);
+                                }
+                                taker.give(slot);
+                                if (ok)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        return decodeJpegToV210(stored.jpeg.data(), stored.jpeg.size(), config_.format.width, config_.format.height, 0, out.data());
+                    };
+                    if (picture(0, *storedOut, rendered.v210) && picture(1, *storedIn, runtime.blendB))
+                    {
+                        blendV210(rendered.v210.data(), runtime.blendB.data(), rendered.v210.data(), bytes, blendWeight1024(weight));
+                        mixed = true;
+                        mixedV210 = true;
+                    }
+                    else
+                    {
+                        rendered.v210.clear();
+                    }
+                }
+                if (!mixed && !onGpu)
+                {
+                    // A picture not in the house format: 16-bit frames, scaled by the decoder's size check.
                     Frame10 frameIn;
                     if (decodeJpeg422(storedOut->jpeg.data(), storedOut->jpeg.size(), mixPicture) &&
                         decodeJpeg422(storedIn->jpeg.data(), storedIn->jpeg.size(), frameIn) && mixPicture.width == frameIn.width &&
@@ -1102,7 +1170,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady 
                 }
             }
             lock.lock();
-            if (renderedOnGpu)
+            if (renderedOnGpu || mixedV210)
             {
                 runtime.lastV210 = rendered.v210;
             }
@@ -1170,6 +1238,7 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady 
     // CPU: an exact frame is decoded straight into the output grain; only blends and
     // interpolation need the 16-bit frames, and only they need frame B.
     bool directV210 = false;
+    bool blendedV210 = false;
     if (renderedOnGpu || mixed)
     {
         foundA = true;
@@ -1181,11 +1250,50 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady 
         lock.unlock();
         bool decoded = false;
         bool repeated = false;
+        // A blend on the CPU: both frames in v210 (from the worker, or the picture the grain before decoded)
+        // and blended there. 1.8.7 decoded both into 16-bit frames on this thread, blended and packed them.
+        bool const v210Blend = needB && !black && runtime.pictures->gpu == nullptr &&
+                               (pick.kind == SourcePick::Kind::Blend || motion == MotionMode::Blend);
+        if (v210Blend)
+        {
+            AheadTaker taker(*runtime.decodeAhead);
+            taker.v210 = &runtime.pictures->v210;
+            // A and B stay where they were decoded (runtime.decoded, runtime.decodedB); only the blend writes the
+            // grain.
+            bool repeatedB = false;
+            bool const okA = decodedV210(camera, taiA, &foundA, runtime.decoded, &repeated, &taker, 0, &runtime.decodedB);
+            bool const okB = okA && decodedV210(camera, taiB, &foundB, runtime.decodedB, &repeatedB, &taker, 1, &runtime.decoded);
+            countDecodeAhead(channel, taker);
+            auto const& pictureA = runtime.decoded.v210;
+            if (okA && okB)
+            {
+                rendered.v210.resize(pictureA.size());
+                blendV210(pictureA.data(), runtime.decodedB.v210.data(), rendered.v210.data(), pictureA.size(), blendWeight1024(pick.phase));
+                decoded = true;
+                blendedV210 = true;
+                repeated = false; // frame A again, but a new picture out
+
+            }
+            else if (okA && !foundB)
+            {
+                // No frame B (yet): frame A alone, as the 16-bit path shows it.
+                rendered.v210 = pictureA;
+                decoded = true;
+                directV210 = true;
+            }
+            else
+            {
+                // Not the house format: the 16-bit path below.
+                foundB = false;
+                repeated = false;
+            }
+        }
         if (!needB && !black)
         {
             AheadTaker taker(*runtime.decodeAhead);
             taker.v210 = runtime.pictures->gpu == nullptr ? &runtime.pictures->v210 : nullptr;
-            decoded = v210At(camera, taiA, rendered.v210, &foundA, runtime.decoded, &repeated, &taker);
+            // A slow motion's exact grain shows the frame the blend before took as B.
+            decoded = v210At(camera, taiA, rendered.v210, &foundA, runtime.decoded, &repeated, &taker, 0, &runtime.decodedB);
             countDecodeAhead(channel, taker);
             directV210 = decoded;
         }
@@ -1234,10 +1342,14 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady 
     else if (mixed)
     {
         exact = false;
-        if (!renderedOnGpu)
+        if (!renderedOnGpu && !mixedV210)
         {
             picture = std::move(mixPicture);
         }
+    }
+    else if (blendedV210)
+    {
+        exact = false;
     }
     else if (renderedOnGpu || directV210)
     {
@@ -1280,11 +1392,11 @@ RenderedFrame Engine::render(int channel, std::uint64_t outputTaiNs, AudioReady 
         rendered.v210 = blackV210_;
         runtime.lastV210 = blackV210_;
     }
-    else if (directV210)
+    else if (directV210 || blendedV210)
     {
         runtime.lastV210 = rendered.v210;
     }
-    else if (!renderedOnGpu)
+    else if (!renderedOnGpu && !mixedV210)
     {
         rendered.v210.resize(v210Size(picture.width, picture.height));
         packV210(picture, rendered.v210.data(), 0);
@@ -1418,8 +1530,7 @@ void Engine::planDecodes(int channel, SourcePick const& current, MotionMode moti
     // locked channel moves at channel 1's speed. Lock held, no reads, no allocation.
     auto const& runtime = channels_[static_cast<std::size_t>(channel - 1)];
     auto const& cfg = config_.channelList[static_cast<std::size_t>(channel - 1)];
-    // The GPU decodes both frames of a grain between two, and both entries of a mix; the CPU path decodes only
-    // single frames ahead (its mix and blend decode 16-bit frames).
+    // Both frames of a grain between two (on the CPU for a blend), and both entries of a mix.
     bool const gpu = runtime.pictures->gpu != nullptr;
     auto const source = [&](Scheduler const& scheduler, SourcePick const& pick, MotionMode mode) {
         AheadSource ahead;
@@ -1430,7 +1541,8 @@ void Engine::planDecodes(int channel, SourcePick const& current, MotionMode moti
         ahead.hfrFactor = hfrFactor(scheduler.camera);
         ahead.hfrSnap = config_.hfrSnap;
         ahead.motion = mode;
-        ahead.withB = gpu;
+        // The CPU blends in v210 too (frame B from the worker); its interpolation uses 16-bit frames.
+        ahead.withB = gpu || mode == MotionMode::Blend;
         return ahead;
     };
     std::array<AheadSource, 2> sources{};
@@ -1443,8 +1555,7 @@ void Engine::planDecodes(int channel, SourcePick const& current, MotionMode moti
     else if (runtime.mix.active && runtime.mix.done < runtime.mix.videoFrames)
     {
         // A mix (1.8.6): the incoming and the outgoing entry's nearest frames (render's mix), the outgoing one
-        // holding at its OUT.
-        if (gpu)
+        // holding at its OUT. On the CPU too: its mix is in v210.
         {
             auto const nearest = [&](Scheduler const& scheduler) {
                 return pickSource(std::max<std::int64_t>(0, scheduler.positionNs), 0, scheduler.framePeriodNs, hfrFactor(scheduler.camera), config_.hfrSnap,

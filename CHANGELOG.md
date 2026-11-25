@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The CPU slow motion and mix now blend in v210. On a host without a GPU, a 0.5× blend spent 23.5 ms of the output thread per blended grain, longer than a 50p grain lasts. It decoded two JPEGs into 16-bit frames, blended them and packed the result back, and 4 channels on a 16-vCPU EPYC VM fell behind. Now the decode worker also decodes frame B, each frame once, straight to v210. The output thread blends the two v210 pictures in place (`blendV210`, with AVX2 and SSE4.1 versions picked at run time) in about 1 ms. 4 cameras and 8 slow-motion channels keep up, with about a quarter less CPU. The result is bit-exact with the 16-bit blend (unit tests). Measurements are in `docs/benchmarks/README.md` ("the CPU blend in v210").
+- `mxl-replay-blend-bench` times a blended grain stage by stage, before and after.
+
 ## 1.8.7 (2026-11-10)
 
 - A grain's audio is written to MXL before its picture is rendered. Until now each channel rendered the picture first (GPU decode, interpolation, mix; on a busy shared GPU 10 ms typical, up to 20 ms at 50p), then wrote video, ANC and only then the grain's audio. The audio needs only the position, speed and transition state, so `Engine::render` now makes it first and hands it to the MXL writer at once (`MxlBridge::publishAudio`), then renders the picture as before. Downstream (an audio mixer reading the flow, a fabrics sender) gets each grain's audio about one render time earlier. A live channel still waits briefly for its newest recorded frame before both. The audio is still one write of the grain's samples (960 at 50p). `playout_seconds{stage="render"}` now includes the audio write; `publish` is the picture and ANC.
